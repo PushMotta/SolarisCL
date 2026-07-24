@@ -11,6 +11,11 @@ confirmed. What is still genuinely unknown is listed below with a way to check
 it — do not "fix" those from recall, because the failure mode is a silently
 incorrect render, not an exception.
 
+The synthetic probe's one SKIP (D2 — typed AOV prims) was then **resolved
+separately** by running `/hip-check` on a real production Karma shot
+(`SHOT_SandBurst_ROCHA_v14`, Houdini 22.0.368): the inspector read its ROPs,
+resolution, camera, delegate settings and AOVs correctly. See D2/D4 below.
+
 **Workflow:** run `verify_environment.py --report` on any new machine/version.
 Move each newly confirmed item into the Verified table with the version you
 checked, and fix the code for anything that comes back wrong.
@@ -85,18 +90,27 @@ missing `lopoutput` would export to the wrong path with no warning.
 | # | Assumption | Status |
 |---|---|---|
 | D1 | `prim.IsA(UsdRender.Settings)` matches typed prims authored by Solaris | `OK` (21, 22) |
-| D2 | Solaris authors typed `UsdRender.Product` / `UsdRender.Var` prims, not untyped overs | `?` — **still unverified**; the throwaway probe scene authors no products/vars, so this needs a real shot with known AOVs |
+| D2 | Solaris authors typed `UsdRender.Product` / `UsdRender.Var` prims, not untyped overs | `OK` (22, real scene) — a real Karma shot authored 4 typed `UsdRender.Var` prims; `IsA(UsdRender.Var)` matched them all |
 | D3 | Stage metadata key is `renderSettingsPrimPath` | `OK` (21, 22) |
-| D4 | Karma knobs are attributes on the settings prim in the `karma:` namespace | `?` — probe authored no karma settings; unexercised |
+| D4 | Karma knobs are attributes on the settings prim in the `karma:` namespace | `OK` (22, real scene) — ~90 `karma:*` / `husk:*` attrs read off the settings prim |
 | D5 | `hou.LopNode.stage()` returns the composed stage at the current time | `OK` (21, 22) |
 
-**D2 is the one that matters most** and is genuinely still unknown: if Solaris
-authors AOVs as untyped overs, `IsA(UsdRender.Var)` returns False and the AOV
-list comes back empty. The probe now reports this honestly as SKIP rather than a
-misleading FAIL. Resolve it by running `/hip-check` on a real scene whose AOVs
-you know; if `IsA()` misses them, fall back on `GetTypeName()` or the products'
-`orderedVars` targets, with a USD-fixture test. `D5` also carries the known
+**D2 is resolved on a real scene.** `/hip-check` on a production Karma shot
+(`SHOT_SandBurst_ROCHA_v14`, Houdini 22.0.368) returned 4 typed `UsdRender.Var`
+prims — `beauty` (LPE `C.*[LO]`), `CryptoObject`, `CryptoPrimitives`, `depth` —
+all matched by `IsA(UsdRender.Var)`. The empty-AOV failure mode did not occur;
+the typed-prim assumption holds for Karma. The bare-probe SKIP stays as the
+honest answer when a scene authors no vars. `D5` still carries the known
 single-frame-cook limitation — see `docs/TASKS.md` T5.
+
+**Real-scene note:** in that shot the `UsdRenderProduct.productName` attribute
+was empty on the products the settings prim references, so `outputs_for()`
+returned no paths — the output location is driven by the ROP override / husk
+`--output`, not authored on the product prim. Not an inspector bug (it reads
+what is there), but worth knowing: an empty output list in the manifest does not
+mean "no outputs". The inspector also correctly *warned* — rather than failing
+silently — when the second ROP's input LOP did not cook to a stage at the
+current frame.
 
 ## E. husk CLI flags — `hsl/husk.py` `build_command()`
 
@@ -154,7 +168,9 @@ Confirmed against `husk --help` on 22.0.368 (and flag presence re-checked on
 | C4 | `savestyle=flattenalllayers` | 21.0.729, 22.0.368 | 2026-07-24 | **fixed** — was `flattenall` (not a real token) |
 | C5 | `enableoutputprocessor_simplerelativepaths` | 21.0.729, 22.0.368 | 2026-07-24 | |
 | D1 | `IsA(UsdRender.Settings)` | 21.0.729, 22.0.368 | 2026-07-24 | |
+| D2 | typed `UsdRender.Var` prims on a real Karma scene | 22.0.368 | 2026-07-24 | SHOT_SandBurst_ROCHA_v14; 4 AOVs incl. LPE beauty + cryptomatte |
 | D3 | stage metadata `renderSettingsPrimPath` | 21.0.729, 22.0.368 | 2026-07-24 | |
+| D4 | `karma:*` / `husk:*` attrs on the settings prim | 22.0.368 | 2026-07-24 | ~90 knobs read from the same scene |
 | D5 | `LopNode.stage()` returns composed stage | 21.0.729, 22.0.368 | 2026-07-24 | current-frame cook limitation stands (T5) |
 | E1–E14 | every flag `build_command()` emits | 21.0.729, 22.0.368 | 2026-07-24 | via `husk --help`; `ALF_PROGRESS` literal wants a live render |
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |
@@ -163,10 +179,6 @@ Confirmed against `husk --help` on 22.0.368 (and flag presence re-checked on
 
 ## Still unknown (do not guess)
 
-- **D2** — whether Solaris authors typed `UsdRender.Var`/`Product` prims. The
-  highest-value remaining unknown; needs a real scene with known AOVs
-  (`/hip-check`).
-- **D4** — `karma:` namespaced delegate knobs on the settings prim.
 - **A3** — the `::`-versioned type-name split path.
 - **E8/E9** — accepted values for `--complexity` and `--purpose`.
 - **F2/F3** — Karma license behaviour and the Indie resolution cap.
