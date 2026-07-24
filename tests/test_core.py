@@ -6,8 +6,13 @@ import sys
 import tempfile
 import unittest
 
+import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from hsl import farm, preflight, presets
+from hsl.bridge import (
+    find_hython, list_hython_installations, load_user_settings, save_user_setting,
+)
 from hsl.cli import parse_frames
 from hsl.husk import (
     FrameChunk, RenderJob, build_command, format_command, frame_chunks,
@@ -203,6 +208,17 @@ class TestCommand(unittest.TestCase):
         self.assertIn('"/my renders/a.exr"', text)
         self.assertNotIn('"husk"', text)
 
+    def test_hython_engine_command(self):
+        job = RenderJob(engine="hython", hip_file="/jobs/shot.hip", rop_path="/stage/usdrender1",
+                        chunk=FrameChunk(1001, 10, 1), hython_exe="/opt/hfs/bin/hython")
+        cmd = build_command(job)
+        self.assertEqual(cmd[0], "/opt/hfs/bin/hython")
+        self.assertEqual(cmd[1:4], ["-m", "hsl.inspector", "/jobs/shot.hip"])
+        self.assertIn("--render-direct", cmd)
+        self.assertEqual(cmd[cmd.index("--rop") + 1], "/stage/usdrender1")
+        self.assertEqual(cmd[cmd.index("--frame-start") + 1], "1001")
+        self.assertEqual(cmd[cmd.index("--frame-count") + 1], "10")
+
 
 class TestJobsForRop(unittest.TestCase):
     def test_seeds_from_manifest(self):
@@ -281,11 +297,17 @@ class TestRenderQueue(unittest.TestCase):
                 "sys.exit(7 if '--make-it-fail' in args else 0)\n"
             )
         os.chmod(self.fake, os.stat(self.fake).st_mode | stat.S_IEXEC)
+        if os.name == "nt":
+            self.fake_exe = os.path.join(self.dir, "fake_husk.bat")
+            with open(self.fake_exe, "w") as fh:
+                fh.write(f'@echo off\n"{sys.executable}" "{self.fake}" %*\n')
+        else:
+            self.fake_exe = self.fake
 
     def job(self, start, fail=False):
         return RenderJob(
             usd_file=os.path.join(self.dir, "shot.usd"),
-            husk_exe=self.fake,
+            husk_exe=self.fake_exe,
             chunk=FrameChunk(start, 2, 1),
             extra_args=["--make-it-fail"] if fail else [],
         )
@@ -328,6 +350,99 @@ class TestRenderQueue(unittest.TestCase):
     def test_log_is_captured(self):
         queue, _ = self._run([self.job(1)])
         self.assertTrue(any("rendered" in line for line in queue.tasks[0].log))
+
+
+class TestHythonDiscovery(unittest.TestCase):
+    def test_list_hython_installations(self):
+        installs = list_hython_installations()
+        self.assertIsInstance(installs, list)
+        for label, path in installs:
+            self.assertTrue(os.path.isfile(path))
+
+    def test_find_hython_explicit(self):
+        fake_file = tempfile.NamedTemporaryFile(delete=False)
+        fake_file.close()
+        try:
+            found = find_hython(fake_file.name)
+            self.assertEqual(os.path.abspath(found), os.path.abspath(fake_file.name))
+        finally:
+            if os.path.exists(fake_file.name):
+                os.remove(fake_file.name)
+
+
+class TestAovSelection(unittest.TestCase):
+    """AOV editing is a USD edit, not a husk flag. Test the plain-Python half:
+    resolving an --aovs spec to RenderVar prim paths, and that no husk AOV flag
+    is ever emitted. The USD overlay itself needs hython and is checked there."""
+
+    def test_no_aov_flag_is_ever_emitted(self):
+        # husk has no --aov/--skip-aov; build_command must not invent one.
+        cmd = build_command(RenderJob(usd_file="/jobs/shot.usd", renderer="BRAY_HdKarma"))
+        self.assertNotIn("--aov", cmd)
+        self.assertNotIn("--skip-aov", cmd)
+
+    def test_resolve_aovs_by_name(self):
+        from hsl.cli import _resolve_aovs
+        m = sample_manifest()   # vars: /Render/Vars/Ci (Ci), /Render/Vars/N (N)
+        self.assertEqual(_resolve_aovs(m, "Ci"), ["/Render/Vars/Ci"])
+        self.assertEqual(set(_resolve_aovs(m, "ci,n")),
+                         {"/Render/Vars/Ci", "/Render/Vars/N"})
+
+    def test_resolve_aovs_unknown_is_empty(self):
+        from hsl.cli import _resolve_aovs
+        self.assertEqual(_resolve_aovs(sample_manifest(), "does_not_exist"), [])
+
+
+class TestPreflight(unittest.TestCase):
+    def test_preflight_resolution_warning(self):
+        job = RenderJob(usd_file="/jobs/shot.usd", resolution=(3840, 2160))
+        warnings = preflight.run_preflight_checks(job)
+        self.assertTrue(any(w.category == "resolution" for w in warnings))
+
+    def test_preflight_clean(self):
+        job = RenderJob(usd_file="/jobs/shot.usd", resolution=(1920, 1080))
+        warnings = preflight.run_preflight_checks(job)
+        self.assertFalse(any(w.level == "error" for w in warnings))
+
+
+class TestPresets(unittest.TestCase):
+    def test_default_presets(self):
+        all_p = presets.get_default_presets()
+        self.assertIn("🚀 Fast Preview (Karma XPU)", all_p)
+        self.assertIn("🎨 Beauty Final (Production)", all_p)
+
+    def test_apply_preset(self):
+        job = RenderJob(usd_file="/jobs/shot.usd")
+        preset = presets.DEFAULT_PRESETS["🚀 Fast Preview (Karma XPU)"]
+        updated = presets.apply_preset(job, preset)
+        self.assertEqual(updated.renderer, "BRAY_HdKarmaXPU")
+        self.assertEqual(updated.resolution, (960, 540))
+
+
+class TestFarm(unittest.TestCase):
+    def test_export_deadline_job(self):
+        job = RenderJob(usd_file="/jobs/shot.usd", husk_exe="husk")
+        temp_dir = tempfile.mkdtemp()
+        try:
+            j_path, p_path = farm.export_deadline_job([job], temp_dir)
+            self.assertTrue(os.path.isfile(j_path))
+            self.assertTrue(os.path.isfile(p_path))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_export_tractor_job(self):
+        job = RenderJob(usd_file="/jobs/shot.usd", husk_exe="husk")
+        temp_dir = tempfile.mkdtemp()
+        try:
+            out_file = os.path.join(temp_dir, "tractor_job.alf")
+            res = farm.export_tractor_job([job], out_file)
+            self.assertTrue(os.path.isfile(res))
+            with open(res, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            self.assertIn("Job -title", content)
+            self.assertIn("RemoteCmd", content)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

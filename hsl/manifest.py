@@ -30,6 +30,7 @@ class RenderVar:
     source_name: str = ""
     source_type: str = ""        # "raw", "primvar", "lpe", ...
     data_type: str = ""          # "color3f", "float", ...
+    enabled: bool = True
 
     @property
     def label(self) -> str:

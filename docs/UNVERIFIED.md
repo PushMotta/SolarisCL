@@ -137,6 +137,20 @@ Confirmed against `husk --help` on 22.0.368 (and flag presence re-checked on
 `husk --help` confirms `-V [ --verbose ] arg` is `0-9` plus flag letters where
 `a` = "Turn on Alfred progress" — exactly what `parse_progress()` depends on.
 
+### AOV selection has no husk flag  ·  `OK` (22)
+
+Checked against `husk --help`: husk has **no `--aov` / `--skip-aov` flag** (an
+earlier version invented them; they were removed). Which AOV planes a render
+writes is defined entirely by each `UsdRenderProduct`'s `orderedVars` in the USD.
+The two look-alike flags are *not* it: `--mask` limits stage **population** to a
+set of prims, and `--mplay-monitor` only sets which planes the interactive mplay
+window shows. So AOV editing is a USD edit: `inspector.filter_usd_aovs()` authors
+a thin overlay that sublayers the export and overrides each product's
+`orderedVars` to the chosen subset (`bridge.filter_aovs` runs it under hython).
+**Verified on 22.0.368** against a fixture — dropping one AOV from a 3-var
+product left `orderedVars = [C, depth]` in the flattened composition, the other
+product untouched.
+
 ## F. Environment and licensing
 
 | # | Assumption | Status |
@@ -173,6 +187,7 @@ Confirmed against `husk --help` on 22.0.368 (and flag presence re-checked on
 | D4 | `karma:*` / `husk:*` attrs on the settings prim | 22.0.368 | 2026-07-24 | ~90 knobs read from the same scene |
 | D5 | `LopNode.stage()` returns composed stage | 21.0.729, 22.0.368 | 2026-07-24 | current-frame cook limitation stands (T5) |
 | E1–E14 | every flag `build_command()` emits | 21.0.729, 22.0.368 | 2026-07-24 | via `husk --help`; `ALF_PROGRESS` literal wants a live render |
+| E-AOV | husk has no AOV flag; selection is USD `orderedVars`; overlay filter works | 22.0.368 | 2026-07-24 | `filter_usd_aovs` verified: dropping a var left the right `orderedVars` |
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |
 | F4 | hython bridge imports `hsl.inspector`, `describe_rop()` runs | 21.0.729, 22.0.368 | 2026-07-24 | |
 | F5 | `hou.hipFile.load` signature | 21.0.729, 22.0.368 | 2026-07-24 | |

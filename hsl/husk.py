@@ -136,8 +136,11 @@ def frame_chunks(start: int, end: int, inc: int = 1,
 
 @dataclass
 class RenderJob:
-    """A fully resolved husk invocation, before it is turned into argv."""
-    usd_file: str
+    """A fully resolved husk or hython invocation, before it is turned into argv."""
+    usd_file: str = ""
+    engine: str = "husk"                 # "husk" or "hython"
+    hip_file: str = ""
+    rop_path: str = ""
     renderer: str = "BRAY_HdKarma"
     chunk: FrameChunk = field(default_factory=lambda: FrameChunk(1, 1, 1))
     settings_prim: str = ""
@@ -154,15 +157,39 @@ class RenderJob:
     purpose: str = ""                    # e.g. "render,proxy"
     extra_args: list[str] = field(default_factory=list)
     husk_exe: str = ""
+    hython_exe: str = ""
 
     @property
     def label(self) -> str:
-        return f"{os.path.basename(self.usd_file)} [{self.chunk}]"
+        source = self.hip_file if (self.engine == "hython" and self.hip_file) else self.usd_file
+        prefix = f"[{self.engine}] " if self.engine != "husk" else ""
+        return f"{prefix}{os.path.basename(source)} [{self.chunk}]"
 
 
 def build_command(job: RenderJob) -> list[str]:
     """Turn a RenderJob into an argv list. Never shell-quoted -- pass this
     straight to subprocess/QProcess with shell=False."""
+    if job.engine == "hython":
+        from .bridge import find_hython   # lives in bridge (smart discovery)
+        exe = job.hython_exe or find_hython() or "hython"
+        cmd: list[str] = [exe, "-m", "hsl.inspector", job.hip_file or job.usd_file, "--render-direct"]
+        if job.rop_path:
+            cmd += ["--rop", job.rop_path]
+        cmd += ["--frame-start", str(job.chunk.start)]
+        cmd += ["--frame-count", str(job.chunk.count)]
+        if job.chunk.inc != 1:
+            cmd += ["--frame-inc", str(job.chunk.inc)]
+        if job.renderer:
+            cmd += ["--renderer", job.renderer]
+        if job.camera:
+            cmd += ["--camera", job.camera]
+        if job.output:
+            cmd += ["--output", job.output]
+        if job.resolution:
+            cmd += ["--res", str(job.resolution[0]), str(job.resolution[1])]
+        cmd += list(job.extra_args)
+        return cmd
+
     exe = job.husk_exe or find_husk() or "husk"
     cmd: list[str] = [exe]
 
@@ -188,6 +215,12 @@ def build_command(job: RenderJob) -> list[str]:
         cmd += ["--purpose", job.purpose]
     if job.snapshot_interval:
         cmd += ["--snapshot", str(job.snapshot_interval)]
+
+    # NB: AOV selection is NOT a husk flag. Which planes a render writes is
+    # defined by each UsdRenderProduct's orderedVars in the USD, so AOV editing
+    # is done by pointing job.usd_file at an overlay from inspector.filter_usd_aovs
+    # (see bridge.filter_aovs). Do not add a --aov/--skip-aov flag here — husk
+    # has none and rejects unknown options.
 
     if job.make_output_path:
         cmd += ["--make-output-path"]
@@ -218,7 +251,7 @@ def format_command(cmd: Sequence[str]) -> str:
     return " ".join(out)
 
 
-def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str,
+def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str = "",
                  *, chunk_size: int = 0, **overrides) -> list[RenderJob]:
     """Build one RenderJob per frame chunk, seeded from the manifest.
 
@@ -228,6 +261,9 @@ def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str,
     settings = manifest.resolve_settings(rop)
 
     defaults = {
+        "engine": overrides.get("engine", "husk"),
+        "hip_file": manifest.hip_path,
+        "rop_path": rop.node_path,
         "renderer": rop.renderer or "BRAY_HdKarma",
         "settings_prim": rop.settings_prim or manifest.default_settings_prim,
         "camera": rop.camera or (settings.camera if settings else ""),

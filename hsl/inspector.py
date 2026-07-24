@@ -30,9 +30,9 @@ except ImportError:  # pragma: no cover - only importable inside hython
     hou = None
 
 try:
-    from pxr import Usd, UsdGeom, UsdRender
+    from pxr import Sdf, Usd, UsdGeom, UsdRender
 except ImportError:  # pragma: no cover
-    Usd = UsdGeom = UsdRender = None
+    Sdf = Usd = UsdGeom = UsdRender = None
 
 
 # Node types that can drive a husk render. Versioned type names
@@ -366,6 +366,60 @@ def export_usd(rop_node, out_path: str, frame_range=None,
     return out_path if os.path.exists(out_path) else ""
 
 
+def filter_usd_aovs(usd_in: str, usd_out: str, keep_paths,
+                    warnings: Optional[list] = None) -> str:
+    """Write a thin overlay USD that keeps only ``keep_paths`` RenderVars.
+
+    husk has **no flag** to select which AOVs are written — a render's output
+    planes are defined entirely by each ``UsdRenderProduct``'s ``orderedVars``
+    relationship (``husk --mask`` is a stage *population* mask; ``--mplay-monitor``
+    only affects the interactive display). So AOV editing is done in USD.
+
+    Rather than re-cook or re-export the heavy stage, this authors an *overlay*
+    layer at ``usd_out`` that sublayers ``usd_in`` and overrides every product's
+    ``orderedVars`` to the chosen subset. husk renders ``usd_out`` and composes
+    the original underneath — fast, and the source export is left untouched so
+    the selection can be changed again cheaply.
+    """
+    warnings = warnings if warnings is not None else []
+    if Usd is None or Sdf is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+
+    keep = set(keep_paths or [])
+    os.makedirs(os.path.dirname(os.path.abspath(usd_out)) or ".", exist_ok=True)
+
+    # Sublayer the full export by a path relative to the overlay, so husk
+    # resolves it wherever the pair lives.
+    overlay = Sdf.Layer.CreateNew(usd_out)
+    sub_rel = os.path.relpath(os.path.abspath(usd_in),
+                              os.path.dirname(os.path.abspath(usd_out)))
+    overlay.subLayerPaths.append(sub_rel.replace(os.sep, "/"))
+
+    stage = Usd.Stage.Open(overlay)          # overlay is the root / edit layer
+    if stage is None:
+        warnings.append(f"AOV filter: could not open {usd_in}")
+        return ""
+
+    edited = 0
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdRender.Product):
+            continue
+        rel = UsdRender.Product(prim).GetOrderedVarsRel()
+        current = [str(t) for t in rel.GetTargets()]
+        if not current:
+            continue
+        kept = [t for t in current if t in keep]
+        if kept != current:
+            rel.SetTargets([Sdf.Path(t) for t in kept])
+            edited += 1
+
+    overlay.Save()
+    if edited == 0:
+        warnings.append("AOV filter: no product orderedVars changed "
+                        "(selection already matched the scene).")
+    return usd_out if os.path.exists(usd_out) else ""
+
+
 # --------------------------------------------------------------------------
 # Top level
 # --------------------------------------------------------------------------
@@ -451,12 +505,68 @@ def inspect(hip_path: str, export: bool = False,
     return manifest
 
 
+def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] = None,
+                  frame_count: int = 1, frame_inc: int = 1, renderer: str = "",
+                  camera: str = "", output: str = "", res: Optional[tuple[int, int]] = None) -> int:
+    """Render a LOP ROP directly in hython without exporting USD to disk."""
+    if hou is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+
+    hou.hipFile.load(hip_path, suppress_save_prompt=True, ignore_load_warnings=True)
+
+    rop_nodes = find_render_rops()
+    if rop_path:
+        rop_nodes = [n for n in rop_nodes if n.path() == rop_path]
+    if not rop_nodes:
+        sys.stderr.write(f"No matching render ROP found in {hip_path}\n")
+        return 1
+
+    target_rop = rop_nodes[0]
+
+    if renderer:
+        _set_parm(target_rop, "renderer", renderer)
+        _set_parm(target_rop, "husk_renderer", renderer)
+        _set_parm(target_rop, "engine", renderer)
+    if camera:
+        _set_parm(target_rop, "override_camera", camera)
+        _set_parm(target_rop, "camera", camera)
+    if output:
+        _set_parm(target_rop, "outputimage", output)
+        _set_parm(target_rop, "picture", output)
+    if res:
+        _set_parm(target_rop, "resolutionx", res[0])
+        _set_parm(target_rop, "resolutiony", res[1])
+
+    if frame_start is not None:
+        f1 = frame_start
+        f2 = frame_start + (frame_count - 1) * frame_inc
+        _set_parm(target_rop, "trange", 1)
+        _set_parm(target_rop, "f1", f1)
+        _set_parm(target_rop, "f2", f2)
+        _set_parm(target_rop, "f3", frame_inc)
+        frame_range = (f1, f2, frame_inc)
+    else:
+        frame_range = ()
+
+    try:
+        sys.stdout.write("ALF_PROGRESS 0%\n")
+        sys.stdout.flush()
+        target_rop.render(frame_range=frame_range if frame_range else (), verbose=True)
+        sys.stdout.write("ALF_PROGRESS 100%\n")
+        sys.stdout.flush()
+        return 0
+    except hou.Error as exc:
+        sys.stderr.write(f"Direct render failed on {target_rop.path()}: {exc}\n")
+        return 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="hython -m hsl.inspector",
         description="Describe the renderable state of a Houdini .hip file.",
     )
-    parser.add_argument("hip", help="Path to the .hip file")
+    parser.add_argument("hip", nargs="?", default="",
+                        help="Path to the .hip file (omitted for --filter-aovs)")
     parser.add_argument("--json", dest="json_out", default="",
                         help="Write the manifest here (default: stdout)")
     parser.add_argument("--export-usd", action="store_true",
@@ -467,7 +577,43 @@ def main(argv=None) -> int:
                         help="Flatten the stage on export (portable, larger)")
     parser.add_argument("--rop", default="",
                         help="Only inspect this ROP path")
+    parser.add_argument("--render-direct", action="store_true",
+                        help="Render the ROP directly inside hython (0 USD disk space)")
+    parser.add_argument("--frame-start", type=int, default=None, help="Start frame")
+    parser.add_argument("--frame-count", type=int, default=1, help="Frame count")
+    parser.add_argument("--frame-inc", type=int, default=1, help="Frame increment")
+    parser.add_argument("--renderer", default="", help="Renderer delegate")
+    parser.add_argument("--camera", default="", help="Camera override")
+    parser.add_argument("--output", default="", help="Output image override")
+    parser.add_argument("--res", nargs=2, type=int, default=None, help="Resolution X Y")
+    parser.add_argument("--filter-aovs", action="store_true",
+                        help="Write an overlay USD keeping only --keep RenderVars")
+    parser.add_argument("--usd-in", default="", help="Source USD for --filter-aovs")
+    parser.add_argument("--usd-out", default="", help="Overlay USD to write")
+    parser.add_argument("--keep", default="",
+                        help="Comma-separated RenderVar prim paths to keep")
     args = parser.parse_args(argv)
+
+    if args.filter_aovs:
+        keep = [p for p in args.keep.split(",") if p]
+        warnings: list[str] = []
+        out = filter_usd_aovs(args.usd_in, args.usd_out, keep, warnings)
+        for warning in warnings:
+            sys.stderr.write(f"{warning}\n")
+        if not out:
+            return 1
+        sys.stdout.write(out + "\n")
+        return 0
+
+    if not args.hip:
+        parser.error("hip path is required unless --filter-aovs is given")
+
+    if args.render_direct:
+        res = tuple(args.res) if args.res else None
+        return render_direct(args.hip, rop_path=args.rop, frame_start=args.frame_start,
+                             frame_count=args.frame_count, frame_inc=args.frame_inc,
+                             renderer=args.renderer, camera=args.camera,
+                             output=args.output, res=res)
 
     try:
         manifest = inspect(args.hip, export=args.export_usd,

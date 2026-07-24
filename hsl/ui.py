@@ -14,12 +14,13 @@ from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
-from . import bridge, husk as husk_mod
+from . import bridge, farm, husk as husk_mod, preflight, presets
 from .manifest import RenderRop, SceneManifest
 from .runner import RenderQueue, State, Task
 
@@ -59,6 +60,27 @@ class InspectWorker(QObject):
         self.finished.emit(manifest)
 
 
+class FilterWorker(QObject):
+    """Runs bridge.filter_aovs (a hython subprocess) off the Qt thread."""
+    finished = Signal(str)      # path to the AOV-filtered overlay USD
+    failed = Signal(str)
+
+    def __init__(self, usd_in: str, keep_paths, hython: str = ""):
+        super().__init__()
+        self.usd_in = usd_in
+        self.keep_paths = keep_paths
+        self.hython = hython
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            out = bridge.filter_aovs(self.usd_in, self.keep_paths, hython=self.hython)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(out)
+
+
 class QueueBridge(QObject):
     """Marshals RenderQueue callbacks onto the Qt event loop."""
     task_started = Signal(object)
@@ -88,10 +110,32 @@ class LauncherWindow(QMainWindow):
         self._worker: Optional[InspectWorker] = None
 
         self._build_ui()
+        self._populate_hython_options()
         self._connect()
         self._set_scene_loaded(False)
 
     # -- construction -----------------------------------------------------
+
+    def _populate_hython_options(self) -> None:
+        self.hython_combo.blockSignals(True)
+        self.hython_combo.clear()
+        installs = bridge.list_hython_installations()
+        for label, path in installs:
+            self.hython_combo.addItem(f"{label}: {path}", path)
+        self.hython_combo.addItem("Custom path...", "")
+
+        saved = bridge.load_user_settings().get("hython_path", "")
+        active = bridge.find_hython(saved)
+        if active:
+            idx = self.hython_combo.findData(active)
+            if idx >= 0:
+                self.hython_combo.setCurrentIndex(idx)
+            else:
+                self.hython_combo.setCurrentIndex(self.hython_combo.count() - 1)
+            self.hython_edit.setText(active)
+        else:
+            self.hython_combo.setCurrentIndex(self.hython_combo.count() - 1)
+        self.hython_combo.blockSignals(False)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -112,12 +156,24 @@ class LauncherWindow(QMainWindow):
         scene_row.addWidget(self.read_btn)
         outer.addLayout(scene_row)
 
+        # --- hython selector row ---
+        hython_row = QHBoxLayout()
+        self.hython_combo = QComboBox()
+        self.hython_edit = QLineEdit()
+        self.hython_edit.setPlaceholderText("Path to hython executable")
+        self.hython_browse_btn = QPushButton("Browse Hython…")
+        hython_row.addWidget(QLabel("Hython"))
+        hython_row.addWidget(self.hython_combo, 1)
+        hython_row.addWidget(self.hython_edit, 2)
+        hython_row.addWidget(self.hython_browse_btn)
+        outer.addLayout(hython_row)
+
         opts_row = QHBoxLayout()
         self.export_usd_check = QCheckBox("Write USD while reading")
-        self.export_usd_check.setChecked(True)
+        self.export_usd_check.setChecked(False)
         self.export_usd_check.setToolTip(
-            "husk renders a USD file, not a .hip. Leave this on unless the "
-            "stage is already on disk."
+            "If unchecked, scene reading is fast (metadata only). Turn on to pre-bake "
+            "USD stages to disk."
         )
         self.flatten_check = QCheckBox("Flatten stage")
         self.flatten_check.setToolTip(
@@ -150,15 +206,34 @@ class LauncherWindow(QMainWindow):
         self._build_menu()
 
     def _build_rop_panel(self) -> QWidget:
-        box = QGroupBox("Render ROPs")
+        box = QGroupBox("Render ROPs & AOV Manager")
         layout = QVBoxLayout(box)
 
         self.rop_combo = QComboBox()
         layout.addWidget(self.rop_combo)
 
+        # AOV Manager section
+        aov_box = QGroupBox("AOV Manager (Check to include)")
+        aov_layout = QVBoxLayout(aov_box)
+
+        self.aov_list = QListWidget()
+        self.aov_list.setMaximumHeight(130)
+        aov_layout.addWidget(self.aov_list)
+
+        aov_btn_row = QHBoxLayout()
+        self.aov_all_btn = QPushButton("Select All")
+        self.aov_beauty_btn = QPushButton("Beauty + Depth")
+        self.aov_none_btn = QPushButton("Clear All")
+        aov_btn_row.addWidget(self.aov_all_btn)
+        aov_btn_row.addWidget(self.aov_beauty_btn)
+        aov_btn_row.addWidget(self.aov_none_btn)
+        aov_layout.addLayout(aov_btn_row)
+
+        layout.addWidget(aov_box)
+
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
-        self.detail.setFont(QFont(MONO, 10))
+        self.detail.setFont(QFont(MONO, 9))
         self.detail.setPlaceholderText(
             "Read a scene to see its render settings, camera and AOVs."
         )
@@ -166,9 +241,19 @@ class LauncherWindow(QMainWindow):
         return box
 
     def _build_override_panel(self) -> QWidget:
-        box = QGroupBox("Overrides")
+        box = QGroupBox("Overrides & Quality Presets")
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("Custom Configuration", "")
+        for p_name in presets.get_default_presets().keys():
+            self.preset_combo.addItem(p_name, p_name)
+        form.addRow("Render Profile", self.preset_combo)
+
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(["Husk (USD Export)", "Hython (Direct ROP, 0 USD Disk Space)"])
+        form.addRow("Render engine", self.engine_combo)
 
         self.renderer_combo = QComboBox()
         self.renderer_combo.setEditable(True)
@@ -247,13 +332,17 @@ class LauncherWindow(QMainWindow):
         return box
 
     def _build_run_panel(self) -> QWidget:
-        box = QGroupBox("Render")
+        box = QGroupBox("Render & Diagnostics")
         layout = QVBoxLayout(box)
+
+        self.preflight_label = QLabel("Preflight: Ready.")
+        self.preflight_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        layout.addWidget(self.preflight_label)
 
         self.command_view = QPlainTextEdit()
         self.command_view.setReadOnly(True)
         self.command_view.setFont(QFont(MONO, 9))
-        self.command_view.setMaximumHeight(90)
+        self.command_view.setMaximumHeight(80)
         self.command_view.setPlaceholderText("The husk command appears here.")
         layout.addWidget(self.command_view)
 
@@ -262,28 +351,39 @@ class LauncherWindow(QMainWindow):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.copy_btn = QPushButton("Copy command")
+        self.farm_btn = QPushButton("Submit to Farm…")
         self.overall_bar = QProgressBar()
         self.overall_bar.setRange(0, 100)
         button_row.addWidget(self.render_btn)
         button_row.addWidget(self.cancel_btn)
         button_row.addWidget(self.copy_btn)
+        button_row.addWidget(self.farm_btn)
         button_row.addWidget(self.overall_bar, 1)
         layout.addLayout(button_row)
 
+        self.tabs = QTabWidget()
+
+        # Tab 1: Queue & Logs
+        queue_widget = QWidget()
+        q_layout = QVBoxLayout(queue_widget)
+        q_layout.setContentsMargins(0, 0, 0, 0)
         self.task_table = QTableWidget(0, 4)
         self.task_table.setHorizontalHeaderLabels(["Frames", "State", "Progress", "Time"])
         self.task_table.verticalHeader().setVisible(False)
         self.task_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.task_table.setMaximumHeight(150)
-        layout.addWidget(self.task_table)
+        self.task_table.setMaximumHeight(140)
+        q_layout.addWidget(self.task_table)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setFont(QFont(MONO, 9))
         self.log_view.setMaximumBlockCount(5000)
         self.log_view.setPlaceholderText("husk output appears here.")
-        layout.addWidget(self.log_view, 1)
+        q_layout.addWidget(self.log_view, 1)
+        self.tabs.addTab(queue_widget, "Queue & Logs")
+
+        layout.addWidget(self.tabs, 1)
         return box
 
     def _build_menu(self) -> None:
@@ -301,13 +401,23 @@ class LauncherWindow(QMainWindow):
     def _connect(self) -> None:
         self.browse_btn.clicked.connect(self.choose_hip)
         self.read_btn.clicked.connect(self.read_scene)
+        self.hython_combo.currentIndexChanged.connect(self.on_hython_combo_changed)
+        self.hython_edit.textChanged.connect(self.on_hython_path_changed)
+        self.hython_browse_btn.clicked.connect(self.choose_hython)
         self.rop_combo.currentIndexChanged.connect(self.on_rop_changed)
+        self.preset_combo.currentIndexChanged.connect(self.on_preset_changed)
+        self.aov_all_btn.clicked.connect(self.select_all_aovs)
+        self.aov_beauty_btn.clicked.connect(self.select_beauty_aovs)
+        self.aov_none_btn.clicked.connect(self.clear_all_aovs)
+        self.aov_list.itemChanged.connect(self.refresh_command)
         self.res_check.toggled.connect(self.res_x.setEnabled)
         self.res_check.toggled.connect(self.res_y.setEnabled)
         self.copy_btn.clicked.connect(self.copy_command)
+        self.farm_btn.clicked.connect(self.export_farm_job)
         self.render_btn.clicked.connect(self.start_render)
         self.cancel_btn.clicked.connect(self.cancel_render)
 
+        self.engine_combo.currentIndexChanged.connect(self.refresh_command)
         for widget in (self.renderer_combo, self.camera_combo, self.settings_combo):
             widget.currentTextChanged.connect(self.refresh_command)
         for widget in (self.frame_start, self.frame_end, self.frame_inc,
@@ -322,6 +432,113 @@ class LauncherWindow(QMainWindow):
         for widget in (self.rop_combo, self.render_btn, self.copy_btn):
             widget.setEnabled(loaded)
 
+    # -- hython slots -----------------------------------------------------
+
+    @Slot(int)
+    def on_hython_combo_changed(self, index: int) -> None:
+        path = self.hython_combo.itemData(index)
+        if path:
+            self.hython_edit.setText(path)
+            bridge.save_user_setting("hython_path", path)
+
+    @Slot(str)
+    def on_hython_path_changed(self, text: str) -> None:
+        path = text.strip()
+        if path and os.path.isfile(path):
+            bridge.save_user_setting("hython_path", path)
+
+    @Slot()
+    def choose_hython(self) -> None:
+        filter_str = "hython.exe (hython.exe);;All files (*)" if os.name == "nt" else "hython (hython);;All files (*)"
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Hython executable", self.hython_edit.text() or os.path.expanduser("~"),
+            filter_str,
+        )
+        if path:
+            self.hython_edit.setText(path)
+        bridge.save_user_setting("hython_path", path)
+        idx = self.hython_combo.findData(path)
+        if idx >= 0:
+            self.hython_combo.setCurrentIndex(idx)
+        else:
+            self.hython_combo.setCurrentIndex(self.hython_combo.count() - 1)
+
+    # -- presets and AOV slots --------------------------------------------
+
+    @Slot(int)
+    def on_preset_changed(self, index: int) -> None:
+        name = self.preset_combo.itemData(index)
+        if not name:
+            return
+        all_presets = presets.get_default_presets()
+        if name in all_presets:
+            p = all_presets[name]
+            if "renderer" in p:
+                self.renderer_combo.setCurrentText(p["renderer"])
+            if "resolution" in p and p["resolution"]:
+                self.res_check.setChecked(True)
+                self.res_x.setValue(p["resolution"][0])
+                self.res_y.setValue(p["resolution"][1])
+            if "threads" in p:
+                self.threads_spin.setValue(p["threads"])
+            if "snapshot_interval" in p:
+                self.snapshot_spin.setValue(p["snapshot_interval"])
+            if "verbosity" in p:
+                self.verbosity_edit.setText(p["verbosity"])
+            if "extra_args" in p:
+                self.extra_edit.setText(" ".join(p["extra_args"]))
+            self.refresh_command()
+
+    @Slot()
+    def select_all_aovs(self) -> None:
+        self.aov_list.blockSignals(True)
+        for i in range(self.aov_list.count()):
+            self.aov_list.item(i).setCheckState(Qt.Checked)
+        self.aov_list.blockSignals(False)
+        self.refresh_command()
+
+    @Slot()
+    def select_beauty_aovs(self) -> None:
+        self.aov_list.blockSignals(True)
+        for i in range(self.aov_list.count()):
+            item = self.aov_list.item(i)
+            name = item.text().lower()
+            keep = ("beauty" in name or "depth" in name or name in ("c", "z", "alpha"))
+            item.setCheckState(Qt.Checked if keep else Qt.Unchecked)
+        self.aov_list.blockSignals(False)
+        self.refresh_command()
+
+    @Slot()
+    def clear_all_aovs(self) -> None:
+        self.aov_list.blockSignals(True)
+        for i in range(self.aov_list.count()):
+            self.aov_list.item(i).setCheckState(Qt.Unchecked)
+        self.aov_list.blockSignals(False)
+        self.refresh_command()
+
+    @Slot()
+    def export_farm_job(self) -> None:
+        jobs = self.build_jobs()
+        if not jobs:
+            QMessageBox.warning(self, "No Render Job", "Read a scene and select a valid ROP first.")
+            return
+
+        choice, ok = QFileDialog.getSaveFileName(
+            self, "Export Farm Submission File",
+            os.path.expanduser("~/deadline_job.job"),
+            "Deadline Job (*.job);;Tractor Job (*.alf)",
+        )
+        if not ok or not choice:
+            return
+
+        if choice.endswith(".alf"):
+            farm.export_tractor_job(jobs, choice)
+            QMessageBox.information(self, "Tractor Job Exported", f"Exported Tractor job script:\n{choice}")
+        else:
+            out_dir = os.path.dirname(choice) or os.getcwd()
+            j_path, p_path = farm.export_deadline_job(jobs, out_dir)
+            QMessageBox.information(self, "Deadline Job Exported", f"Exported Deadline job files:\n{j_path}\n{p_path}")
+
     # -- scene reading ----------------------------------------------------
 
     @Slot()
@@ -335,7 +552,7 @@ class LauncherWindow(QMainWindow):
             self.read_scene()
 
     @Slot()
-    def read_scene(self) -> None:
+    def read_scene(self, force_reload: bool = False) -> None:
         hip_path = self.hip_edit.text().strip()
         if not hip_path:
             self.status_label.setText("Choose a .hip file first.")
@@ -345,6 +562,13 @@ class LauncherWindow(QMainWindow):
                                 f"There is no file at:\n{hip_path}")
             return
 
+        if not force_reload:
+            cached = bridge.load_cached(hip_path)
+            if cached:
+                self.on_scene_read(cached)
+                self.status_label.setText(f"Loaded cached manifest for {os.path.basename(hip_path)} (Instant).")
+                return
+
         self.read_btn.setEnabled(False)
         self.status_label.setText("Reading scene in hython. Large scenes take a while…")
 
@@ -353,6 +577,7 @@ class LauncherWindow(QMainWindow):
             hip_path,
             export_usd=self.export_usd_check.isChecked(),
             flatten=self.flatten_check.isChecked(),
+            hython=self.hython_edit.text().strip(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -372,6 +597,19 @@ class LauncherWindow(QMainWindow):
         for rop in manifest.rops:
             self.rop_combo.addItem(rop.node_path, rop.node_path)
         self.rop_combo.blockSignals(False)
+
+        # Populate AOVs — display the (distinct) prim name, key by prim path.
+        self.aov_list.blockSignals(True)
+        self.aov_list.clear()
+        for v in manifest.vars:
+            item = QListWidgetItem(v.prim_path.rsplit("/", 1)[-1])
+            item.setData(Qt.UserRole, v.prim_path)
+            item.setToolTip(f"{v.prim_path}\nsource: {v.source_name or '—'} "
+                            f"({v.source_type or '—'}, {v.data_type or '—'})")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.aov_list.addItem(item)
+        self.aov_list.blockSignals(False)
 
         self.settings_combo.clear()
         self.settings_combo.addItem("(from ROP / stage default)", "")
@@ -415,14 +653,14 @@ class LauncherWindow(QMainWindow):
     def current_rop(self) -> Optional[RenderRop]:
         if not self.manifest:
             return None
-        return self.manifest.rop(self.rop_combo.currentData() or "")
+        node_path = self.rop_combo.currentData() or self.rop_combo.currentText()
+        return self.manifest.rop(node_path)
 
     @Slot(int)
-    def on_rop_changed(self, _index: int) -> None:
+    def on_rop_changed(self, index: int) -> None:
         rop = self.current_rop()
         if not rop or not self.manifest:
             return
-
         settings = self.manifest.resolve_settings(rop)
 
         if rop.renderer:
@@ -493,13 +731,32 @@ class LauncherWindow(QMainWindow):
 
     # -- command ----------------------------------------------------------
 
-    def build_jobs(self) -> list:
+    def _selected_aov_paths(self) -> Optional[list]:
+        """Checked AOV prim paths, or None when every AOV is selected.
+
+        None means "no filtering" — render the scene's products untouched. A
+        strict subset returns the paths to keep; AOV editing is a USD edit
+        (husk has no AOV flag), applied at render time via bridge.filter_aovs.
+        """
+        if not self.manifest or self.aov_list.count() == 0:
+            return None
+        checked = [self.aov_list.item(i).data(Qt.UserRole)
+                   for i in range(self.aov_list.count())
+                   if self.aov_list.item(i).checkState() == Qt.Checked]
+        checked = [p for p in checked if p]
+        all_paths = {v.prim_path for v in self.manifest.vars}
+        if not all_paths or set(checked) == all_paths:
+            return None
+        return checked
+
+    def build_jobs(self, usd_override: Optional[str] = None) -> list:
         rop = self.current_rop()
         if not rop or not self.manifest:
             return []
 
-        usd_file = rop.usd_path
-        if not usd_file:
+        engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+        usd_file = usd_override or rop.usd_path
+        if engine == "husk" and not usd_file:
             return []
 
         settings_prim = self.settings_combo.currentData()
@@ -507,6 +764,7 @@ class LauncherWindow(QMainWindow):
             settings_prim = self.settings_combo.currentText()
 
         overrides = {
+            "engine": engine,
             "renderer": self.renderer_combo.currentText().strip(),
             "settings_prim": settings_prim or "",
             "camera": self.camera_combo.currentText().strip(),
@@ -536,19 +794,42 @@ class LauncherWindow(QMainWindow):
         jobs = self.build_jobs()
         if not jobs:
             rop = self.current_rop()
-            if rop and not rop.usd_path:
+            engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+            if rop and engine == "husk" and not rop.usd_path:
                 self.command_view.setPlainText(
                     "No USD on disk for this ROP. Turn on “Write USD while "
-                    "reading” and read the scene again."
+                    "reading” and read the scene again, or switch to Hython engine."
                 )
             else:
                 self.command_view.setPlainText("")
+            self.preflight_label.setStyleSheet("color: palette(mid);")
+            self.preflight_label.setText("Preflight: No active job.")
             return
 
         preview = husk_mod.format_command(husk_mod.build_command(jobs[0]))
         if len(jobs) > 1:
             preview += f"\n\n… and {len(jobs) - 1} more chunk(s) with different --frame values."
+        engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+        if engine == "husk" and self._selected_aov_paths() is not None:
+            preview += ("\n\n# AOVs will be filtered to your selection via a USD "
+                        "overlay authored in hython at render start.")
         self.command_view.setPlainText(preview)
+
+        pf_warnings = preflight.run_preflight_checks(jobs[0], self.manifest)
+        if pf_warnings:
+            errs = [w for w in pf_warnings if w.level == "error"]
+            warns = [w for w in pf_warnings if w.level == "warning"]
+            if errs:
+                self.preflight_label.setStyleSheet("color: #F44336; font-weight: bold;")
+                self.preflight_label.setText(f"Preflight: {len(errs)} Error(s), {len(warns)} Warning(s).")
+            else:
+                self.preflight_label.setStyleSheet("color: #FF9800; font-weight: bold;")
+                self.preflight_label.setText(f"Preflight: {len(warns)} Warning(s) detected.")
+            self.preflight_label.setToolTip("\n".join(f"[{w.level.upper()}] {w.message}" for w in pf_warnings))
+        else:
+            self.preflight_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            self.preflight_label.setText("Preflight: All checks passed cleanly.")
+            self.preflight_label.setToolTip("Scene and job parameters are valid.")
 
     @Slot()
     def copy_command(self) -> None:
@@ -567,7 +848,8 @@ class LauncherWindow(QMainWindow):
             )
             return
 
-        if not husk_mod.find_husk():
+        engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+        if engine == "husk" and not husk_mod.find_husk():
             QMessageBox.warning(
                 self, "husk not found",
                 "husk is not on PATH and $HFS is not set.\n\n"
@@ -575,6 +857,43 @@ class LauncherWindow(QMainWindow):
             )
             return
 
+        # AOV editing is a USD edit, not a husk flag. If the user picked a
+        # subset (husk engine), author the overlay in a worker thread first,
+        # then launch the queue against it — never freeze the UI on hython.
+        keep = self._selected_aov_paths() if engine == "husk" else None
+        if keep is not None:
+            self.render_btn.setEnabled(False)
+            self.status_label.setText("Filtering AOVs in hython…")
+            self._filter_thread = QThread(self)
+            self._filter_worker = FilterWorker(
+                self.current_rop().usd_path, keep,
+                hython=self.hython_edit.text().strip())
+            self._filter_worker.moveToThread(self._filter_thread)
+            self._filter_thread.started.connect(self._filter_worker.run)
+            self._filter_worker.finished.connect(self._on_aovs_filtered)
+            self._filter_worker.failed.connect(self._on_filter_failed)
+            self._filter_worker.finished.connect(self._filter_thread.quit)
+            self._filter_worker.failed.connect(self._filter_thread.quit)
+            self._filter_thread.start()
+            return
+
+        self._launch_queue(jobs)
+
+    @Slot(str)
+    def _on_aovs_filtered(self, filtered_usd: str) -> None:
+        jobs = self.build_jobs(usd_override=filtered_usd)
+        if not jobs:
+            self._on_filter_failed("The filtered USD produced no render jobs.")
+            return
+        self._launch_queue(jobs)
+
+    @Slot(str)
+    def _on_filter_failed(self, message: str) -> None:
+        self.render_btn.setEnabled(True)
+        self.status_label.setText("AOV filtering failed.")
+        QMessageBox.critical(self, "Could not filter AOVs", message[-4000:])
+
+    def _launch_queue(self, jobs: list) -> None:
         self.log_view.clear()
         self.overall_bar.setValue(0)
 

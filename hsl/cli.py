@@ -82,14 +82,29 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def _aov_keys(var) -> set:
+    """Names a var can be referred to by: prim basename, label, source name."""
+    basename = var.prim_path.rsplit("/", 1)[-1]
+    return {k.lower() for k in (basename, var.label, var.source_name) if k}
+
+
+def _resolve_aovs(manifest: SceneManifest, spec: str) -> list:
+    """Map a comma spec (``beauty,depth``) to matching RenderVar prim paths."""
+    wanted = [s.strip().lower() for s in spec.split(",") if s.strip()]
+    return [v.prim_path for v in manifest.vars
+            if any(w in _aov_keys(v) for w in wanted)]
+
+
 def cmd_render(args) -> int:
+    engine = "hython" if getattr(args, "direct_hython", False) else getattr(args, "engine", "husk")
+    export_usd = (engine == "husk")
     manifest = bridge.inspect_hip(args.hip, hython=args.hython,
-                                  export_usd=True, usd_dir=args.usd_dir,
+                                  export_usd=export_usd, usd_dir=args.usd_dir,
                                   flatten=args.flatten, rop=args.rop)
     rop = _pick_rop(manifest, args.rop)
     if rop is None:
         return 2
-    if not rop.usd_path:
+    if engine == "husk" and not rop.usd_path:
         sys.stderr.write("The stage could not be written to USD; nothing to render.\n")
         for warning in manifest.warnings:
             sys.stderr.write(f"  {warning}\n")
@@ -100,9 +115,31 @@ def cmd_render(args) -> int:
         rop.frame_start, rop.frame_end, rop.frame_inc = start, end, inc
         rop.use_frame_range = end != start
 
+    # AOV selection is a USD edit, not a husk flag: keep only the requested
+    # RenderVars by rendering an overlay produced by bridge.filter_aovs.
+    usd_for_render = rop.usd_path
+    keep = None
+    if engine == "husk" and getattr(args, "aovs", ""):
+        keep = _resolve_aovs(manifest, args.aovs)
+        if not keep:
+            available = sorted({v.prim_path.rsplit("/", 1)[-1] for v in manifest.vars})
+            sys.stderr.write(f"--aovs '{args.aovs}' matched no RenderVars. "
+                             f"Available: {', '.join(available) or '(none)'}\n")
+            return 4
+        if set(keep) == {v.prim_path for v in manifest.vars}:
+            keep = None                       # selection is everything: no filter
+
+    if keep is not None and not args.dry_run:
+        try:
+            usd_for_render = bridge.filter_aovs(rop.usd_path, keep, hython=args.hython)
+        except bridge.InspectError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 3
+
     jobs = husk_mod.jobs_for_rop(
-        manifest, rop, rop.usd_path,
+        manifest, rop, usd_for_render,
         chunk_size=args.chunk,
+        engine=engine,
         renderer=args.renderer or None,
         camera=args.camera or None,
         settings_prim=args.settings or None,
@@ -114,6 +151,9 @@ def cmd_render(args) -> int:
     )
 
     if args.dry_run:
+        if keep is not None:
+            print(f"# AOVs filtered to: {args.aovs} "
+                  f"(overlay USD authored from {os.path.basename(rop.usd_path)} at render time)")
         for job in jobs:
             print(husk_mod.format_command(husk_mod.build_command(job)))
         return 0
@@ -172,7 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Also write the USD to disk")
     p_inspect.set_defaults(func=cmd_inspect)
 
-    p_render = sub.add_parser("render", parents=[common], help="Render with husk")
+    p_render = sub.add_parser("render", parents=[common], help="Render with husk or hython")
+    p_render.add_argument("--engine", choices=["husk", "hython"], default="husk",
+                          help="Render engine: husk (USD export) or hython (direct ROP)")
+    p_render.add_argument("--direct-hython", action="store_true",
+                          help="Shortcut for --engine hython (0 USD disk space)")
     p_render.add_argument("--rop", default="", help="ROP node path")
     p_render.add_argument("--frames", type=parse_frames, default=None,
                           help="1001, 1001-1100 or 1001-1100x2")
@@ -183,6 +227,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("--renderer", default="")
     p_render.add_argument("--camera", default="")
     p_render.add_argument("--settings", default="", help="RenderSettings prim path")
+    p_render.add_argument("--aovs", default="",
+                          help="Comma list of AOVs to keep (by name), e.g. beauty,depth. "
+                               "Others are dropped from the USD products (husk only)")
     p_render.add_argument("--output", default="")
     p_render.add_argument("--res", nargs=2, type=int, metavar=("W", "H"))
     p_render.add_argument("--threads", type=int, default=0)
