@@ -1,0 +1,182 @@
+# hsl — Solaris Render Launcher
+
+Load a `.hip`, read what the LOP network is actually set up to render, and fire
+`husk` at it. GUI, CLI, or importable library.
+
+---
+
+## Why it's split in two
+
+`hou` only exists inside `hython`. `husk` is a separate binary. A GUI that
+imports `hou` inherits hython's startup cost, its license checkout, and its
+event loop — all for what amounts to a single read of the scene.
+
+So there are two halves that never meet:
+
+```
+┌─ hython ──────────────┐         ┌─ plain Python ──────────────┐
+│  hsl.inspector        │  JSON   │  hsl.bridge                 │
+│  · loads the .hip     │ ──────▶ │  hsl.husk    → argv          │
+│  · cooks the LOPs     │manifest │  hsl.runner  → husk procs    │
+│  · walks the USD stage│         │  hsl.ui / hsl.cli            │
+│  · writes USD to disk │         └─────────────────────────────┘
+└───────────────────────┘
+```
+
+`hsl/manifest.py` is the contract between them — pure dataclasses, standard
+library only. Everything downstream of the manifest is testable without
+Houdini installed, which is why `tests/test_core.py` covers it.
+
+Practical payoffs: the UI stays responsive during a two-minute hip load,
+manifests can be cached and diffed, and the inspector is reusable as-is for
+farm submission.
+
+---
+
+## Install
+
+```bash
+export HFS=/opt/hfs20.5          # or: cd /opt/hfs20.5 && source houdini_setup
+pip install PySide6              # GUI only; the CLI has no dependencies
+```
+
+`hython` and `husk` are found via `$HFS/bin`, then `PATH`. Override either with
+`$HSL_HYTHON` / `$HSL_HUSK`.
+
+## Use
+
+```bash
+# What is this scene set up to render?
+python -m hsl.cli inspect /jobs/shot/shot_v012.hip
+
+# Show the husk commands without running anything
+python -m hsl.cli render shot.hip --frames 1001-1100 --chunk 10 --dry-run
+
+# Render, four husk processes at a time
+python -m hsl.cli render shot.hip \
+    --rop /stage/usdrender_rop1 \
+    --frames 1001-1100 --chunk 10 --parallel 4
+
+# Quarter-res check render of a single frame
+python -m hsl.cli render shot.hip --frames 1050 --res 960 540 \
+    --renderer BRAY_HdKarmaXPU
+
+# GUI
+python -m hsl.cli ui shot.hip
+```
+
+As a library:
+
+```python
+from hsl import bridge, husk
+
+manifest = bridge.inspect_hip("shot.hip", export_usd=True)
+rop = manifest.rops[0]
+settings = manifest.resolve_settings(rop)
+
+print(settings.resolution, settings.camera)
+print([v.label for v in manifest.aovs_for(settings)])
+
+jobs = husk.jobs_for_rop(manifest, rop, rop.usd_path, chunk_size=10)
+for job in jobs:
+    print(husk.format_command(husk.build_command(job)))
+```
+
+---
+
+## What it reads
+
+Node parameters are treated as **hints**. The authoritative source is the
+composed USD stage, because in Solaris the render settings can be authored
+anywhere in the layer stack — the ROP parameter is just a pointer, and is often
+empty.
+
+From the stage: every `UsdRenderSettings` (resolution, camera, pixel aspect,
+conform policy, included purposes), every `UsdRenderProduct` (output paths),
+every `UsdRenderVar` (your AOVs, with data and source types), every
+`UsdGeomCamera`, and any namespaced delegate knobs — `karma:*`, `ri:*`,
+`arnold:*` — authored on the settings prim.
+
+From the ROP: renderer, settings prim, camera, frame range.
+
+Settings resolution order: ROP parameter → stage `renderSettingsPrimPath`
+metadata → the only settings prim if there's exactly one.
+
+### Version tolerance
+
+`usdrender_rop` parameter names have drifted across 19.0 → 20.5. Every read
+goes through `_parm(node, candidate_names, default)`, which tries a list and
+falls back quietly rather than raising `AttributeError` on a scene from a
+different build. Anything it couldn't find lands in `RenderRop.raw_parms` and
+in `manifest.warnings` so you can see what was missed rather than getting a
+silently wrong command.
+
+---
+
+## Things worth knowing
+
+**USD export uses a temporary `usd_rop`, not `Usd.Stage.Export()`.** This is
+deliberate. `Export()` serialises the stage as cooked at a single time — any
+animation, motion blur samples, or per-frame value clips are silently dropped,
+and you get a still frame repeated across the range with no error to tell you
+why. The temporary ROP re-cooks per frame. It's wired to the render ROP's
+input, cooked, and destroyed; the `.hip` is never saved.
+
+**Chunking is measured in frames rendered, not frame numbers.** With an
+increment of 2 over 1–100 and a chunk size of 10, each chunk renders 10 frames
+and spans 20 frame numbers. `husk` takes `--frame-count`, not an end frame,
+which is the usual source of off-by-one errors here.
+
+**`--parallel` is for one machine.** Several husk processes on one box contend
+for RAM and cores; each also checks out its own Karma license. Two or three is
+usually the sweet spot on a workstation. For real distribution, use `--dry-run`
+and feed the commands to your scheduler.
+
+**Verify the husk flags against your build.** `build_command()` emits
+`--renderer --frame --frame-count --frame-inc --settings --camera --output
+--res --threads --complexity --purpose --snapshot --make-output-path
+--fast-exit --verbose`. These are stable across recent Houdini, but run
+`husk --help` on your version before trusting the ones you don't already use.
+`--verbose` takes a single token: a level plus optional flag letters, where `a`
+selects Alfred-style `ALF_PROGRESS n%` output — which is what `parse_progress()`
+reads to drive the progress bars. Turning Alfred off leaves the bars at zero.
+
+**Licensing.** `husk` pulls a Karma render license rather than a full Houdini
+license, so it parallelises without eating interactive seats. The inspector
+does need a real hython license for as long as it takes to load and cook.
+On Indie, husk is capped at 1920×1080.
+
+---
+
+## Verified vs. not
+
+The manifest, chunking, command construction, progress parsing and the process
+queue are covered by 46 tests, including a fake husk that exercises the full
+run/cancel/failure path:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+`hsl/inspector.py` needs `hou` and `pxr`. It has now been probed against
+**Houdini 21.0.729 and 22.0.368** with `scripts/verify_environment.py` — every
+node type, ROP/USD-ROP parameter and USD schema call it relies on is confirmed
+on both (see `docs/UNVERIFIED.md`). That probe fixed two silent version-drift
+bugs (`override_camera`, `flattenalllayers`). What it does **not** yet cover is a
+real scene's AOVs (whether Solaris types `UsdRender.Var` prims — item D2), so
+still start with `inspect` on a scene you know well and check the reported
+resolution, camera and AOVs against what Houdini shows you. `hsl/ui.py` was
+import-checked against stubbed Qt, not exercised live.
+
+---
+
+## Extending
+
+- **Farm submission** — `husk.jobs_for_rop()` already gives you one job per
+  chunk. Swap `RenderQueue` for a Deadline/Tractor submitter and emit
+  `build_command(job)` per task.
+- **In-session variant** — for a shelf tool inside Houdini, skip `bridge`
+  entirely and call `inspector.walk_stage(hou.node('/stage/…').stage())`
+  directly. The manifest and everything downstream are unchanged.
+- **Layout / IFD-style preflight** — `manifest.warnings` is the natural place
+  to hang missing-texture and unresolved-reference checks before submitting.

@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Houdini
+*.hip
+*.hipnc
+*.hiplc
+backup/
+*.rat
+*.bgeo*
+
+# hsl scratch
+/tmp/hsl/
+*.usd
+*.usda
+*.usdc
+manifest_*.json
+
+# renders
+*.exr
+*.jpg
+*.png
+!docs/**/*.png
+
+.DS_Store
+.idea/

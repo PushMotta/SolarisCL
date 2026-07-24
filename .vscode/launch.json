@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "hsl: launcher window",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "hsl.cli",
+      "args": ["ui"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "hsl: inspect a scene",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "hsl.cli",
+      "args": ["inspect", "${input:hipFile}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "hsl: render (dry run)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "hsl.cli",
+      "args": ["render", "${input:hipFile}", "--frames", "1-10", "--chunk", "5", "--dry-run"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "hsl: all tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "unittest",
+      "args": ["discover", "-s", "tests", "-v"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "hipFile",
+      "type": "promptString",
+      "description": "Path to a .hip file",
+      "default": ""
+    }
+  ]
+}

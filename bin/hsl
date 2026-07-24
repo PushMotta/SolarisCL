@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Solaris Render Launcher. Usage: hsl inspect|render|ui ...
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}"
+exec "${HSL_PYTHON:-python3}" -m hsl.cli "$@"

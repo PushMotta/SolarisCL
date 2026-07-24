@@ -1,0 +1,24 @@
+[project]
+name = "hsl"
+version = "0.1.0"
+description = "Launch Houdini Solaris renders from a .hip file"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+
+[project.scripts]
+hsl = "hsl.cli:main"
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"hsl/inspector.py" = ["F401"]   # hou/pxr imports are guarded, not unused
+"scripts/_probe_houdini.py" = ["E402"]  # must import hou before anything else
