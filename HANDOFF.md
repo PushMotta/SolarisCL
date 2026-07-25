@@ -1,0 +1,161 @@
+# Session handoff — hsl / SolarisCL
+
+Read `AGENTS.md` (canonical brief) and `docs/UNVERIFIED.md` first. This file is
+the *session* state: what's been done, what's proven, the gotchas, and what's
+left. Written 2026-07-25.
+
+## TL;DR
+
+`hsl` is a Solaris/Karma render launcher (GUI + CLI + library). It loads a
+Houdini `.hip` under **hython**, reads the render setup from the composed USD
+stage, exports USD, and drives **husk** — with a plain-Python side that stays
+testable without Houdini. This session verified it against real Houdini, fixed
+several silent bugs, added AOV editing + missing-texture scan/relink, and proved
+the whole chain on a real production shot.
+
+- **Repo:** github.com/PushMotta/SolarisCL (private, `main`), clean & synced at
+  commit `529e71d`. **59 tests green**; boundary/drift/ui-imports green.
+- **Project lives at:** `F:\Nexus Projects\SolarisCL\extracted\pack\solaris_launcher`
+  (unpacked from `files.zip` → `solaris_launcher_pack.tar.gz`). The git repo root
+  is that `solaris_launcher` dir.
+- **Persistent memory** already holds `houdini-env` and `solaris-cl-project`.
+
+## Environment (this machine — critical)
+
+- Windows 11. `$HFS` is **unset**; hython/husk are **not on PATH**. The tool
+  auto-discovers installs (`bridge.list_hython_installations`), but for manual
+  hython calls set e.g.
+  `$env:HFS = "C:\Program Files\Side Effects Software\Houdini 22.0.368"`.
+- **Two Houdini installs:** `22.0.368` (USD 0.26.5) and `21.0.729` (USD 0.25.5).
+  **H21 has an Octane plugin** that prints `[Octane] …` banners to stdout — the
+  probe uses a `@@HSL_PROBE_JSON@@` sentinel so that can't corrupt parsing.
+- **C: is ~94% full (~57 GB free of 931 GB).** USD exports of heavy sims fill it
+  fast (see cost note). Point `--usd-dir` at a roomier drive for real exports.
+- **Test scene:** `V:\Pushvfx Dropbox\Pedro Motta\Etihad\ETIHAD RAIL_RX_SHARE\3D\HOUDINI\SHOT_SandBurst_ROCHA_v14_Motta.hiplc`.
+  `V:` is the user's Dropbox — **never write render outputs there**; use scratch.
+
+## Gotchas learned this session (will bite the next session)
+
+- **Boundary rule is load-bearing:** `hou`/`pxr` only in `hsl/inspector.py`, Qt
+  only in `hsl/ui.py`, stdlib only in `hsl/manifest.py`. Enforced by
+  `.claude/hooks/boundary_guard.py` + tests. Never widen it (no `try: import hou`).
+- **Never invent a husk flag or Houdini parm.** husk has **no `--aov`/`--skip-aov`**
+  and **no missing-texture pre-scan**; `--mask` is a stage-population mask,
+  `--mplay-monitor` is display-only. Verify against `husk --help` / a probe and
+  record in `docs/UNVERIFIED.md`.
+- **git-bash mangles args starting with `/`** (USD prim paths, `--keep`,
+  `--settings`). Run hython/husk calls that take prim-path args from **PowerShell**
+  (native, no mangling) — or through the tool's `subprocess` (no shell, safe).
+  The tool itself is fine; only manual bash invocations are affected.
+- **hython crashes on teardown (exit 5/255) on heavy scenes** *after* the work
+  finishes. Python's block-buffered stdout is then lost. Always
+  `print(..., flush=True)` (or `sys.stdout.flush()`) in probe scripts, ideally
+  incrementally, so results survive.
+- **PowerShell piping to `python -c` adds a UTF-8 BOM** → `json.load` fails. Print
+  the raw JSON line instead of re-parsing through a pipe.
+- A sandbox guard once **blocked `Remove-Item`** because a `C:\Program …` path
+  appeared in the same command. Use `rm` (bash) or isolate the command.
+
+## How USD edits work here (AOV filter, relink)
+
+Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
+`hsl/bridge.py`, because husk has no flags for them:
+- `filter_usd_aovs` — overlay overriding each `UsdRenderProduct.orderedVars` to a
+  chosen subset. Driver: CLI `render --aovs beauty,depth`, UI AOV Manager.
+- `relink_assets` — overlay repathing unresolved assets (empty
+  `Sdf.AssetPath.resolvedPath`) to same-basename files found under search dirs.
+  Driver: CLI `render --relink-from DIR`, UI "Relink textures…".
+- Overlays sublayer the export and override just what's needed — **fast, no
+  re-cook**. husk/hython render the overlay.
+
+## What was done this session
+
+1. **Assessed the pack**; ran `make check` (proven-vs-asserted).
+2. **Verified `inspector.py` against Houdini 21 + 22.** Fixed two *silent*
+   version-drift bugs: ROP camera parm is `override_camera` (old candidates were
+   all wrong); flatten token is `flattenalllayers` (old `flattenall` is not a
+   real menu token, silently ignored). Hardened `verify_environment.py`
+   (Octane-banner sentinel), made probe D2 an honest SKIP, reconciled
+   `check_drift.py` with the Windows copy-fallback, fixed doc drift.
+3. **Reviewed another agent's feature drop and fixed the dangerous parts** —
+   invented husk `--aov`/`--skip-aov` (reimplemented AOV editing as USD overlays),
+   invented `--disable-depth-of-field` preset flag (removed), a silently-deleted
+   scene-load error dialog (restored), a non-functional Frame Preview stub
+   (removed), duplicate `find_hython` (deduped). Kept the genuinely good adds:
+   hython auto-discovery, preflight, presets, farm export (sketch), and a
+   **direct-hython render engine** (`--engine hython` / `render_direct`).
+4. **`/hip-check` on the real scene** resolved the two big unknowns: Karma **does**
+   author typed `UsdRender.Var` prims (AOVs populate — D2), and `karma:*`/`husk:*`
+   settings read off the settings prim (D4).
+5. **Added missing-texture scan + relink + output browse.** `scan_missing_assets`
+   populates `manifest.missing_assets`; **preflight now raises them as errors**
+   (the gap that let a render start with missing maps).
+6. **Proved the full chain on the real shot:** scan found **4 real missing gravel
+   textures** (`mxn_gravel_crushed`, authored with `D:/Dropbox/WORK/…` absolute
+   paths — Dropbox is `V:` here). Relink from `V:\…\3D\HOUDINI\tex` → 0 missing.
+   husk rendered the relinked USD, **loaded the 4K gravel textures**, `Render
+   complete` in 100 s. First **live** confirmation that `--verbose 3a` emits
+   `ALF_PROGRESS`.
+
+## Verified vs. not (see `docs/UNVERIFIED.md`)
+
+- **Verified on 21.0.729 + 22.0.368:** all node types, ROP/USD-ROP parms, husk
+  flags, USD schema calls; AOV overlay filter; missing-asset scan + relink
+  (scalar + array, recursive search).
+- **Known husk facts:** no `--aov`/`--skip-aov`; no missing-texture pre-scan;
+  `-o/--output` overrides **only the first product** (multi-product needs a
+  productName overlay).
+- **Cost of USD export (SandBurst):** hip load ~7 s; `.usd` structure ~57 MB
+  (negligible); **VDB volume sidecar ≈ tens of GB per frame** (44 GB observed for
+  one frame) — the export **bakes** volumes because they're live SOP-imported
+  (`OpenVDBAsset.filePath` is empty; verified 4 volumes / 8 field assets, 0
+  filePaths). A full 1–30 export ≈ ~1 TB and won't fit on C:. **For volume-heavy
+  shots, the hython-direct engine (no export) is the right choice.**
+
+## Open follow-ups (prioritized)
+
+1. ~~**Volume-bake preflight warning**~~ — **BUILT (2026-07-25 cont.), Houdini
+   verification pending.** `inspector.scan_live_volumes()` groups empty-`filePath`
+   `OpenVDBAsset` fields under their owning `UsdVol.Volume` into
+   `manifest.live_volumes`. Preflight raises a `volume_bake` **warning** for the
+   husk engine; and the real guard — `inspect(allow_volume_bake=False)` **skips
+   the export** for a live-volume ROP, so `hsl render --engine husk` aborts with
+   advice (use `--engine hython`, cache to `.vdb`, or `--allow-volume-bake`)
+   instead of filling the disk. Surfaced in CLI `inspect`/`render` and the UI
+   status/preflight tooltip. Plain-Python layer tested (62 tests green); the
+   `UsdVol` scan itself is **unverified on a real install** — see `docs/UNVERIFIED.md`
+   D6–D8. **Next:** run against SandBurst (known 4 volumes / 8 fields / 0
+   filePaths) and move D6–D8 to Verified.
+2. **Complete the render-path override:** husk `--output` only redirects product
+   0. Add a productName overlay to redirect **all** products to a chosen folder
+   (reuse the overlay mechanism).
+3. **Relink for the hython-direct engine:** relink currently only helps the husk
+   (USD) path; `render_direct` renders the ROP as-authored. Would need parm-level
+   repath.
+4. **Export only the frames being rendered:** export writes the ROP's full
+   authored range regardless of `--frames`; narrowing it cuts export cost.
+5. **Farm exporter is a sketch:** `farm.export_deadline_job` only emits job[0]'s
+   command (no per-task frame token) — won't distribute a chunked render. Tractor
+   is closer. Needs a real fix + a test that asserts frame distribution.
+6. **`render_direct` rough edges:** progress is faked (0→100, nothing between);
+   `resolutionx`/`resolutiony` overrides are unverified (likely silent no-op).
+7. **TASKS.md T1** (other `_set_parm` returns in `export_usd` unchecked) — harmless
+   on 21/22 since the parms exist, but a real gap on an untested build.
+8. **Precise per-frame export TIME** was never captured (disk filled). Re-run
+   `scratchpad/export_timing.py` (now flushed) with `--usd-dir`/outdir on a drive
+   with hundreds of GB free.
+
+## How to run / verify
+
+```bash
+python -m unittest discover -s tests        # 59 tests, no Houdini needed
+make check                                   # tests + boundary + drift + ui-imports (green on Windows)
+# with $HFS set to a Houdini install:
+python scripts/verify_environment.py --report
+python -m hsl.cli inspect <hip>              # lists ROPs, res, camera, AOVs, MISSING textures
+python -m hsl.cli render <hip> --frames 1 --aovs beauty --relink-from <texdir> --output <path> --dry-run
+python -m hsl.cli render <hip> --frames 1 --engine hython   # direct render, no USD export
+```
+
+The scratchpad has probe scripts from this session (export_timing.py, scan_real.py,
+volume_probe.py, tex_probe.py, and USD fixtures) if useful to re-run.
