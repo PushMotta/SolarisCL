@@ -19,7 +19,8 @@ from hsl.husk import (
     jobs_for_rop, looks_like_error, parse_progress,
 )
 from hsl.manifest import (
-    Camera, RenderProduct, RenderRop, RenderSettings, RenderVar, SceneManifest,
+    Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
+    RenderVar, SceneManifest,
 )
 from hsl.runner import RenderQueue, State
 
@@ -77,6 +78,18 @@ class TestManifest(unittest.TestCase):
         self.assertIsInstance(restored.cameras[0], Camera)
         self.assertEqual(restored.settings[0].resolution, (2048, 858))
         self.assertEqual(restored.rops[0].renderer, "BRAY_HdKarmaXPU")
+
+    def test_round_trip_live_volumes(self):
+        original = sample_manifest()
+        original.live_volumes = [
+            LiveVolume(prim_path="/stage/pyro/volume",
+                       field_count=2, field_names=["density", "vel"]),
+        ]
+        restored = SceneManifest.from_json(original.to_json())
+        self.assertIsInstance(restored.live_volumes[0], LiveVolume)
+        self.assertEqual(restored.live_volumes[0].field_names, ["density", "vel"])
+        self.assertEqual(restored.live_volumes[0].field_count, 2)
+        self.assertEqual(restored.live_volumes[0].label, "volume")
 
     def test_frame_count(self):
         rop = sample_manifest().rops[0]
@@ -406,7 +419,6 @@ class TestPreflight(unittest.TestCase):
 
     def test_preflight_flags_missing_textures(self):
         # The gap this closes: a missing texture must be a preflight error.
-        from hsl.manifest import MissingAsset
         m = sample_manifest()
         m.missing_assets = [MissingAsset(attr_path="/mat/tex.inputs:file",
                                          asset_path="/tex/wood.exr")]
@@ -415,6 +427,27 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].level, "error")
         self.assertIn("wood.exr", hits[0].message)
+
+    def test_preflight_flags_live_volumes_for_husk(self):
+        # Live volumes bake ~GB/frame on a husk USD export — warn about it.
+        m = sample_manifest()
+        m.live_volumes = [LiveVolume(prim_path="/stage/pyro/volume",
+                                     field_count=2, field_names=["density", "vel"])]
+        warnings = preflight.run_preflight_checks(
+            RenderJob(usd_file="/s.usd", engine="husk"), m)
+        hits = [w for w in warnings if w.category == "volume_bake"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "warning")
+        self.assertIn("density", hits[0].message)
+
+    def test_preflight_live_volumes_ignored_for_hython(self):
+        # The hython engine never exports, so there is nothing to bake.
+        m = sample_manifest()
+        m.live_volumes = [LiveVolume(prim_path="/stage/pyro/volume",
+                                     field_count=1, field_names=["density"])]
+        warnings = preflight.run_preflight_checks(
+            RenderJob(usd_file="", engine="hython"), m)
+        self.assertFalse(any(w.category == "volume_bake" for w in warnings))
 
 
 class TestPresets(unittest.TestCase):

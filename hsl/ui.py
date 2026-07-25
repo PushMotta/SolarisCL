@@ -665,6 +665,9 @@ class LauncherWindow(QMainWindow):
         found = f"{len(manifest.rops)} ROP(s), {len(manifest.settings)} render settings prim(s)"
         if manifest.missing_assets:
             found += f" — ⚠ {len(manifest.missing_assets)} missing texture(s), use Relink"
+        if manifest.live_volumes:
+            found += (f" — ⚠ {len(manifest.live_volumes)} live volume(s) bake on export, "
+                      f"prefer Hython engine")
         if manifest.warnings:
             found += f" — {len(manifest.warnings)} warning(s)"
         self.status_label.setText(found)

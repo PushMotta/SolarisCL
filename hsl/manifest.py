@@ -96,6 +96,27 @@ class MissingAsset:
         return self.asset_path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+@dataclass
+class LiveVolume:
+    """A volume prim whose field data is live in the stage -- no .vdb to reference.
+
+    Its ``UsdVolOpenVDBAsset`` fields carry an empty ``filePath``, so the data
+    is embedded (SOP-imported) rather than pointing at a cache on disk. A USD
+    export then *bakes* those voxels into the exported layer -- tens of GB per
+    frame observed on a real shot, versus a few MB when a ``.vdb`` is
+    referenced. Only the **husk** (USD-export) engine pays this cost; the
+    hython-direct engine renders the live data without exporting. Produced by
+    ``inspector.scan_live_volumes``.
+    """
+    prim_path: str                                        # the UsdVolVolume prim
+    field_count: int = 0                                  # live OpenVDBAsset fields under it
+    field_names: list[str] = field(default_factory=list)  # e.g. ["density", "vel"]
+
+    @property
+    def label(self) -> str:
+        return self.prim_path.rsplit("/", 1)[-1]
+
+
 # --------------------------------------------------------------------------
 # Houdini-side description (read from node parameters)
 # --------------------------------------------------------------------------
@@ -146,6 +167,7 @@ class SceneManifest:
     vars: list[RenderVar] = field(default_factory=list)
     cameras: list[Camera] = field(default_factory=list)
     missing_assets: list[MissingAsset] = field(default_factory=list)
+    live_volumes: list[LiveVolume] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     # -- lookups ----------------------------------------------------------
@@ -221,6 +243,7 @@ _ELEMENT_TYPES = {
     "vars": RenderVar,
     "cameras": Camera,
     "missing_assets": MissingAsset,
+    "live_volumes": LiveVolume,
 }
 
 

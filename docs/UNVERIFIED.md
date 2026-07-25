@@ -112,6 +112,35 @@ mean "no outputs". The inspector also correctly *warned* — rather than failing
 silently — when the second ROP's input LOP did not cook to a stage at the
 current frame.
 
+### Live volumes bake on export  ·  `?` (grounded, function not yet run)
+
+`inspector.scan_live_volumes()` flags volumes that will **bake** into a USD
+export. A SOP-imported volume has no `.vdb` on disk: its `UsdVolOpenVDBAsset`
+fields carry an **empty** `filePath`, so exporting the stage serialises the
+voxels into the layer — ~44 GB observed for a single frame on `SHOT_SandBurst`,
+~1 TB for a full range. So the husk (USD-export) path is the wrong engine for
+such shots; `render_direct` (hython) renders the live data with no export.
+
+The scan groups empty-`filePath` `OpenVDBAsset` prims under their owning
+`UsdVol.Volume` and lands them in `manifest.live_volumes`. Preflight raises a
+`volume_bake` **warning** for the husk engine (not the hython engine, which
+never exports), and — the real guard — `inspect(..., allow_volume_bake=False)`
+**skips the export** for a ROP whose stage has live volumes, so the CLI
+`hsl render --engine husk` aborts with advice instead of filling the disk
+(`--allow-volume-bake` overrides).
+
+| # | Assumption | Status | How to check |
+|---|---|---|---|
+| D6 | `prim.IsA(UsdVol.OpenVDBAsset)` matches Houdini's SOP-imported volume fields | `?` | traverse the SandBurst stage, print `[p for p in stage.Traverse() if p.IsA(UsdVol.OpenVDBAsset)]` — expect 8 |
+| D7 | `UsdVolOpenVDBAsset.GetFilePathAttr().Get().path` is empty for a live field, set for a `.vdb`-referenced one | `?` (raw data seen) | the handoff's `volume_probe.py` already observed **0 filePaths** across 8 field assets; confirm `scan_live_volumes()` returns those 4 volumes |
+| D8 | `UsdVol.Volume` owns the field prims (fields are children) | `?` | print each field prim's parent chain; expect a `Volume`-typed ancestor |
+
+**Do not guess these from recall** — the failure mode is either a false "safe"
+(a real bake slips through and fills the disk) or a false alarm (a cached-VDB
+scene wrongly aborts). Verify against the SandBurst shot, whose live-volume
+counts are already known (4 volumes / 8 fields / 0 filePaths), then move D6–D8
+into the Verified table.
+
 ## E. husk CLI flags — `hsl/husk.py` `build_command()`
 
 Confirmed against `husk --help` on 22.0.368 (and flag presence re-checked on
@@ -212,6 +241,10 @@ field + Browse.
 ## Still unknown (do not guess)
 
 - **A3** — the `::`-versioned type-name split path.
+- **D6/D7/D8** — the `UsdVol` live-volume scan (`scan_live_volumes`): schema
+  match, empty-`filePath` semantics, and volume/field ownership. Raw counts for
+  SandBurst are known (4 volumes / 8 fields / 0 filePaths); the function itself
+  has not been run. Verify against that shot before trusting the abort.
 - **E8/E9** — accepted values for `--complexity` and `--purpose`.
 - **F2/F3** — Karma license behaviour and the Indie resolution cap.
 

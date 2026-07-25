@@ -82,6 +82,14 @@ def cmd_inspect(args) -> int:
         for asset in manifest.missing_assets:
             print(f"    ✗ {asset.asset_path}  (at {asset.attr_path})")
 
+    if manifest.live_volumes:
+        total_fields = sum(v.field_count for v in manifest.live_volumes)
+        print(f"\n  {len(manifest.live_volumes)} live volume(s), {total_fields} field(s) "
+              f"with no on-disk VDB — a husk USD export will bake ~GB/frame:")
+        for v in manifest.live_volumes:
+            print(f"    ⚠ {v.prim_path}  ({', '.join(v.field_names)})")
+        print("    → render with --engine hython (no export) or cache the volumes to .vdb.")
+
     for warning in manifest.warnings:
         print(f"\n  warning: {warning}")
     return 0
@@ -103,12 +111,37 @@ def _resolve_aovs(manifest: SceneManifest, spec: str) -> list:
 def cmd_render(args) -> int:
     engine = "hython" if getattr(args, "direct_hython", False) else getattr(args, "engine", "husk")
     export_usd = (engine == "husk")
+    allow_volume_bake = getattr(args, "allow_volume_bake", False)
     manifest = bridge.inspect_hip(args.hip, hython=args.hython,
                                   export_usd=export_usd, usd_dir=args.usd_dir,
-                                  flatten=args.flatten, rop=args.rop)
+                                  flatten=args.flatten, rop=args.rop,
+                                  allow_volume_bake=allow_volume_bake)
     rop = _pick_rop(manifest, args.rop)
     if rop is None:
         return 2
+
+    # Live volumes bake tens of GB/frame into a husk USD export. Unless the user
+    # opted in with --allow-volume-bake, the inspector skipped the export — so
+    # explain why and how to proceed instead of the generic failure below.
+    if engine == "husk" and manifest.live_volumes and not allow_volume_bake:
+        n = len(manifest.live_volumes)
+        total_fields = sum(v.field_count for v in manifest.live_volumes)
+        sys.stderr.write(
+            f"Aborted: {n} live volume(s) ({total_fields} field(s) with no "
+            f"on-disk VDB) would bake tens of GB per frame into the USD export.\n"
+            f"  → render with --engine hython (no export, recommended for this shot),\n"
+            f"  → or cache the volumes to .vdb and re-read,\n"
+            f"  → or pass --allow-volume-bake to export anyway.\n")
+        for v in manifest.live_volumes:
+            sys.stderr.write(f"    ⚠ {v.prim_path}  ({', '.join(v.field_names)})\n")
+        return 3
+
+    if engine == "husk" and manifest.live_volumes and allow_volume_bake:
+        total_fields = sum(v.field_count for v in manifest.live_volumes)
+        sys.stderr.write(
+            f"--allow-volume-bake: exporting {len(manifest.live_volumes)} live "
+            f"volume(s), {total_fields} field(s) — expect tens of GB per frame.\n")
+
     if engine == "husk" and not rop.usd_path:
         sys.stderr.write("The stage could not be written to USD; nothing to render.\n")
         for warning in manifest.warnings:
@@ -255,6 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
                                "Others are dropped from the USD products (husk only)")
     p_render.add_argument("--relink-from", action="append", default=[], metavar="DIR",
                           help="Search DIR for missing textures and repath them (repeatable)")
+    p_render.add_argument("--allow-volume-bake", action="store_true",
+                          help="Export live (SOP-imported) volumes to USD even though "
+                               "they bake ~GB/frame. Default: abort and suggest --engine hython.")
     p_render.add_argument("--output", default="", help="Override the output image path (husk --output)")
     p_render.add_argument("--res", nargs=2, type=int, metavar=("W", "H"))
     p_render.add_argument("--threads", type=int, default=0)

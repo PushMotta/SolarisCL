@@ -87,6 +87,27 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
                 message=f"Unresolved {asset.kind}: {asset.asset_path}  (at {asset.attr_path})"
             ))
 
+    # 5b. Live (SOP-imported) volumes bake tens of GB/frame into a USD export.
+    #     Only the husk engine exports; the hython-direct engine renders the
+    #     live data with no export, so this is a husk-only hazard.
+    if (manifest and manifest.live_volumes
+            and getattr(job, "engine", "husk") == "husk"):
+        n = len(manifest.live_volumes)
+        total_fields = sum(v.field_count for v in manifest.live_volumes)
+        fields = ", ".join(sorted({f for v in manifest.live_volumes
+                                   for f in v.field_names}))
+        detail = f" ({fields})" if fields else ""
+        warnings.append(PreflightWarning(
+            level="warning",
+            category="volume_bake",
+            message=(
+                f"{n} live volume(s), {total_fields} field(s){detail} have no "
+                f"on-disk VDB (OpenVDBAsset.filePath empty) and will bake into "
+                f"the USD export -- tens of GB per frame. Render with the hython "
+                f"engine (no export) or point the volumes at a .vdb cache."
+            ),
+        ))
+
     # 6. Attach any manifest scene warnings
     if manifest and manifest.warnings:
         for msg in manifest.warnings:

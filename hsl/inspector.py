@@ -21,8 +21,8 @@ import traceback
 from typing import Any, Iterable, Optional
 
 from .manifest import (
-    Camera, MissingAsset, RenderProduct, RenderRop, RenderSettings, RenderVar,
-    SceneManifest,
+    Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
+    RenderVar, SceneManifest,
 )
 
 try:
@@ -31,9 +31,9 @@ except ImportError:  # pragma: no cover - only importable inside hython
     hou = None
 
 try:
-    from pxr import Sdf, Usd, UsdGeom, UsdRender
+    from pxr import Sdf, Usd, UsdGeom, UsdRender, UsdVol
 except ImportError:  # pragma: no cover
-    Sdf = Usd = UsdGeom = UsdRender = None
+    Sdf = Usd = UsdGeom = UsdRender = UsdVol = None
 
 
 # Node types that can drive a husk render. Versioned type names
@@ -255,6 +255,72 @@ def scan_missing_assets(stage) -> list[MissingAsset]:
                     _check(attr, asset)
 
     return missing
+
+
+def _owning_volume(prim) -> str:
+    """Path of the nearest ``UsdVolVolume`` ancestor of a field prim.
+
+    Solaris authors OpenVDB field prims as children of the volume prim, so the
+    parent is normally the volume; walking up is just robustness for fields
+    authored elsewhere. Falls back to the field prim's parent, then itself.
+    """
+    node = prim.GetParent()
+    while node and node.IsValid() and not node.IsPseudoRoot():
+        if UsdVol is not None and node.IsA(UsdVol.Volume):
+            return str(node.GetPath())
+        node = node.GetParent()
+    parent = prim.GetParent()
+    if parent and parent.IsValid() and not parent.IsPseudoRoot():
+        return str(parent.GetPath())
+    return str(prim.GetPath())
+
+
+def scan_live_volumes(stage) -> list[LiveVolume]:
+    """Volumes whose OpenVDB fields have no on-disk ``.vdb`` -- they bake on export.
+
+    A ``UsdVolOpenVDBAsset`` with an **empty** ``filePath`` carries no reference
+    to a file on disk: its voxels are live in the composed stage (SOP-imported).
+    Exporting such a stage *bakes* the volume into the exported layer -- tens of
+    GB per frame on a real shot, versus a few MB when a ``.vdb`` is referenced.
+    The husk (USD-export) path pays that cost every frame; the hython-direct
+    engine renders the live data without exporting.
+
+    A field whose ``filePath`` *is* authored (even one that fails to resolve) is
+    **not** a bake -- that is a missing VDB, reported by
+    :func:`scan_missing_assets` instead. Results are grouped by the owning
+    ``UsdVolVolume`` prim so a caller can say "N live volumes".
+    """
+    if UsdVol is None:
+        return []
+
+    order: list[str] = []
+    fields_by_volume: dict[str, list[str]] = {}
+
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdVol.OpenVDBAsset):
+            continue
+        asset = UsdVol.OpenVDBAsset(prim)
+        file_attr = asset.GetFilePathAttr()
+        value = file_attr.Get() if file_attr else None
+        path = (getattr(value, "path", "") or "") if value is not None else ""
+        if path:
+            continue                      # references a real .vdb -- cheap to export
+
+        name_attr = asset.GetFieldNameAttr()
+        field_name = str((name_attr.Get() if name_attr else "") or prim.GetName())
+
+        owner = _owning_volume(prim)
+        if owner not in fields_by_volume:
+            fields_by_volume[owner] = []
+            order.append(owner)
+        fields_by_volume[owner].append(field_name)
+
+    return [
+        LiveVolume(prim_path=owner,
+                   field_count=len(fields_by_volume[owner]),
+                   field_names=fields_by_volume[owner])
+        for owner in order
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -549,8 +615,15 @@ def relink_assets(usd_in: str, usd_out: str, search_dirs) -> dict:
 
 def inspect(hip_path: str, export: bool = False,
             usd_dir: str = "", flatten: bool = False,
-            rop_filter: str = "") -> SceneManifest:
-    """Load a .hip and describe every render ROP in it."""
+            rop_filter: str = "", allow_volume_bake: bool = True) -> SceneManifest:
+    """Load a .hip and describe every render ROP in it.
+
+    When ``export`` is requested and a ROP's stage contains live volumes (see
+    :func:`scan_live_volumes`), the export is **skipped** unless
+    ``allow_volume_bake`` is true -- baking tens of GB per frame is almost never
+    what the caller wants, and the hython-direct engine avoids it entirely. The
+    skip is recorded in ``manifest.warnings`` so the caller can explain it.
+    """
     if hou is None:
         raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
 
@@ -581,10 +654,12 @@ def inspect(hip_path: str, export: bool = False,
     seen_vars: dict[str, RenderVar] = {}
     seen_cameras: dict[str, Camera] = {}
     seen_assets: dict[tuple, MissingAsset] = {}
+    seen_volumes: dict[str, LiveVolume] = {}
 
     for node in rop_nodes:
         rop = describe_rop(node, warnings)
 
+        stage_volumes: list[LiveVolume] = []
         stage, lop = stage_for(node, warnings)
         if stage is not None:
             if not rop.input_lop and lop is not None:
@@ -610,16 +685,35 @@ def inspect(hip_path: str, export: bool = False,
                 seen_cameras.setdefault(item.prim_path, item)
             for asset in scan_missing_assets(stage):
                 seen_assets.setdefault((asset.attr_path, asset.asset_path), asset)
+            stage_volumes = scan_live_volumes(stage)
+            for volume in stage_volumes:
+                seen_volumes.setdefault(volume.prim_path, volume)
         else:
             warnings.append(f"{node.path()}: could not obtain a USD stage.")
 
         if export:
-            usd_name = node.path().strip("/").replace("/", "_") + ".usd"
-            frame_range = ((rop.frame_start, rop.frame_end, rop.frame_inc)
-                           if rop.use_frame_range else None)
-            rop.usd_path = export_usd(node, os.path.join(usd_dir, usd_name),
-                                      frame_range=frame_range,
-                                      flatten=flatten, warnings=warnings)
+            if stage_volumes and not allow_volume_bake:
+                # Live volumes bake tens of GB/frame into the export; skip it
+                # rather than fill the disk. The hython engine renders the live
+                # data with no export at all.
+                fields = ", ".join(sorted({f for v in stage_volumes
+                                           for f in v.field_names}))
+                detail = f" ({fields})" if fields else ""
+                warnings.append(
+                    f"{node.path()}: skipped USD export -- {len(stage_volumes)} "
+                    f"live volume(s){detail} have no on-disk VDB "
+                    f"(OpenVDBAsset.filePath empty) and would bake tens of "
+                    f"GB/frame into the export. Render with --engine hython "
+                    f"(no export), cache the volumes to .vdb, or pass "
+                    f"--allow-volume-bake to export anyway."
+                )
+            else:
+                usd_name = node.path().strip("/").replace("/", "_") + ".usd"
+                frame_range = ((rop.frame_start, rop.frame_end, rop.frame_inc)
+                               if rop.use_frame_range else None)
+                rop.usd_path = export_usd(node, os.path.join(usd_dir, usd_name),
+                                          frame_range=frame_range,
+                                          flatten=flatten, warnings=warnings)
 
         manifest.rops.append(rop)
 
@@ -628,6 +722,7 @@ def inspect(hip_path: str, export: bool = False,
     manifest.vars = list(seen_vars.values())
     manifest.cameras = list(seen_cameras.values())
     manifest.missing_assets = list(seen_assets.values())
+    manifest.live_volumes = list(seen_volumes.values())
     manifest.warnings = warnings
     return manifest
 
@@ -704,6 +799,9 @@ def main(argv=None) -> int:
                         help="Flatten the stage on export (portable, larger)")
     parser.add_argument("--rop", default="",
                         help="Only inspect this ROP path")
+    parser.add_argument("--allow-volume-bake", action="store_true",
+                        help="Export even when live volumes would bake ~GB/frame "
+                             "(default: skip the export for such ROPs)")
     parser.add_argument("--render-direct", action="store_true",
                         help="Render the ROP directly inside hython (0 USD disk space)")
     parser.add_argument("--frame-start", type=int, default=None, help="Start frame")
@@ -755,7 +853,8 @@ def main(argv=None) -> int:
     try:
         manifest = inspect(args.hip, export=args.export_usd,
                            usd_dir=args.usd_dir, flatten=args.flatten,
-                           rop_filter=args.rop)
+                           rop_filter=args.rop,
+                           allow_volume_bake=args.allow_volume_bake)
     except Exception:
         # The launcher parses stdout as JSON, so failures must be structured.
         error = {"schema_version": 0, "error": traceback.format_exc()}
