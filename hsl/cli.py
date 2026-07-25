@@ -77,6 +77,11 @@ def cmd_inspect(args) -> int:
             if aovs:
                 print(f"    aovs       {', '.join(v.label for v in aovs)}")
 
+    if manifest.missing_assets:
+        print(f"\n  {len(manifest.missing_assets)} missing asset(s) — render will fail without a relink:")
+        for asset in manifest.missing_assets:
+            print(f"    ✗ {asset.asset_path}  (at {asset.attr_path})")
+
     for warning in manifest.warnings:
         print(f"\n  warning: {warning}")
     return 0
@@ -115,9 +120,27 @@ def cmd_render(args) -> int:
         rop.frame_start, rop.frame_end, rop.frame_inc = start, end, inc
         rop.use_frame_range = end != start
 
+    # Missing textures fail husk mid-render — surface them, and relink if asked.
+    base_usd = rop.usd_path
+    if manifest.missing_assets and engine == "husk":
+        sys.stderr.write(f"{len(manifest.missing_assets)} unresolved asset(s) in the scene:\n")
+        for asset in manifest.missing_assets:
+            sys.stderr.write(f"  ✗ {asset.asset_path}\n")
+
+    if engine == "husk" and getattr(args, "relink_from", None) and not args.dry_run:
+        try:
+            result = bridge.relink_assets(base_usd, args.relink_from, hython=args.hython)
+        except bridge.InspectError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 3
+        if result.get("usd_out"):
+            base_usd = result["usd_out"]
+            sys.stderr.write(f"Relinked {len(result['relinked'])} asset(s); "
+                             f"{len(result['still_missing'])} still missing.\n")
+
     # AOV selection is a USD edit, not a husk flag: keep only the requested
     # RenderVars by rendering an overlay produced by bridge.filter_aovs.
-    usd_for_render = rop.usd_path
+    usd_for_render = base_usd
     keep = None
     if engine == "husk" and getattr(args, "aovs", ""):
         keep = _resolve_aovs(manifest, args.aovs)
@@ -131,7 +154,7 @@ def cmd_render(args) -> int:
 
     if keep is not None and not args.dry_run:
         try:
-            usd_for_render = bridge.filter_aovs(rop.usd_path, keep, hython=args.hython)
+            usd_for_render = bridge.filter_aovs(base_usd, keep, hython=args.hython)
         except bridge.InspectError as exc:
             sys.stderr.write(f"{exc}\n")
             return 3
@@ -230,7 +253,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("--aovs", default="",
                           help="Comma list of AOVs to keep (by name), e.g. beauty,depth. "
                                "Others are dropped from the USD products (husk only)")
-    p_render.add_argument("--output", default="")
+    p_render.add_argument("--relink-from", action="append", default=[], metavar="DIR",
+                          help="Search DIR for missing textures and repath them (repeatable)")
+    p_render.add_argument("--output", default="", help="Override the output image path (husk --output)")
     p_render.add_argument("--res", nargs=2, type=int, metavar=("W", "H"))
     p_render.add_argument("--threads", type=int, default=0)
     p_render.add_argument("--snapshot", type=int, default=0, metavar="SECONDS")

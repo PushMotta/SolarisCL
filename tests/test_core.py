@@ -404,6 +404,18 @@ class TestPreflight(unittest.TestCase):
         warnings = preflight.run_preflight_checks(job)
         self.assertFalse(any(w.level == "error" for w in warnings))
 
+    def test_preflight_flags_missing_textures(self):
+        # The gap this closes: a missing texture must be a preflight error.
+        from hsl.manifest import MissingAsset
+        m = sample_manifest()
+        m.missing_assets = [MissingAsset(attr_path="/mat/tex.inputs:file",
+                                         asset_path="/tex/wood.exr")]
+        warnings = preflight.run_preflight_checks(RenderJob(usd_file="/s.usd"), m)
+        hits = [w for w in warnings if w.category == "missing_asset"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "error")
+        self.assertIn("wood.exr", hits[0].message)
+
 
 class TestPresets(unittest.TestCase):
     def test_default_presets(self):

@@ -21,7 +21,8 @@ import traceback
 from typing import Any, Iterable, Optional
 
 from .manifest import (
-    Camera, RenderProduct, RenderRop, RenderSettings, RenderVar, SceneManifest,
+    Camera, MissingAsset, RenderProduct, RenderRop, RenderSettings, RenderVar,
+    SceneManifest,
 )
 
 try:
@@ -217,6 +218,43 @@ def walk_stage(stage) -> tuple[list[RenderSettings], list[RenderProduct],
             ))
 
     return settings, products, render_vars, cameras
+
+
+def scan_missing_assets(stage) -> list[MissingAsset]:
+    """Asset-path attributes on the stage whose value does not resolve on disk.
+
+    Every asset-valued attribute (texture ``inputs:file``, volume filenames,
+    etc.) carries an ``Sdf.AssetPath`` with a ``resolvedPath``. An authored path
+    with an **empty** ``resolvedPath`` is one the resolver could not find — a
+    missing texture. This is exactly what husk would fail on mid-render, caught
+    here at read time instead. Deduplicated on (attribute, path).
+    """
+    missing: list[MissingAsset] = []
+    seen: set = set()
+
+    def _check(attr, asset):
+        if asset is None:
+            return
+        path = getattr(asset, "path", "") or ""
+        resolved = getattr(asset, "resolvedPath", "") or ""
+        if not path or resolved:
+            return
+        key = (str(attr.GetPath()), path)
+        if key in seen:
+            return
+        seen.add(key)
+        missing.append(MissingAsset(attr_path=str(attr.GetPath()), asset_path=path))
+
+    for prim in stage.Traverse():
+        for attr in prim.GetAttributes():
+            type_name = attr.GetTypeName()
+            if type_name == Sdf.ValueTypeNames.Asset:
+                _check(attr, attr.Get())
+            elif type_name == Sdf.ValueTypeNames.AssetArray:
+                for asset in (attr.Get() or []):
+                    _check(attr, asset)
+
+    return missing
 
 
 # --------------------------------------------------------------------------
@@ -420,6 +458,91 @@ def filter_usd_aovs(usd_in: str, usd_out: str, keep_paths,
     return usd_out if os.path.exists(usd_out) else ""
 
 
+def _basename_index(search_dirs) -> dict:
+    """Map lower-case basename -> first absolute path found under search_dirs."""
+    index: dict = {}
+    for directory in search_dirs or []:
+        if not directory or not os.path.isdir(directory):
+            continue
+        for root, _dirs, files in os.walk(directory):
+            for name in files:
+                index.setdefault(name.lower(), os.path.join(root, name))
+    return index
+
+
+def relink_assets(usd_in: str, usd_out: str, search_dirs) -> dict:
+    """Author an overlay that repaths unresolved assets found under search_dirs.
+
+    For each missing asset (empty ``resolvedPath``), the file with the same
+    basename found under ``search_dirs`` (first match wins) is authored onto an
+    overlay over ``usd_in`` — the same non-destructive overlay approach as the
+    AOV filter, so the export is untouched and husk/hython render the repathed
+    stage. Returns ``{"usd_out", "relinked": [...], "still_missing": [...]}``.
+    """
+    if Usd is None or Sdf is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+
+    index = _basename_index(search_dirs)
+    os.makedirs(os.path.dirname(os.path.abspath(usd_out)) or ".", exist_ok=True)
+
+    overlay = Sdf.Layer.CreateNew(usd_out)
+    sub_rel = os.path.relpath(os.path.abspath(usd_in),
+                              os.path.dirname(os.path.abspath(usd_out)))
+    overlay.subLayerPaths.append(sub_rel.replace(os.sep, "/"))
+
+    stage = Usd.Stage.Open(overlay)
+    if stage is None:
+        return {"usd_out": "", "relinked": [], "still_missing": []}
+
+    relinked: list = []
+    still_missing: list = []
+
+    def _find(path: str) -> str:
+        base = path.replace("\\", "/").rsplit("/", 1)[-1]
+        return index.get(base.lower(), "")
+
+    for prim in stage.Traverse():
+        for attr in prim.GetAttributes():
+            type_name = attr.GetTypeName()
+            if type_name == Sdf.ValueTypeNames.Asset:
+                asset = attr.Get()
+                path = getattr(asset, "path", "") or "" if asset else ""
+                resolved = getattr(asset, "resolvedPath", "") or "" if asset else ""
+                if not path or resolved:
+                    continue
+                new = _find(path)
+                if new:
+                    attr.Set(Sdf.AssetPath(new))
+                    relinked.append({"attr": str(attr.GetPath()), "old": path, "new": new})
+                else:
+                    still_missing.append({"attr": str(attr.GetPath()), "path": path})
+            elif type_name == Sdf.ValueTypeNames.AssetArray:
+                assets = list(attr.Get() or [])
+                new_list = []
+                changed = False
+                for asset in assets:
+                    path = getattr(asset, "path", "") or ""
+                    resolved = getattr(asset, "resolvedPath", "") or ""
+                    if path and not resolved:
+                        new = _find(path)
+                        if new:
+                            new_list.append(Sdf.AssetPath(new))
+                            relinked.append({"attr": str(attr.GetPath()), "old": path, "new": new})
+                            changed = True
+                            continue
+                        still_missing.append({"attr": str(attr.GetPath()), "path": path})
+                    new_list.append(asset)
+                if changed:
+                    attr.Set(new_list)
+
+    overlay.Save()
+    return {
+        "usd_out": usd_out if os.path.exists(usd_out) else "",
+        "relinked": relinked,
+        "still_missing": still_missing,
+    }
+
+
 # --------------------------------------------------------------------------
 # Top level
 # --------------------------------------------------------------------------
@@ -457,6 +580,7 @@ def inspect(hip_path: str, export: bool = False,
     seen_products: dict[str, RenderProduct] = {}
     seen_vars: dict[str, RenderVar] = {}
     seen_cameras: dict[str, Camera] = {}
+    seen_assets: dict[tuple, MissingAsset] = {}
 
     for node in rop_nodes:
         rop = describe_rop(node, warnings)
@@ -484,6 +608,8 @@ def inspect(hip_path: str, export: bool = False,
                 seen_vars.setdefault(item.prim_path, item)
             for item in cameras:
                 seen_cameras.setdefault(item.prim_path, item)
+            for asset in scan_missing_assets(stage):
+                seen_assets.setdefault((asset.attr_path, asset.asset_path), asset)
         else:
             warnings.append(f"{node.path()}: could not obtain a USD stage.")
 
@@ -501,6 +627,7 @@ def inspect(hip_path: str, export: bool = False,
     manifest.products = list(seen_products.values())
     manifest.vars = list(seen_vars.values())
     manifest.cameras = list(seen_cameras.values())
+    manifest.missing_assets = list(seen_assets.values())
     manifest.warnings = warnings
     return manifest
 
@@ -592,6 +719,10 @@ def main(argv=None) -> int:
     parser.add_argument("--usd-out", default="", help="Overlay USD to write")
     parser.add_argument("--keep", default="",
                         help="Comma-separated RenderVar prim paths to keep")
+    parser.add_argument("--relink", action="store_true",
+                        help="Repath unresolved assets found under --search dirs")
+    parser.add_argument("--search", action="append", default=[],
+                        help="Directory to search for missing assets (repeatable)")
     args = parser.parse_args(argv)
 
     if args.filter_aovs:
@@ -604,6 +735,12 @@ def main(argv=None) -> int:
             return 1
         sys.stdout.write(out + "\n")
         return 0
+
+    if args.relink:
+        result = relink_assets(args.usd_in, args.usd_out, args.search)
+        # Sentinel-tagged so the caller finds it past any Houdini/delegate banners.
+        sys.stdout.write("@@HSL_RELINK@@" + json.dumps(result) + "\n")
+        return 0 if result.get("usd_out") else 1
 
     if not args.hip:
         parser.error("hip path is required unless --filter-aovs is given")

@@ -77,7 +77,17 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
             except OSError:
                 pass
 
-    # 5. Attach any manifest scene warnings
+    # 5. Missing textures / unresolved assets — husk only reports these mid-render,
+    #    so catching them here is the whole point. Each is a hard error.
+    if manifest and manifest.missing_assets:
+        for asset in manifest.missing_assets:
+            warnings.append(PreflightWarning(
+                level="error",
+                category="missing_asset",
+                message=f"Unresolved {asset.kind}: {asset.asset_path}  (at {asset.attr_path})"
+            ))
+
+    # 6. Attach any manifest scene warnings
     if manifest and manifest.warnings:
         for msg in manifest.warnings:
             warnings.append(PreflightWarning(

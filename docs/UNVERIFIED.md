@@ -151,6 +151,22 @@ a thin overlay that sublayers the export and overrides each product's
 product left `orderedVars = [C, depth]` in the flattened composition, the other
 product untouched.
 
+### Missing textures & relinking  ·  `OK` (22)
+
+husk has **no pre-scan** for missing textures — it only errors mid-render, which
+is why preflight missed them. Detection is a USD job: `inspector.scan_missing_assets`
+walks the composed stage and flags every asset attribute whose `Sdf.AssetPath`
+has an empty `resolvedPath`. These land in `manifest.missing_assets` and preflight
+raises them as errors. Relinking (`inspector.relink_assets`) authors an overlay —
+same pattern as the AOV filter — repathing each missing asset to a same-basename
+file found under the chosen search dirs; husk/hython then render the relinked USD.
+**Verified on 22.0.368:** scan caught scalar + array texture refs, relink repathed
+both (recursive search), and a re-scan of the relinked overlay found 0 missing.
+
+The **output path** override uses husk's real `-o/--output` (confirmed in
+`--help`, "variables are expanded"), exposed as the CLI `--output` / the UI Output
+field + Browse.
+
 ## F. Environment and licensing
 
 | # | Assumption | Status |
@@ -186,6 +202,7 @@ product untouched.
 | D3 | stage metadata `renderSettingsPrimPath` | 21.0.729, 22.0.368 | 2026-07-24 | |
 | D4 | `karma:*` / `husk:*` attrs on the settings prim | 22.0.368 | 2026-07-24 | ~90 knobs read from the same scene |
 | D5 | `LopNode.stage()` returns composed stage | 21.0.729, 22.0.368 | 2026-07-24 | current-frame cook limitation stands (T5) |
+| D-ASSET | missing-texture scan (`Sdf.AssetPath.resolvedPath == ""`) + overlay relink | 22.0.368 | 2026-07-25 | verified scalar + array assets, recursive search; re-scan of relinked overlay = 0 missing |
 | E1–E14 | every flag `build_command()` emits | 21.0.729, 22.0.368 | 2026-07-24 | via `husk --help`; `ALF_PROGRESS` literal wants a live render |
 | E-AOV | husk has no AOV flag; selection is USD `orderedVars`; overlay filter works | 22.0.368 | 2026-07-24 | `filter_usd_aovs` verified: dropping a var left the right `orderedVars` |
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |

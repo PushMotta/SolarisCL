@@ -81,6 +81,27 @@ class FilterWorker(QObject):
         self.finished.emit(out)
 
 
+class RelinkWorker(QObject):
+    """Runs bridge.relink_assets (a hython subprocess) off the Qt thread."""
+    finished = Signal(object)   # the result dict
+    failed = Signal(str)
+
+    def __init__(self, usd_in: str, search_dirs, hython: str = ""):
+        super().__init__()
+        self.usd_in = usd_in
+        self.search_dirs = search_dirs
+        self.hython = hython
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = bridge.relink_assets(self.usd_in, self.search_dirs, hython=self.hython)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(result)
+
+
 class QueueBridge(QObject):
     """Marshals RenderQueue callbacks onto the Qt event loop."""
     task_started = Signal(object)
@@ -108,6 +129,8 @@ class LauncherWindow(QMainWindow):
         self.tasks: list[Task] = []
         self._thread: Optional[QThread] = None
         self._worker: Optional[InspectWorker] = None
+        # ROP node path -> relinked overlay USD, once assets have been repathed.
+        self._relinked_usd: dict = {}
 
         self._build_ui()
         self._populate_hython_options()
@@ -291,9 +314,13 @@ class LauncherWindow(QMainWindow):
         frame_row.addStretch(1)
         form.addRow("Frames", frame_row)
 
+        output_row = QHBoxLayout()
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("Leave empty to use the product name from USD")
-        form.addRow("Output", self.output_edit)
+        self.output_browse_btn = QPushButton("Browse…")
+        output_row.addWidget(self.output_edit, 1)
+        output_row.addWidget(self.output_browse_btn)
+        form.addRow("Output", output_row)
 
         self.chunk_spin = QSpinBox()
         self.chunk_spin.setRange(0, 10000)
@@ -351,12 +378,17 @@ class LauncherWindow(QMainWindow):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.copy_btn = QPushButton("Copy command")
+        self.relink_btn = QPushButton("Relink textures…")
+        self.relink_btn.setToolTip(
+            "Pick a folder to search for missing textures and repath them "
+            "(husk renders the relinked USD).")
         self.farm_btn = QPushButton("Submit to Farm…")
         self.overall_bar = QProgressBar()
         self.overall_bar.setRange(0, 100)
         button_row.addWidget(self.render_btn)
         button_row.addWidget(self.cancel_btn)
         button_row.addWidget(self.copy_btn)
+        button_row.addWidget(self.relink_btn)
         button_row.addWidget(self.farm_btn)
         button_row.addWidget(self.overall_bar, 1)
         layout.addLayout(button_row)
@@ -413,6 +445,8 @@ class LauncherWindow(QMainWindow):
         self.res_check.toggled.connect(self.res_x.setEnabled)
         self.res_check.toggled.connect(self.res_y.setEnabled)
         self.copy_btn.clicked.connect(self.copy_command)
+        self.relink_btn.clicked.connect(self.relink_textures)
+        self.output_browse_btn.clicked.connect(self.choose_output)
         self.farm_btn.clicked.connect(self.export_farm_job)
         self.render_btn.clicked.connect(self.start_render)
         self.cancel_btn.clicked.connect(self.cancel_render)
@@ -591,6 +625,7 @@ class LauncherWindow(QMainWindow):
     def on_scene_read(self, manifest: SceneManifest) -> None:
         self.manifest = manifest
         self.read_btn.setEnabled(True)
+        self._relinked_usd.clear()   # a fresh read invalidates any prior relink
 
         self.rop_combo.blockSignals(True)
         self.rop_combo.clear()
@@ -628,6 +663,8 @@ class LauncherWindow(QMainWindow):
             self.renderer_combo.setCurrentText(current)
 
         found = f"{len(manifest.rops)} ROP(s), {len(manifest.settings)} render settings prim(s)"
+        if manifest.missing_assets:
+            found += f" — ⚠ {len(manifest.missing_assets)} missing texture(s), use Relink"
         if manifest.warnings:
             found += f" — {len(manifest.warnings)} warning(s)"
         self.status_label.setText(found)
@@ -755,7 +792,7 @@ class LauncherWindow(QMainWindow):
             return []
 
         engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
-        usd_file = usd_override or rop.usd_path
+        usd_file = usd_override or self._base_usd(rop)
         if engine == "husk" and not usd_file:
             return []
 
@@ -836,6 +873,80 @@ class LauncherWindow(QMainWindow):
         QApplication.clipboard().setText(self.command_view.toPlainText())
         self.status_label.setText("Command copied.")
 
+    # -- assets & output --------------------------------------------------
+
+    def _base_usd(self, rop) -> str:
+        """The USD to render for this ROP — the relinked overlay if one exists."""
+        if rop is None:
+            return ""
+        return self._relinked_usd.get(rop.node_path) or rop.usd_path
+
+    @Slot()
+    def choose_output(self) -> None:
+        start = self.output_edit.text() or os.path.expanduser("~")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Choose an output image path", start,
+            "Images (*.exr *.png *.jpg *.tif);;All files (*)")
+        if path:
+            self.output_edit.setText(path)
+
+    @Slot()
+    def relink_textures(self) -> None:
+        rop = self.current_rop()
+        base = self._base_usd(rop)
+        if not base:
+            QMessageBox.information(
+                self, "Nothing to relink",
+                "Read a scene with “Write USD while reading” enabled first — "
+                "relinking edits the exported USD.")
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose a folder to search for missing textures",
+            os.path.expanduser("~"))
+        if not folder:
+            return
+
+        self.relink_btn.setEnabled(False)
+        self.status_label.setText("Relinking textures in hython…")
+        self._relink_thread = QThread(self)
+        self._relink_worker = RelinkWorker(base, [folder],
+                                           hython=self.hython_edit.text().strip())
+        self._relink_worker.moveToThread(self._relink_thread)
+        self._relink_thread.started.connect(self._relink_worker.run)
+        self._relink_worker.finished.connect(self._on_relinked)
+        self._relink_worker.failed.connect(self._on_relink_failed)
+        self._relink_worker.finished.connect(self._relink_thread.quit)
+        self._relink_worker.failed.connect(self._relink_thread.quit)
+        self._relink_thread.start()
+
+    @Slot(object)
+    def _on_relinked(self, result: dict) -> None:
+        self.relink_btn.setEnabled(True)
+        rop = self.current_rop()
+        out = result.get("usd_out")
+        relinked = result.get("relinked", [])
+        still = result.get("still_missing", [])
+        if out and rop:
+            self._relinked_usd[rop.node_path] = out
+        # Drop the now-resolved assets so preflight stops flagging them.
+        if self.manifest and relinked:
+            done = {r.get("old") for r in relinked}
+            self.manifest.missing_assets = [
+                a for a in self.manifest.missing_assets if a.asset_path not in done]
+        msg = f"Relinked {len(relinked)} texture(s); {len(still)} still missing."
+        self.status_label.setText(msg)
+        if still:
+            QMessageBox.warning(
+                self, "Some textures still missing",
+                msg + "\n\n" + "\n".join(s.get("path", "") for s in still[:20]))
+        self.refresh_command()
+
+    @Slot(str)
+    def _on_relink_failed(self, message: str) -> None:
+        self.relink_btn.setEnabled(True)
+        self.status_label.setText("Relink failed.")
+        QMessageBox.critical(self, "Could not relink textures", message[-4000:])
+
     # -- rendering --------------------------------------------------------
 
     @Slot()
@@ -866,7 +977,7 @@ class LauncherWindow(QMainWindow):
             self.status_label.setText("Filtering AOVs in hython…")
             self._filter_thread = QThread(self)
             self._filter_worker = FilterWorker(
-                self.current_rop().usd_path, keep,
+                self._base_usd(self.current_rop()), keep,
                 hython=self.hython_edit.text().strip())
             self._filter_worker.moveToThread(self._filter_thread)
             self._filter_thread.started.connect(self._filter_worker.run)

@@ -80,6 +80,22 @@ class Camera:
         return self.prim_path.rsplit("/", 1)[-1]
 
 
+@dataclass
+class MissingAsset:
+    """An asset-path attribute on the stage that does not resolve on disk.
+
+    ``attr_path`` is the exact attribute holding the reference (e.g.
+    ``/mat/tex.inputs:file``), which is what relinking needs to repath it.
+    """
+    attr_path: str
+    asset_path: str          # the authored, unresolved path
+    kind: str = "texture"    # texture / reference / volume / ...
+
+    @property
+    def basename(self) -> str:
+        return self.asset_path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
 # --------------------------------------------------------------------------
 # Houdini-side description (read from node parameters)
 # --------------------------------------------------------------------------
@@ -129,6 +145,7 @@ class SceneManifest:
     products: list[RenderProduct] = field(default_factory=list)
     vars: list[RenderVar] = field(default_factory=list)
     cameras: list[Camera] = field(default_factory=list)
+    missing_assets: list[MissingAsset] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     # -- lookups ----------------------------------------------------------
@@ -203,6 +220,7 @@ _ELEMENT_TYPES = {
     "products": RenderProduct,
     "vars": RenderVar,
     "cameras": Camera,
+    "missing_assets": MissingAsset,
 }
 
 

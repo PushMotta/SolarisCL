@@ -255,6 +255,56 @@ def filter_aovs(usd_in: str, enabled_var_paths, *, hython: str = "",
     return usd_out
 
 
+def relink_assets(usd_in: str, search_dirs, *, hython: str = "",
+                  usd_out: str = "", timeout: float = 600.0,
+                  env: Optional[dict] = None) -> dict:
+    """Repath a USD's unresolved assets from files found under ``search_dirs``.
+
+    Runs :func:`hsl.inspector.relink_assets` under hython (pxr lives there) and
+    returns ``{"usd_out", "relinked": [...], "still_missing": [...]}``. Render
+    the returned ``usd_out`` instead of ``usd_in`` to pick up the repaths.
+    """
+    if not usd_in:
+        return {"usd_out": usd_in, "relinked": [], "still_missing": []}
+
+    hython_exe = find_hython(hython)
+    if not hython_exe:
+        raise InspectError("Could not find hython to relink assets. Set $HFS or pass a path.")
+
+    if not usd_out:
+        base, ext = os.path.splitext(usd_in)
+        usd_out = base + ".relinked" + (ext or ".usd")
+
+    cmd = [hython_exe, "-m", "hsl.inspector", "--relink",
+           "--usd-in", usd_in, "--usd-out", usd_out]
+    for directory in search_dirs or []:
+        cmd += ["--search", directory]
+
+    run_env = dict(env or os.environ)
+    root = _package_root()
+    existing = run_env.get("PYTHONPATH", "")
+    run_env["PYTHONPATH"] = (root + os.pathsep + existing) if existing else root
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, env=run_env)
+    except subprocess.SubprocessError as exc:
+        raise InspectError(f"Relink failed to run under hython: {exc}")
+
+    marker = "@@HSL_RELINK@@"
+    for line in reversed(proc.stdout.splitlines()):
+        idx = line.find(marker)
+        if idx != -1:
+            try:
+                return json.loads(line[idx + len(marker):])
+            except ValueError:
+                break
+    raise InspectError(
+        "Relink produced no result.\n"
+        f"exit code: {proc.returncode}\n{proc.stderr[-2000:]}"
+    )
+
+
 def cache_path_for(hip_path: str) -> str:
     """Where a cached manifest for this hip lives."""
     base = os.path.splitext(os.path.basename(hip_path))[0]
