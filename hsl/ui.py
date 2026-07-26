@@ -923,6 +923,32 @@ class LauncherWindow(QMainWindow):
         if engine == "hython" and jobs[0].relink_dirs:
             preview += ("\n\n# Missing textures will be repathed from the folder(s) "
                         "above and composed into the LOP network at render start.")
+
+        # Resolved filenames, so the output path can be checked before starting
+        # a render rather than after it lands somewhere unexpected.
+        rop = self.current_rop()
+        frames = [f for job in jobs
+                  for f in (job.chunk.start + i * job.chunk.inc
+                            for i in range(job.chunk.count))]
+        planned = husk_mod.planned_outputs(
+            self.manifest, rop, output=self.output_edit.text().strip(), frames=frames)
+        if planned:
+            lines = ["", "# Files this render will write:"]
+            for entry in planned:
+                if entry["unresolved"]:
+                    lines.append(f"#   {entry['template']}   "
+                                 f"(unexpandable token — cannot preview)")
+                elif entry["files"]:
+                    lines.append(f"#   {entry['files'][0]}")
+                    if len(entry["files"]) > 1:
+                        lines.append(f"#   … {len(entry['files'])} files, "
+                                     f"last {entry['files'][-1]}")
+                else:
+                    lines.append(f"#   {entry['template']}")
+            preview += "\n" + "\n".join(lines)
+        else:
+            preview += ("\n\n# No output path declared in the scene — husk or the "
+                        "ROP decides it. Set Output above to choose.")
         self.command_view.setPlainText(preview)
 
         pf_warnings = preflight.run_preflight_checks(jobs[0], self.manifest)

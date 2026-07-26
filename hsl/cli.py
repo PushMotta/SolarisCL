@@ -71,8 +71,19 @@ def cmd_inspect(args) -> int:
             print(f"    settings   {settings.prim_path}")
             print(f"    resolution {resolution}")
             print(f"    camera     {settings.camera or '—'}")
-            for path in manifest.outputs_for(settings):
-                print(f"    output     {path}")
+            frames = ([rop.frame_start, rop.frame_end] if rop.use_frame_range
+                      else [rop.frame_start])
+            for entry in husk_mod.planned_outputs(manifest, rop, frames=frames):
+                if entry["unresolved"]:
+                    print(f"    output     {entry['template']}  "
+                          f"(contains a token this tool cannot expand)")
+                elif entry["files"]:
+                    first = entry["files"][0]
+                    print(f"    output     {first}"
+                          + (f"  …  {entry['files'][-1]}" if len(entry["files"]) > 1
+                             else ""))
+                else:
+                    print(f"    output     {entry['template']}")
             aovs = manifest.aovs_for(settings)
             if aovs:
                 print(f"    aovs       {', '.join(v.label for v in aovs)}")
@@ -346,6 +357,29 @@ def cmd_render(args) -> int:
         if keep is not None:
             print(f"# AOVs filtered to: {args.aovs} "
                   f"(overlay USD authored from {os.path.basename(rop.usd_path)} at render time)")
+
+        # What this will actually leave on disk, resolved per frame.
+        chunk_frames = [f for job in jobs
+                        for f in (job.chunk.start + i * job.chunk.inc
+                                  for i in range(job.chunk.count))]
+        planned = husk_mod.planned_outputs(manifest, rop, output=args.output,
+                                           frames=chunk_frames)
+        if planned:
+            print("# Files this render will write:")
+            for entry in planned:
+                if entry["unresolved"]:
+                    print(f"#   {entry['template']}  "
+                          f"(unexpandable token — cannot preview the filename)")
+                elif entry["files"]:
+                    print(f"#   {entry['files'][0]}")
+                    if len(entry["files"]) > 1:
+                        print(f"#   … {len(entry['files'])} files, last "
+                              f"{entry['files'][-1]}")
+                else:
+                    print(f"#   {entry['template']}")
+        else:
+            print("# No output path is declared in the scene; husk/the ROP decides it.")
+
         for job in jobs:
             print(husk_mod.format_command(husk_mod.build_command(job)))
         return 0

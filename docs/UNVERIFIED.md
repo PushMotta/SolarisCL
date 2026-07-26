@@ -235,12 +235,24 @@ file found under the chosen search dirs; husk/hython then render the relinked US
 **Verified on 22.0.368:** scan caught scalar + array texture refs, relink repathed
 both (recursive search), and a re-scan of the relinked overlay found 0 missing.
 
-### Output path: `-o` moves only the first product  ·  `OK` (22)
+### Output path: a single `-o` moves only the first product  ·  `OK` (22)
 
-husk's `-o/--output` is real (confirmed in `--help`, "variables are expanded")
-but it redirects **only the first** `UsdRenderProduct`. On a multi-product shot
-— beauty + cryptomatte + depth — every other product keeps writing wherever the
-scene pointed it, a half-applied override that is only noticed after the render.
+**Corrected 2026-07-26.** This was written as a flat limitation — "`-o` moves
+only the first product" — which overstates it. `husk --help` says:
+
+> *"A comma separated list of filenames can be used to override images when
+> there are multiple render products."*
+
+So **one** path redirects only product 0 (the original claim, true as far as it
+goes), but a **comma list** redirects several. A multi-product shot given a
+single `-o` still silently leaves crypto/depth where the scene pointed them,
+which is the failure worth guarding against.
+
+`--help` also documents the tokens `-o` expands, which the filename preview and
+the output check depend on: `$F $FF $F4`, `$N` (N'th frame *of the sequence*),
+`<F> <FF> <F4>`, and `%d %g %04d`. `expand_frame_token()` resolves the
+unambiguous ones and **flags** `$FF` / `%g` / a bare `$N` rather than guessing —
+inventing a filename there would have failed good renders (see T6).
 
 So `inspector.override_product_paths()` authors an overlay (same mechanism as
 the AOV filter) setting **every** product's `productName`. `--output` naming a

@@ -17,8 +17,23 @@ from .manifest import RenderRop, SceneManifest
 
 # husk emits `ALF_PROGRESS 42%` when run with -Valfred.
 _ALF_PROGRESS = re.compile(r"ALF_PROGRESS\s+(\d+)\s*%")
-# Houdini frame tokens in an output path: `$F`, `$F4`, `${F4}`.
-_FRAME_TOKEN = re.compile(r"\$\{?F(\d*)\}?")
+# Frame tokens husk expands in an output path. From `husk --help`:
+#   $F, $FF, $F4   current frame number
+#   $N             the N'th frame in the sequence
+#   <F>, <FF>, <F4>  frame, UDIM style
+#   %d, %g, %04d   frame, printf style
+# `$FF` and `%g` are float forms whose exact spelling is unconfirmed, and `$N`
+# needs the sequence index rather than the frame, so they are matched only to be
+# *detected* (see `has_unexpanded_tokens`) and never guessed at.
+_FRAME_TOKEN = re.compile(
+    r"\$\{F(\d*)\}"        # ${F4}
+    r"|\$F(?!F)(\d*)"      # $F, $F4   -- not $FF
+    r"|<F(?!F)(\d*)>"      # <F>, <F4> -- not <FF>
+    r"|%(0?\d*)d"          # %d, %04d
+)
+_SEQUENCE_TOKEN = re.compile(r"\$N")
+# Anything still token-shaped after expansion: we cannot say what file it means.
+_UNEXPANDED = re.compile(r"\$\{?F|\$N|<F|%\d*[dg]")
 # `husk --list-renderers` prints one delegate per line, sometimes indented.
 _RENDERER_LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_:.\-]*)\s*$")
 
@@ -318,17 +333,111 @@ def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str = "",
 # Output parsing
 # --------------------------------------------------------------------------
 
-def expand_frame_token(path: str, frame: int) -> str:
-    """Replace Houdini frame tokens in ``path``: ``$F4`` at frame 7 -> ``0007``.
+def expand_frame_token(path: str, frame: int, index: Optional[int] = None) -> str:
+    """Replace frame tokens in ``path``: ``$F4`` at frame 7 -> ``0007``.
 
-    ``$F`` with no padding digit is the bare number. Anything without a token
-    comes back unchanged, which is correct for a single-image output.
+    Covers the spellings husk documents and we can resolve unambiguously --
+    ``$F`` / ``$F4`` / ``${F4}``, the UDIM-style ``<F>`` / ``<F4>``, and printf
+    ``%d`` / ``%04d``. ``$N`` (the N'th frame *of the sequence*, not the frame
+    number) is expanded only when ``index`` is given.
+
+    Tokens whose meaning is not certain -- ``$FF``, ``%g`` -- are deliberately
+    left alone rather than guessed at. Use :func:`has_unexpanded_tokens` to find
+    out whether the result is a real path or still a template; guessing here
+    would invent a filename that no render ever writes.
     """
     def _sub(match) -> str:
-        padding = int(match.group(1)) if match.group(1) else 1
-        return str(frame).zfill(padding)
+        digits = next((g for g in match.groups() if g is not None), "")
+        return str(frame).zfill(int(digits) if digits else 1)
 
-    return _FRAME_TOKEN.sub(_sub, path)
+    expanded = _FRAME_TOKEN.sub(_sub, path)
+    if index is not None:
+        expanded = _SEQUENCE_TOKEN.sub(str(index), expanded)
+    return expanded
+
+
+def has_unexpanded_tokens(path: str) -> bool:
+    """True if ``path`` still holds a token, i.e. it is not a real filename yet."""
+    return bool(_UNEXPANDED.search(path))
+
+
+def planned_product_paths(products, output: str) -> list:
+    """Where each render product ends up, given an ``--output`` override.
+
+    ``products`` is ``[(prim_path, authored_product_name)]`` in stage order;
+    the return is ``[(prim_path, new_path)]``.
+
+    This is the single definition of the rule, shared by the preview and by
+    ``inspector.override_product_paths()`` which actually authors it. Two
+    copies would drift, and a preview that disagrees with the render is worse
+    than no preview.
+
+    * ``output`` naming a **file** gives that exact path to the first product
+      and puts the rest alongside it under their own filenames.
+    * ``output`` naming a **directory** (trailing separator, or one that exists)
+      keeps every product's own filename.
+    * A product with no authored name is called after its prim, keeping
+      ``output``'s extension.
+    """
+    as_dir = output.endswith(("/", "\\")) or os.path.isdir(output)
+    directory = output if as_dir else (os.path.dirname(output) or ".")
+    extension = "" if as_dir else os.path.splitext(output)[1]
+
+    planned = []
+    for index, (prim_path, current) in enumerate(products):
+        if not as_dir and index == 0:
+            new_path = output
+        else:
+            base = os.path.basename((current or "").replace("\\", "/"))
+            if not base:
+                base = prim_path.rsplit("/", 1)[-1] + (extension or ".exr")
+            new_path = os.path.join(directory, base)
+        planned.append((prim_path, new_path.replace(os.sep, "/")))
+    return planned
+
+
+def planned_outputs(manifest, rop, output: str = "", frames=()) -> list:
+    """The files a render will actually write — for showing before it starts.
+
+    Returns one entry per product::
+
+        {"product": prim, "template": path, "files": [...], "unresolved": bool}
+
+    ``unresolved`` marks a template holding a token we cannot expand, so the
+    caller can say "cannot preview this" instead of inventing a filename.
+    An empty list means the scene declares no output path at all — which is
+    normal, and means husk/the ROP decides it (real shots often author no
+    ``productName``).
+    """
+    settings = manifest.resolve_settings(rop)
+    products = []
+    if settings:
+        for prim_path in settings.products:
+            product = manifest.product(prim_path)
+            if product is not None:
+                products.append((product.prim_path, product.product_name))
+
+    chosen = output or rop.output_override
+    if chosen:
+        if products:
+            pairs = planned_product_paths(products, chosen)
+        else:                       # nothing declared: the override is the output
+            pairs = [("(from --output)", chosen.replace(os.sep, "/"))]
+    else:
+        pairs = [(p, name) for p, name in products if name]
+
+    entries = []
+    for prim_path, template in pairs:
+        files, unresolved = [], False
+        for index, frame in enumerate(frames or (), 1):
+            path = expand_frame_token(template, frame, index)
+            if has_unexpanded_tokens(path):
+                unresolved = True
+                break
+            files.append(path)
+        entries.append({"product": prim_path, "template": template,
+                        "files": files, "unresolved": unresolved})
+    return entries
 
 
 def parse_progress(line: str) -> Optional[int]:

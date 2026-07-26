@@ -17,7 +17,8 @@ from enum import Enum
 from typing import Callable, Optional, Sequence
 
 from .husk import (
-    RenderJob, build_command, expand_frame_token, looks_like_error, parse_progress,
+    RenderJob, build_command, expand_frame_token, has_unexpanded_tokens,
+    looks_like_error, parse_progress,
 )
 
 
@@ -217,8 +218,15 @@ class RenderQueue:
 
         expected, missing = [], []
         for template in templates:
-            for frame in frames:
-                path = expand_frame_token(template, frame)
+            for index, frame in enumerate(frames, 1):
+                path = expand_frame_token(template, frame, index)
+                if has_unexpanded_tokens(path):
+                    # A token we cannot resolve (e.g. $FF, %g) means we do not
+                    # know the filename. Checking it would find nothing and fail
+                    # a perfectly good render, so leave this one alone.
+                    self._record(task, f"Cannot verify output (unresolved token): "
+                                       f"{template}")
+                    continue
                 expected.append(path)
                 try:
                     if not (os.path.isfile(path) and os.path.getsize(path) > 0):

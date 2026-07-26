@@ -24,6 +24,9 @@ from .manifest import (
     Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
     RenderVar, SceneManifest,
 )
+# Plain-Python, no Houdini: the output-naming rule, shared with the UI/CLI
+# preview so the two can never disagree about where a render lands.
+from .husk import planned_product_paths
 
 try:
     import hou
@@ -607,41 +610,32 @@ def override_product_paths(usd_in: str, usd_out: str, output: str,
         warnings.append(f"Output override: could not open {usd_in}")
         return ""
 
-    as_dir = output.endswith(("/", "\\")) or os.path.isdir(output)
-    directory = output if as_dir else (os.path.dirname(output) or ".")
-    extension = os.path.splitext(output)[1] if not as_dir else ""
-
-    assigned: dict = {}
-    index = 0
+    # Collect in stage order, then apply the shared naming rule. The rule lives
+    # in hsl.husk so the UI/CLI preview and this overlay cannot disagree about
+    # where a render lands.
+    prims: dict = {}
+    products: list = []
     for prim in stage.Traverse():
         if not prim.IsA(UsdRender.Product):
             continue
-        product = UsdRender.Product(prim)
-        attr = product.GetProductNameAttr()
-        current = str((attr.Get() if attr else "") or "")
+        attr = UsdRender.Product(prim).GetProductNameAttr()
+        path = str(prim.GetPath())
+        prims[path] = prim
+        products.append((path, str((attr.Get() if attr else "") or "")))
 
-        if not as_dir and index == 0:
-            new_path = output
-        else:
-            base = os.path.basename(current.replace("\\", "/"))
-            if not base:
-                base = prim.GetName() + (extension or ".exr")
-            new_path = os.path.join(directory, base)
-
-        new_path = new_path.replace(os.sep, "/")
+    assigned: dict = {}
+    for prim_path, new_path in planned_product_paths(products, output):
         if new_path in assigned:
             warnings.append(
-                f"Output override: {prim.GetPath()} and {assigned[new_path]} both "
+                f"Output override: {prim_path} and {assigned[new_path]} both "
                 f"resolve to {new_path}; they would overwrite each other. Point "
                 f"--output at a directory instead of a file, or rename the products."
             )
-        assigned[new_path] = str(prim.GetPath())
-
-        product.CreateProductNameAttr(new_path)
-        index += 1
+        assigned[new_path] = prim_path
+        UsdRender.Product(prims[prim_path]).CreateProductNameAttr(new_path)
 
     overlay.Save()
-    if index == 0:
+    if not products:
         warnings.append("Output override: the stage declares no RenderProducts.")
         return ""
     return usd_out if os.path.exists(usd_out) else ""

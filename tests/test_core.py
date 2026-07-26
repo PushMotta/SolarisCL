@@ -11,7 +11,7 @@ import unittest
 import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hsl import bridge, farm, preflight, presets
+from hsl import bridge, farm, husk as husk_mod, preflight, presets
 from hsl.bridge import (
     find_hython, list_hython_installations, load_user_settings, save_user_setting,
 )
@@ -20,7 +20,8 @@ from hsl.cli import (
 )
 from hsl.husk import (
     DEFAULT_ENGINE, FrameChunk, RenderJob, build_command, expand_frame_token,
-    format_command, frame_chunks, jobs_for_rop, looks_like_error, parse_progress,
+    format_command, frame_chunks, has_unexpanded_tokens, jobs_for_rop,
+    looks_like_error, parse_progress,
 )
 from hsl.manifest import (
     Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
@@ -428,15 +429,53 @@ class TestOutputVerification(unittest.TestCase):
     def test_unknown_expectations_are_not_guessed(self):
         self.assertIs(self._run([]).state, State.DONE)
 
+    def test_printf_named_outputs_are_verified(self):
+        for frame in (1, 2):
+            with open(os.path.join(self.dir, "out.%04d.exr" % frame), "w") as fh:
+                fh.write("pixels")
+        task = self._run([os.path.join(self.dir, "out.%04d.exr")])
+        self.assertIs(task.state, State.DONE)
+
+    def test_unresolvable_token_does_not_fail_a_good_render(self):
+        # Regression: $FF cannot be expanded, so the path could never be found
+        # and the check marked a perfectly good render FAILED.
+        task = self._run([os.path.join(self.dir, "out.$FF.exr")])
+        self.assertIs(task.state, State.DONE)
+        self.assertTrue(any("unresolved token" in line for line in task.log))
+
 
 class TestFrameTokens(unittest.TestCase):
-    def test_padding(self):
+    """husk expands $F/$FF/$F4, $N, <F>/<F4> and %d/%g/%04d (from --help)."""
+
+    def test_dollar_f_padding(self):
         self.assertEqual(expand_frame_token("/r/shot.$F4.exr", 7), "/r/shot.0007.exr")
         self.assertEqual(expand_frame_token("/r/shot.$F.exr", 7), "/r/shot.7.exr")
         self.assertEqual(expand_frame_token("/r/shot.${F4}.exr", 12), "/r/shot.0012.exr")
 
-    def test_path_without_a_token_is_unchanged(self):
+    def test_udim_style(self):
+        self.assertEqual(expand_frame_token("/r/shot.<F4>.exr", 7), "/r/shot.0007.exr")
+        self.assertEqual(expand_frame_token("/r/shot.<F>.exr", 7), "/r/shot.7.exr")
+
+    def test_printf_style(self):
+        self.assertEqual(expand_frame_token("/r/shot.%04d.exr", 7), "/r/shot.0007.exr")
+        self.assertEqual(expand_frame_token("/r/shot.%d.exr", 7), "/r/shot.7.exr")
+
+    def test_sequence_token_needs_an_index(self):
+        self.assertEqual(expand_frame_token("/r/shot.$N.exr", 1007, 3), "/r/shot.3.exr")
+        # Without an index it is left alone rather than confused with the frame.
+        self.assertTrue(has_unexpanded_tokens(expand_frame_token("/r/shot.$N.exr", 1007)))
+
+    def test_ambiguous_tokens_are_left_alone_not_guessed(self):
+        # $FF and %g are float forms whose spelling is unconfirmed. Expanding
+        # them by guesswork would invent a filename no render ever writes.
+        for template in ("/r/shot.$FF.exr", "/r/shot.%g.exr"):
+            self.assertTrue(has_unexpanded_tokens(expand_frame_token(template, 7)),
+                            f"{template} should be reported as unresolved")
+        self.assertNotIn("7F", expand_frame_token("/r/shot.$FF.exr", 7))
+
+    def test_path_without_a_token_is_unchanged_and_resolved(self):
         self.assertEqual(expand_frame_token("/r/single.exr", 7), "/r/single.exr")
+        self.assertFalse(has_unexpanded_tokens("/r/single.exr"))
 
 
 class TestHythonDiscovery(unittest.TestCase):
@@ -710,6 +749,62 @@ class TestExportNarrowing(unittest.TestCase):
         self._run(["--frames", "1050-1060"])
         self.assertFalse(self.captured["export_usd"])
         self.assertIsNone(self.captured["export_frames"])
+
+
+class TestPlannedOutputs(unittest.TestCase):
+    """The filename preview must match what the overlay actually authors."""
+
+    def test_file_mode_first_product_exact_rest_alongside(self):
+        pairs = husk_mod.planned_product_paths(
+            [("/R/P/beauty", "/old/shot_beauty.$F4.exr"),
+             ("/R/P/crypto", "/old/shot_crypto.$F4.exr")],
+            "/renders/v2/hero.exr")
+        self.assertEqual(pairs[0][1], "/renders/v2/hero.exr")
+        self.assertEqual(pairs[1][1], "/renders/v2/shot_crypto.$F4.exr")
+
+    def test_directory_mode_keeps_every_filename(self):
+        pairs = husk_mod.planned_product_paths(
+            [("/R/P/beauty", "/old/shot_beauty.$F4.exr"),
+             ("/R/P/crypto", "/old/shot_crypto.$F4.exr")],
+            "/renders/v3/")
+        self.assertEqual([p for _, p in pairs],
+                         ["/renders/v3/shot_beauty.$F4.exr",
+                          "/renders/v3/shot_crypto.$F4.exr"])
+
+    def test_empty_product_name_falls_back_to_the_prim(self):
+        # Exactly the real shot: products with no authored productName.
+        pairs = husk_mod.planned_product_paths(
+            [("/R/P/beauty", ""), ("/R/P/depth", "")], "/renders/v2/hero.exr")
+        self.assertEqual(pairs[1][1], "/renders/v2/depth.exr")
+
+    def test_preview_resolves_frames(self):
+        m = sample_manifest()
+        entries = husk_mod.planned_outputs(m, m.rops[0], frames=[1001, 1002])
+        beauty = next(e for e in entries if e["product"].endswith("beauty"))
+        self.assertEqual(beauty["files"], ["/renders/shot_beauty.1001.exr",
+                                           "/renders/shot_beauty.1002.exr"])
+        self.assertFalse(beauty["unresolved"])
+
+    def test_preview_follows_the_output_override(self):
+        m = sample_manifest()
+        entries = husk_mod.planned_outputs(m, m.rops[0], output="/out/v9/",
+                                           frames=[1001])
+        self.assertEqual([e["files"][0] for e in entries],
+                         ["/out/v9/shot_beauty.1001.exr",
+                          "/out/v9/shot_crypto.1001.exr"])
+
+    def test_unexpandable_token_is_reported_not_invented(self):
+        m = sample_manifest()
+        m.products[0].product_name = "/renders/shot.$FF.exr"
+        entries = husk_mod.planned_outputs(m, m.rops[0], frames=[1001])
+        self.assertTrue(entries[0]["unresolved"])
+        self.assertEqual(entries[0]["files"], [])
+
+    def test_no_declared_output_is_an_empty_plan(self):
+        m = sample_manifest()
+        for product in m.products:
+            product.product_name = ""
+        self.assertEqual(husk_mod.planned_outputs(m, m.rops[0], frames=[1001]), [])
 
 
 class TestMultiProductOutput(unittest.TestCase):
