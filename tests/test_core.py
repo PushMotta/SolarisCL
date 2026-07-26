@@ -524,6 +524,89 @@ class TestCliEngineGuards(unittest.TestCase):
             cmd_render(args)
 
 
+class TestCliPreflight(unittest.TestCase):
+    """Preflight used to run only in the GUI; cmd_render must enforce it too."""
+
+    def setUp(self):
+        self.manifest = sample_manifest()
+        self.manifest.rops[0].usd_path = "/tmp/shot.usd"
+        self._real_inspect = bridge.inspect_hip
+        # Stand in for the hython subprocess so this needs no Houdini.
+        bridge.inspect_hip = lambda *a, **k: self.manifest
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        bridge.inspect_hip = self._real_inspect
+
+    def _render(self, extra):
+        args = build_parser().parse_args(["render", "s.hip"] + extra)
+        with contextlib.redirect_stderr(io.StringIO()) as err, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = cmd_render(args)
+        return code, err.getvalue()
+
+    def test_missing_texture_blocks_the_render(self):
+        self.manifest.missing_assets = [
+            MissingAsset(attr_path="/mat/tex.inputs:file", asset_path="/tex/wood.exr")]
+        code, message = self._render([])
+        self.assertEqual(code, 5)
+        self.assertIn("preflight error", message)
+        self.assertIn("wood.exr", message)
+
+    def test_skip_preflight_overrides_the_block(self):
+        self.manifest.missing_assets = [
+            MissingAsset(attr_path="/mat/tex.inputs:file", asset_path="/tex/wood.exr")]
+        # Not 5: it proceeds past preflight (and fails later trying to render).
+        code, _ = self._render(["--skip-preflight", "--dry-run"])
+        self.assertNotEqual(code, 5)
+
+    def test_dry_run_reports_but_does_not_block(self):
+        self.manifest.missing_assets = [
+            MissingAsset(attr_path="/mat/tex.inputs:file", asset_path="/tex/wood.exr")]
+        code, message = self._render(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("wood.exr", message)
+
+    def test_clean_scene_passes_preflight(self):
+        code, message = self._render(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("preflight error", message)
+
+
+class TestExportNarrowing(unittest.TestCase):
+    """The export used to cover the ROP's whole authored range regardless of
+    --frames, which is most of the cost on a heavy scene."""
+
+    def setUp(self):
+        self.captured = {}
+        self.manifest = sample_manifest()
+        self.manifest.rops[0].usd_path = "/tmp/shot.usd"
+        self._real = bridge.inspect_hip
+
+        def fake(*args, **kwargs):
+            self.captured.update(kwargs)
+            return self.manifest
+
+        bridge.inspect_hip = fake
+        self.addCleanup(lambda: setattr(bridge, "inspect_hip", self._real))
+
+    def _run(self, extra):
+        args = build_parser().parse_args(["render", "s.hip", "--dry-run"] + extra)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            cmd_render(args)
+
+    def test_husk_export_is_narrowed_to_requested_frames(self):
+        self._run(["--engine", "husk", "--frames", "1050-1060"])
+        self.assertTrue(self.captured["export_usd"])
+        self.assertEqual(self.captured["export_frames"], (1050, 1060, 1))
+
+    def test_hython_exports_nothing_at_all(self):
+        self._run(["--frames", "1050-1060"])
+        self.assertFalse(self.captured["export_usd"])
+        self.assertIsNone(self.captured["export_frames"])
+
+
 class TestHythonSelection(unittest.TestCase):
     INSTALLS = [("Houdini 22.0.368", "/opt/hfs22/bin/hython"),
                 ("Houdini 21.0.729", "/opt/hfs21/bin/hython")]

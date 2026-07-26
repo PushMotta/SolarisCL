@@ -135,7 +135,8 @@ def _package_root() -> str:
 
 def inspect_hip(hip_path: str, *, hython: str = "", export_usd: bool = True,
                 usd_dir: str = "", flatten: bool = False, rop: str = "",
-                allow_volume_bake: bool = True, timeout: float = 1800.0,
+                allow_volume_bake: bool = True, export_frames=None,
+                timeout: float = 1800.0,
                 env: Optional[dict] = None) -> SceneManifest:
     """Run the inspector under hython and return the parsed manifest.
 
@@ -173,6 +174,10 @@ def inspect_hip(hip_path: str, *, hython: str = "", export_usd: bool = True,
         cmd += ["--rop", rop]
     if allow_volume_bake:
         cmd.append("--allow-volume-bake")
+    if export_frames:
+        # Narrow the export to the frames being rendered; without this the ROP's
+        # whole authored range is written, which is most of the export cost.
+        cmd += ["--export-frames"] + [str(int(v)) for v in export_frames]
 
     run_env = dict(env or os.environ)
     existing = run_env.get("PYTHONPATH", "")

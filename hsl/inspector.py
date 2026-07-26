@@ -81,6 +81,24 @@ def _set_parm(node, name, value) -> bool:
         return False
 
 
+def _apply_override(node, names, value, label: str, warnings: list) -> bool:
+    """Set the first parameter in ``names`` that exists; record it if none do.
+
+    ``_set_parm`` returns False when the parameter is absent. Discarding that
+    return is how an override turns into a **silent no-op**: the render succeeds
+    and quietly uses the scene's own value instead of the one that was asked
+    for. Every override goes through here so that never happens unnoticed.
+    """
+    for name in names:
+        if _set_parm(node, name, value):
+            return True
+    warnings.append(
+        f"{node.path()}: no parameter {' / '.join(names)} on this build, so "
+        f"{label}={value!r} was NOT applied; the scene's own value is used."
+    )
+    return False
+
+
 def _flatten_token(node) -> str:
     """Return the usd_rop ``savestyle`` token that flattens into one layer.
 
@@ -437,7 +455,19 @@ def export_usd(rop_node, out_path: str, frame_range=None,
     tmp = parent.createNode("usd_rop", "hsl_tmp_export")
     try:
         tmp.setInput(0, source)
-        _set_parm(tmp, "lopoutput", out_path)
+
+        # T1: if `lopoutput` is named differently on this build, the ROP writes
+        # to its own default path and husk would then render a stale or missing
+        # file. Refuse rather than return a path that was never written to.
+        if not _set_parm(tmp, "lopoutput", out_path):
+            warnings.append(
+                f"{rop_node.path()}: the temporary usd_rop has no 'lopoutput' "
+                f"parameter on this Houdini build, so the export destination "
+                f"could not be set. Aborting the export instead of writing to "
+                f"an unknown location."
+            )
+            return ""
+        # Absent on some builds and harmless either way -- not worth a warning.
         _set_parm(tmp, "enableoutputprocessor_simplerelativepaths", False)
 
         if flatten:
@@ -452,14 +482,22 @@ def export_usd(rop_node, out_path: str, frame_range=None,
 
         if frame_range:
             start, end, inc = frame_range
-            _set_parm(tmp, "trange", 1)
-            _set_parm(tmp, "f1", start)
-            _set_parm(tmp, "f2", end)
-            _set_parm(tmp, "f3", inc)
-            # One self-contained file keeps the husk command simple.
-            _set_parm(tmp, "fileperframe", 0)
-        else:
-            _set_parm(tmp, "trange", 0)
+            # One self-contained file (fileperframe=0) keeps the husk command
+            # simple. A missing parm here means the wrong frames get exported,
+            # so say so rather than exporting a single frame in silence.
+            for name, value in (("trange", 1), ("f1", start), ("f2", end),
+                                ("f3", inc), ("fileperframe", 0)):
+                if not _set_parm(tmp, name, value):
+                    warnings.append(
+                        f"{rop_node.path()}: usd_rop has no '{name}' parameter on "
+                        f"this build; the exported range may not be {start}-{end}"
+                        f"x{inc} as requested."
+                    )
+        elif not _set_parm(tmp, "trange", 0):
+            warnings.append(
+                f"{rop_node.path()}: usd_rop has no 'trange' parameter; the "
+                f"export may cover the ROP's whole range, not the current frame."
+            )
 
         tmp.render(verbose=False)
     except hou.Error as exc:
@@ -619,7 +657,8 @@ def relink_assets(usd_in: str, usd_out: str, search_dirs) -> dict:
 
 def inspect(hip_path: str, export: bool = False,
             usd_dir: str = "", flatten: bool = False,
-            rop_filter: str = "", allow_volume_bake: bool = True) -> SceneManifest:
+            rop_filter: str = "", allow_volume_bake: bool = True,
+            export_frames: Optional[tuple] = None) -> SceneManifest:
     """Load a .hip and describe every render ROP in it.
 
     When ``export`` is requested and a ROP's stage contains live volumes (see
@@ -627,6 +666,11 @@ def inspect(hip_path: str, export: bool = False,
     ``allow_volume_bake`` is true -- baking tens of GB per frame is almost never
     what the caller wants, and the hython-direct engine avoids it entirely. The
     skip is recorded in ``manifest.warnings`` so the caller can explain it.
+
+    ``export_frames`` is a ``(start, end, inc)`` that narrows the export to the
+    frames actually being rendered. Without it the export covers the ROP's whole
+    authored range, which on a heavy scene is most of the cost -- exporting 1-240
+    to render frame 12.
     """
     if hou is None:
         raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
@@ -713,8 +757,10 @@ def inspect(hip_path: str, export: bool = False,
                 )
             else:
                 usd_name = node.path().strip("/").replace("/", "_") + ".usd"
-                frame_range = ((rop.frame_start, rop.frame_end, rop.frame_inc)
-                               if rop.use_frame_range else None)
+                # Export only what is being rendered when the caller said so.
+                frame_range = export_frames or (
+                    (rop.frame_start, rop.frame_end, rop.frame_inc)
+                    if rop.use_frame_range else None)
                 rop.usd_path = export_usd(node, os.path.join(usd_dir, usd_name),
                                           frame_range=frame_range,
                                           flatten=flatten, warnings=warnings)
@@ -734,7 +780,19 @@ def inspect(hip_path: str, export: bool = False,
 def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] = None,
                   frame_count: int = 1, frame_inc: int = 1, renderer: str = "",
                   camera: str = "", output: str = "", res: Optional[tuple[int, int]] = None) -> int:
-    """Render a LOP ROP directly in hython without exporting USD to disk."""
+    """Render a LOP ROP directly in hython without exporting USD to disk.
+
+    This is the default engine (``husk.DEFAULT_ENGINE``), so its progress
+    reporting has to be real: frames are rendered **one call at a time** and an
+    ``ALF_PROGRESS`` line is emitted after each. ``RopNode.render()`` blocks and
+    reports nothing while it runs, so rendering a whole range in one call can
+    only ever print 0% and then 100% -- which reads as a hung render.
+
+    The trade-off is one ``render()`` call per frame instead of one per range.
+    Progress within a single frame is still not available on this path (husk
+    gets that from Karma's own ``ALF_PROGRESS``); a one-frame job therefore
+    still goes 0% -> 100%.
+    """
     if hou is None:
         raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
 
@@ -749,37 +807,51 @@ def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] 
 
     target_rop = rop_nodes[0]
 
+    # Every override reports whether it actually landed. `resolutionx` /
+    # `resolutiony` in particular are unconfirmed on usdrender_rop -- if they
+    # are absent the render silently used the scene resolution before this.
+    overrides: list[str] = []
     if renderer:
-        _set_parm(target_rop, "renderer", renderer)
-        _set_parm(target_rop, "husk_renderer", renderer)
-        _set_parm(target_rop, "engine", renderer)
+        _apply_override(target_rop, ("renderer", "husk_renderer", "engine"),
+                        renderer, "renderer", overrides)
     if camera:
-        _set_parm(target_rop, "override_camera", camera)
-        _set_parm(target_rop, "camera", camera)
+        _apply_override(target_rop, ("override_camera", "camera"),
+                        camera, "camera", overrides)
     if output:
-        _set_parm(target_rop, "outputimage", output)
-        _set_parm(target_rop, "picture", output)
+        _apply_override(target_rop, ("outputimage", "picture"),
+                        output, "output", overrides)
     if res:
-        _set_parm(target_rop, "resolutionx", res[0])
-        _set_parm(target_rop, "resolutiony", res[1])
+        _apply_override(target_rop, ("resolutionx",), res[0], "resolution x", overrides)
+        _apply_override(target_rop, ("resolutiony",), res[1], "resolution y", overrides)
+    for message in overrides:
+        sys.stderr.write(f"warning: {message}\n")
+    sys.stderr.flush()
 
     if frame_start is not None:
-        f1 = frame_start
-        f2 = frame_start + (frame_count - 1) * frame_inc
+        frames = [frame_start + i * frame_inc for i in range(max(1, frame_count))]
         _set_parm(target_rop, "trange", 1)
-        _set_parm(target_rop, "f1", f1)
-        _set_parm(target_rop, "f2", f2)
-        _set_parm(target_rop, "f3", frame_inc)
-        frame_range = (f1, f2, frame_inc)
     else:
-        frame_range = ()
+        frames = []
 
+    total = len(frames) or 1
     try:
         sys.stdout.write("ALF_PROGRESS 0%\n")
         sys.stdout.flush()
-        target_rop.render(frame_range=frame_range if frame_range else (), verbose=True)
-        sys.stdout.write("ALF_PROGRESS 100%\n")
-        sys.stdout.flush()
+
+        if frames:
+            for index, frame in enumerate(frames, 1):
+                # Set the frame parms *and* pass an explicit range, so the two
+                # cannot disagree if this build honours only one of them.
+                _set_parm(target_rop, "f1", frame)
+                _set_parm(target_rop, "f2", frame)
+                _set_parm(target_rop, "f3", 1)
+                target_rop.render(frame_range=(frame, frame, 1), verbose=True)
+                sys.stdout.write("ALF_PROGRESS %d%%\n" % int(index * 100 / total))
+                sys.stdout.flush()
+        else:
+            target_rop.render(verbose=True)
+            sys.stdout.write("ALF_PROGRESS 100%\n")
+            sys.stdout.flush()
         return 0
     except hou.Error as exc:
         sys.stderr.write(f"Direct render failed on {target_rop.path()}: {exc}\n")
@@ -803,6 +875,10 @@ def main(argv=None) -> int:
                         help="Flatten the stage on export (portable, larger)")
     parser.add_argument("--rop", default="",
                         help="Only inspect this ROP path")
+    parser.add_argument("--export-frames", nargs=3, type=int, default=None,
+                        metavar=("START", "END", "INC"),
+                        help="Export only this range instead of the ROP's full "
+                             "authored range")
     parser.add_argument("--allow-volume-bake", action="store_true",
                         help="Export even when live volumes would bake ~GB/frame "
                              "(default: skip the export for such ROPs)")
@@ -858,7 +934,9 @@ def main(argv=None) -> int:
         manifest = inspect(args.hip, export=args.export_usd,
                            usd_dir=args.usd_dir, flatten=args.flatten,
                            rop_filter=args.rop,
-                           allow_volume_bake=args.allow_volume_bake)
+                           allow_volume_bake=args.allow_volume_bake,
+                           export_frames=(tuple(args.export_frames)
+                                          if args.export_frames else None))
     except Exception:
         # The launcher parses stdout as JSON, so failures must be structured.
         error = {"schema_version": 0, "error": traceback.format_exc()}

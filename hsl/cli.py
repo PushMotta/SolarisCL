@@ -13,7 +13,7 @@ import sys
 import threading
 from typing import Optional
 
-from . import bridge, husk as husk_mod
+from . import bridge, husk as husk_mod, preflight
 from .manifest import RenderRop, SceneManifest
 from .runner import RenderQueue, State
 
@@ -187,7 +187,10 @@ def cmd_render(args) -> int:
     manifest = bridge.inspect_hip(args.hip, hython=args.hython,
                                   export_usd=export_usd, usd_dir=args.usd_dir,
                                   flatten=args.flatten, rop=args.rop,
-                                  allow_volume_bake=allow_volume_bake)
+                                  allow_volume_bake=allow_volume_bake,
+                                  # Export only the frames asked for, not the
+                                  # ROP's whole authored range.
+                                  export_frames=args.frames if export_usd else None)
     rop = _pick_rop(manifest, args.rop)
     if rop is None:
         return 2
@@ -249,6 +252,11 @@ def cmd_render(args) -> int:
             base_usd = result["usd_out"]
             sys.stderr.write(f"Relinked {len(result['relinked'])} asset(s); "
                              f"{len(result['still_missing'])} still missing.\n")
+            # Drop what the relink resolved, so preflight below judges the USD
+            # that is actually about to render — not the state before the fix.
+            resolved = {entry.get("old") for entry in result.get("relinked", [])}
+            manifest.missing_assets = [a for a in manifest.missing_assets
+                                       if a.asset_path not in resolved]
 
     # AOV selection is a USD edit, not a husk flag: keep only the requested
     # RenderVars by rendering an overlay produced by bridge.filter_aovs.
@@ -284,6 +292,19 @@ def cmd_render(args) -> int:
         resolution=tuple(args.res) if args.res else None,
         extra_args=args.extra or None,
     )
+
+    # Preflight — frame range, resolution, output path, free disk, unresolved
+    # assets, volume bake. This ran only in the GUI until now, so CLI and farm
+    # users got none of it.
+    checks = preflight.run_preflight_checks(jobs[0], manifest)
+    for check in checks:
+        sys.stderr.write(f"[preflight {check.level}] {check.message}\n")
+    errors = [c for c in checks if c.level == "error"]
+    if errors and not args.dry_run and not args.skip_preflight:
+        sys.stderr.write(
+            f"\n{len(errors)} preflight error(s) — nothing rendered. Fix them, or "
+            f"re-run with --skip-preflight to render anyway.\n")
+        return 5
 
     if args.dry_run:
         if keep is not None:
@@ -379,8 +400,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("--snapshot", type=int, default=0, metavar="SECONDS")
     p_render.add_argument("--extra", nargs=argparse.REMAINDER,
                           help="Everything after this is passed to husk verbatim")
+    p_render.add_argument("--skip-preflight", action="store_true",
+                          help="Render even if preflight reports errors (missing "
+                               "textures, unwritable output path, …)")
     p_render.add_argument("--dry-run", action="store_true",
-                          help="Print the husk commands and stop")
+                          help="Print the render commands and stop")
     p_render.set_defaults(func=cmd_render)
 
     p_hython = sub.add_parser("hython",
