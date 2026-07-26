@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional, Sequence
 
-from .husk import RenderJob, build_command, looks_like_error, parse_progress
+from .husk import (
+    RenderJob, build_command, expand_frame_token, looks_like_error, parse_progress,
+)
 
 
 class State(str, Enum):
@@ -182,7 +184,7 @@ class RenderQueue:
 
             if self._cancel.is_set():
                 task.state = State.CANCELLED
-            elif proc.returncode == 0:
+            elif proc.returncode == 0 and self._wrote_something(task):
                 task.state = State.DONE
                 task.progress = 100
             else:
@@ -192,6 +194,54 @@ class RenderQueue:
         finally:
             task._proc = None
             self._slots.release()
+
+    def _wrote_something(self, task: Task) -> bool:
+        """False only when the render exited 0 and produced none of its outputs.
+
+        A husk process can exit 0 having written nothing at all -- an output
+        directory it could not write to, a product pointing somewhere
+        unexpected -- and the return code alone cannot tell that from success.
+
+        The check is deliberately timid. It needs ``job.expected_outputs`` to
+        know what to look for, and it only fails a task when **every** expected
+        file is absent or empty. A partial miss is logged but still passes:
+        turning a good render into a false failure over our own path
+        arithmetic would be worse than the bug being caught.
+        """
+        templates = task.job.expected_outputs
+        if not templates:
+            return True
+
+        chunk = task.job.chunk
+        frames = [chunk.start + i * chunk.inc for i in range(chunk.count)]
+
+        expected, missing = [], []
+        for template in templates:
+            for frame in frames:
+                path = expand_frame_token(template, frame)
+                expected.append(path)
+                try:
+                    if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+                        missing.append(path)
+                except OSError:
+                    missing.append(path)
+
+        if not expected:
+            return True
+
+        if len(missing) == len(expected):
+            self._record(task, f"Exited 0 but wrote none of its {len(expected)} "
+                               f"expected output(s):")
+            for path in missing[:5]:
+                self._record(task, f"  missing: {path}")
+            if len(missing) > 5:
+                self._record(task, f"  … and {len(missing) - 5} more")
+            return False
+
+        if missing:
+            self._record(task, f"warning: {len(missing)} of {len(expected)} "
+                               f"expected output(s) missing or empty")
+        return True
 
     def _record(self, task: Task, line: str) -> None:
         task.log.append(line)

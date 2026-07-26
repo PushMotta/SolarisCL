@@ -3,16 +3,14 @@
 Ordered by risk. Each has an acceptance criterion — "done" means the criterion
 is demonstrated, not that the code looks right.
 
-## T1 — `export_usd()` ignores failed parameter writes  ·  high
+## ~~T1 — `export_usd()` ignores failed parameter writes~~  ·  **DONE 2026-07-26**
 
-`_set_parm()` returns `False` when a parameter does not exist, and
-`hsl/inspector.py:304-319` discards every return value. If `lopoutput` is named
-differently in the user's Houdini version, the USD is written somewhere else
-and husk renders a stale file or fails on a missing path — with no warning.
-
-**Done when:** each `_set_parm()` call site checks the result and appends to
-`warnings`; a missing `lopoutput` aborts the export rather than returning a
-path that was never written; `docs/UNVERIFIED.md` C1–C5 note the new behaviour.
+A missing `lopoutput` now **aborts** the export instead of returning a path
+nothing was written to, and every frame parm that fails to set appends to
+`warnings`. The same class of bug in `render_direct()` is covered by the new
+`_apply_override()`, which reports any override that did not land — including
+`resolutionx`/`resolutiony`, still unconfirmed on `usdrender_rop` and until now
+silently ignored.
 
 ## ~~T2 — Confirm `--verbose 3a` produces `ALF_PROGRESS`~~  ·  **DONE 2026-07-25**
 
@@ -49,22 +47,34 @@ time is described from one moment. See `docs/UNVERIFIED.md` D5.
 given one, and warns if the settings prim set differs between the first and
 last frame of the range.
 
-## T6 — No per-chunk output verification  ·  medium
+## ~~T6 — No per-chunk output verification~~  ·  **DONE 2026-07-26**
 
-A husk process can exit 0 having written nothing — wrong output path, no write
-permission. `RenderQueue` currently trusts the return code.
+`RenderJob.expected_outputs` carries the paths a job should produce (the
+`--output` override, else the settings prim's products), and
+`RenderQueue._wrote_something()` expands their `$F` tokens per frame and checks
+each file exists and is non-empty. A task that exits 0 having written **nothing**
+is marked FAILED with the missing paths in its log.
 
-**Done when:** each finished task checks its expected outputs exist and are
-non-empty, and marks itself failed if not. Testable with the fake husk.
+Deliberately timid: with no known expectations the check is skipped rather than
+guessed at, and a *partial* miss logs a warning but still passes — a false
+failure over our own path arithmetic would be worse than the bug being caught.
+Covered by five fake-husk tests.
 
-## T7 — Farm submission  ·  medium
+## ~~T7 — Farm submission~~  ·  **DONE 2026-07-26**
 
-`husk.jobs_for_rop()` already produces one job per chunk, which is the whole
-of what a submitter needs.
+The Deadline exporter wrote `first_job`'s command **verbatim**, frame numbers
+and all, so every task on the farm would have re-rendered chunk 0 and no other
+frame would ever have been produced. `farm.task_command()` now substitutes
+Deadline's `<STARTFRAME>` token for the job's frame (`--frame` for husk,
+`--frame-start` for hython), pins `--frame-count 1` and drops the per-task
+increment, with `ChunkSize=1` so the scheduler owns the splitting.
+`frame_expression()` emits the full covered range as explicit runs
+(`1001-1100`, `1,6,11`) rather than the `1-19x2` shorthand not every scheduler
+parses.
 
-**Done when:** `hsl/farm.py` emits a Deadline or Tractor job from a list of
-`RenderJob`s, with tests that assert on the generated job file rather than on
-a live scheduler.
+Tractor was already correct — one task per chunk with its real command — and
+now also loses a duplicated `-title`. Seven tests assert on the generated files,
+including that no literal start frame survives in the Deadline arguments.
 
 ## T8 — Manifest caching is unused by the CLI  ·  low
 

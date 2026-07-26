@@ -19,8 +19,8 @@ from hsl.cli import (
     _resolve_hython_choice, build_parser, cmd_render, parse_frames,
 )
 from hsl.husk import (
-    DEFAULT_ENGINE, FrameChunk, RenderJob, build_command, format_command,
-    frame_chunks, jobs_for_rop, looks_like_error, parse_progress,
+    DEFAULT_ENGINE, FrameChunk, RenderJob, build_command, expand_frame_token,
+    format_command, frame_chunks, jobs_for_rop, looks_like_error, parse_progress,
 )
 from hsl.manifest import (
     Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
@@ -373,6 +373,72 @@ class TestRenderQueue(unittest.TestCase):
         self.assertTrue(any("rendered" in line for line in queue.tasks[0].log))
 
 
+class TestOutputVerification(unittest.TestCase):
+    """T6: a husk process can exit 0 having written nothing."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.fake = os.path.join(self.dir, "fake_husk.py")
+        with open(self.fake, "w") as fh:
+            fh.write("import sys\nprint('ALF_PROGRESS 100%', flush=True)\nsys.exit(0)\n")
+        if os.name == "nt":
+            self.exe = os.path.join(self.dir, "fake_husk.bat")
+            with open(self.exe, "w") as fh:
+                fh.write(f'@echo off\n"{sys.executable}" "{self.fake}" %*\n')
+        else:
+            self.exe = self.fake
+            os.chmod(self.fake, os.stat(self.fake).st_mode | stat.S_IEXEC)
+
+    def _run(self, expected):
+        job = RenderJob(usd_file=os.path.join(self.dir, "shot.usd"),
+                        engine="husk", husk_exe=self.exe,
+                        chunk=FrameChunk(1, 2, 1), expected_outputs=expected)
+        queue = RenderQueue([job])
+        queue.start(block=True)
+        return queue.tasks[0]
+
+    def test_exit_zero_with_no_output_is_a_failure(self):
+        task = self._run([os.path.join(self.dir, "out.$F4.exr")])
+        self.assertEqual(task.returncode, 0)
+        self.assertIs(task.state, State.FAILED)
+        self.assertTrue(any("wrote none of its" in line for line in task.log))
+
+    def test_outputs_present_means_done(self):
+        for frame in (1, 2):
+            with open(os.path.join(self.dir, "out.%04d.exr" % frame), "w") as fh:
+                fh.write("pixels")
+        task = self._run([os.path.join(self.dir, "out.$F4.exr")])
+        self.assertIs(task.state, State.DONE)
+
+    def test_empty_file_does_not_count_as_output(self):
+        for frame in (1, 2):
+            open(os.path.join(self.dir, "out.%04d.exr" % frame), "w").close()
+        task = self._run([os.path.join(self.dir, "out.$F4.exr")])
+        self.assertIs(task.state, State.FAILED)
+
+    def test_partial_output_still_passes_but_warns(self):
+        # Only frame 1 written: a partial miss must not fail a good render.
+        with open(os.path.join(self.dir, "out.0001.exr"), "w") as fh:
+            fh.write("pixels")
+        task = self._run([os.path.join(self.dir, "out.$F4.exr")])
+        self.assertIs(task.state, State.DONE)
+        self.assertTrue(any("1 of 2 expected" in line for line in task.log))
+
+    def test_unknown_expectations_are_not_guessed(self):
+        self.assertIs(self._run([]).state, State.DONE)
+
+
+class TestFrameTokens(unittest.TestCase):
+    def test_padding(self):
+        self.assertEqual(expand_frame_token("/r/shot.$F4.exr", 7), "/r/shot.0007.exr")
+        self.assertEqual(expand_frame_token("/r/shot.$F.exr", 7), "/r/shot.7.exr")
+        self.assertEqual(expand_frame_token("/r/shot.${F4}.exr", 12), "/r/shot.0012.exr")
+
+    def test_path_without_a_token_is_unchanged(self):
+        self.assertEqual(expand_frame_token("/r/single.exr", 7), "/r/single.exr")
+
+
 class TestHythonDiscovery(unittest.TestCase):
     def test_list_hython_installations(self):
         installs = list_hython_installations()
@@ -672,6 +738,74 @@ class TestPresets(unittest.TestCase):
         updated = presets.apply_preset(job, preset)
         self.assertEqual(updated.renderer, "BRAY_HdKarmaXPU")
         self.assertEqual(updated.resolution, (960, 540))
+
+
+class TestFarmDistribution(unittest.TestCase):
+    """T7: the exporter must distribute frames. It used to emit job[0]'s
+    command verbatim, so every farm task re-rendered that one chunk."""
+
+    def jobs(self):
+        m = sample_manifest()                      # 1001-1100
+        return jobs_for_rop(m, m.rops[0], "/tmp/shot.usd",
+                            engine="husk", husk_exe="husk", chunk_size=25)
+
+    def test_frame_expression_collapses_runs(self):
+        jobs = self.jobs()
+        self.assertEqual(len(jobs), 4)
+        self.assertEqual(farm.frame_expression(jobs), "1001-1100")
+
+    def test_frame_expression_handles_gaps_and_steps(self):
+        job = RenderJob(usd_file="/s.usd", engine="husk", chunk=FrameChunk(1, 3, 5))
+        # frames 1, 6, 11 -- no consecutive run to collapse
+        self.assertEqual(farm.frame_expression([job]), "1,6,11")
+
+    def test_every_frame_is_covered_exactly_once(self):
+        frames = farm.all_frames(self.jobs())
+        self.assertEqual(frames, list(range(1001, 1101)))
+        self.assertEqual(len(frames), len(set(frames)))
+
+    def test_task_command_is_tokenised_not_hardcoded(self):
+        argv = farm.task_command(self.jobs()[0], farm.DEADLINE_START_TOKEN)
+        self.assertIn(farm.DEADLINE_START_TOKEN, argv)
+        self.assertEqual(argv[argv.index("--frame") + 1], farm.DEADLINE_START_TOKEN)
+        self.assertEqual(argv[argv.index("--frame-count") + 1], "1")
+        # The literal start frame must be gone, or every task renders chunk 0.
+        self.assertNotIn("1001", argv)
+
+    def test_hython_jobs_tokenise_their_own_frame_flag(self):
+        m = sample_manifest()
+        job = jobs_for_rop(m, m.rops[0], "", engine="hython", chunk_size=25)[0]
+        argv = farm.task_command(job, farm.DEADLINE_START_TOKEN)
+        self.assertEqual(argv[argv.index("--frame-start") + 1],
+                         farm.DEADLINE_START_TOKEN)
+
+    def test_deadline_files_carry_token_and_full_range(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            job_path, plugin_path = farm.export_deadline_job(self.jobs(), temp_dir)
+            with open(job_path, encoding="utf-8") as fh:
+                job_info = fh.read()
+            with open(plugin_path, encoding="utf-8") as fh:
+                plugin_info = fh.read()
+            self.assertIn("Frames=1001-1100", job_info)
+            self.assertIn("ChunkSize=1", job_info)
+            self.assertIn(farm.DEADLINE_START_TOKEN, plugin_info)
+            self.assertNotIn("--frame 1001", plugin_info)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_tractor_emits_one_task_per_chunk_with_real_frames(self):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            out = farm.export_tractor_job(
+                self.jobs(), os.path.join(temp_dir, "job.alf"))
+            with open(out, encoding="utf-8") as fh:
+                content = fh.read()
+            self.assertEqual(content.count("RemoteCmd"), 4)
+            for start in ("1001", "1026", "1051", "1076"):
+                self.assertIn(start, content)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class TestFarm(unittest.TestCase):

@@ -150,9 +150,11 @@ Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
    reports missing assets for both engines.
 4. **Export only the frames being rendered:** export writes the ROP's full
    authored range regardless of `--frames`; narrowing it cuts export cost.
-5. **Farm exporter is a sketch:** `farm.export_deadline_job` only emits job[0]'s
-   command (no per-task frame token) — won't distribute a chunked render. Tractor
-   is closer. Needs a real fix + a test that asserts frame distribution.
+5. ~~**Farm exporter is a sketch**~~ — **DONE.** Deadline now substitutes
+   `<STARTFRAME>` per task (`--frame` for husk, `--frame-start` for hython),
+   `ChunkSize=1`, and `Frames=` carries the whole covered range as explicit runs.
+   Tractor was already distributing correctly. 7 tests assert on the generated
+   files, including that no literal start frame survives. See TASKS.md T7.
 6. **`render_direct` rough edges** — ⬆ **now the highest-value item: this is the
    default engine.** Progress is faked (0→100, nothing between), so every default
    render looks hung; `resolutionx`/`resolutiony` overrides are unverified

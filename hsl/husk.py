@@ -17,6 +17,8 @@ from .manifest import RenderRop, SceneManifest
 
 # husk emits `ALF_PROGRESS 42%` when run with -Valfred.
 _ALF_PROGRESS = re.compile(r"ALF_PROGRESS\s+(\d+)\s*%")
+# Houdini frame tokens in an output path: `$F`, `$F4`, `${F4}`.
+_FRAME_TOKEN = re.compile(r"\$\{?F(\d*)\}?")
 # `husk --list-renderers` prints one delegate per line, sometimes indented.
 _RENDERER_LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_:.\-]*)\s*$")
 
@@ -168,6 +170,10 @@ class RenderJob:
     extra_args: list[str] = field(default_factory=list)
     husk_exe: str = ""
     hython_exe: str = ""
+    # Output paths this job should produce, frame tokens still in place. Used
+    # only to catch a render that exits 0 having written nothing; empty means
+    # "unknown", and the check is then skipped rather than guessed at.
+    expected_outputs: list[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -281,6 +287,18 @@ def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str = "",
     }
     defaults.update({k: v for k, v in overrides.items() if v is not None})
 
+    # What this job should leave on disk, so the runner can tell a silent
+    # no-output render from a real one. An explicit output override wins;
+    # otherwise the products declared by the settings prim.
+    if "expected_outputs" not in overrides:
+        chosen = defaults.get("output") or ""
+        if chosen:
+            defaults["expected_outputs"] = [chosen]
+        elif settings:
+            defaults["expected_outputs"] = manifest.outputs_for(settings)
+        else:
+            defaults["expected_outputs"] = []
+
     if rop.use_frame_range:
         chunks = frame_chunks(rop.frame_start, rop.frame_end,
                               rop.frame_inc, chunk_size)
@@ -294,6 +312,19 @@ def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str = "",
 # --------------------------------------------------------------------------
 # Output parsing
 # --------------------------------------------------------------------------
+
+def expand_frame_token(path: str, frame: int) -> str:
+    """Replace Houdini frame tokens in ``path``: ``$F4`` at frame 7 -> ``0007``.
+
+    ``$F`` with no padding digit is the bare number. Anything without a token
+    comes back unchanged, which is correct for a single-image output.
+    """
+    def _sub(match) -> str:
+        padding = int(match.group(1)) if match.group(1) else 1
+        return str(frame).zfill(padding)
+
+    return _FRAME_TOKEN.sub(_sub, path)
+
 
 def parse_progress(line: str) -> Optional[int]:
     """Extract a 0-100 percentage from a line of husk output, else None."""
