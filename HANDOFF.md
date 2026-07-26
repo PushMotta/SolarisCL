@@ -150,31 +150,49 @@ Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
    because a weaker one would silently keep the broken paths). `--relink-from`
    now works on **both** engines. SandBurst went 4 unresolved → 0. See
    `docs/UNVERIFIED.md` G1–G3 / G-RELINK.
-4. **Export only the frames being rendered:** export writes the ROP's full
-   authored range regardless of `--frames`; narrowing it cuts export cost.
+4. ~~**Export only the frames being rendered**~~ — **DONE.** `inspect()` takes
+   `export_frames`, plumbed through `bridge.inspect_hip` and the CLI, so a husk
+   run exports only `--frames` instead of the ROP's whole authored range.
 5. ~~**Farm exporter is a sketch**~~ — **DONE.** Deadline now substitutes
    `<STARTFRAME>` per task (`--frame` for husk, `--frame-start` for hython),
    `ChunkSize=1`, and `Frames=` carries the whole covered range as explicit runs.
    Tractor was already distributing correctly. 7 tests assert on the generated
    files, including that no literal start frame survives. See TASKS.md T7.
-6. **`render_direct` rough edges** — ⬆ **now the highest-value item: this is the
-   default engine.** Progress is faked (0→100, nothing between), so every default
-   render looks hung; `resolutionx`/`resolutiony` overrides are unverified
-   (likely silent no-op).
-7. **TASKS.md T1** (other `_set_parm` returns in `export_usd` unchecked) — harmless
-   on 21/22 since the parms exist, but a real gap on an untested build.
+6. ~~**`render_direct` rough edges**~~ — **DONE (progress).** Frames render one
+   call at a time with `ALF_PROGRESS` after each, so a range render no longer
+   looks hung. Intra-frame progress is still unavailable on this path (husk gets
+   it from Karma), so a **one-frame** job still goes 0 → 100 — by design, not an
+   oversight. `resolutionx`/`resolutiony` are still unconfirmed on
+   `usdrender_rop`, but `_apply_override()` now **says so loudly** instead of
+   silently rendering at the scene resolution.
+7. ~~**TASKS.md T1**~~ — **DONE.** A missing `lopoutput` aborts the export; every
+   other `_set_parm` in `export_usd` warns on failure.
 8. **Precise per-frame export TIME** was never captured (disk filled). Re-run
    `scratchpad/export_timing.py` (now flushed) with `--usd-dir`/outdir on a drive
-   with hundreds of GB free.
-9. **Preflight is UI-only.** `preflight.run_preflight_checks` is called from
-   `hsl/ui.py` alone; `cmd_render` re-implements a subset inline. So CLI and farm
-   users get no disk-space / output-path / resolution checks. Consolidating is
-   cheap, removes the duplication, and is **fully testable without Houdini**.
+   with hundreds of GB free. **Now safe to attempt** — the volume guard means an
+   accidental full-range export can't fill the disk.
+9. ~~**Preflight is UI-only**~~ — **DONE.** `cmd_render` runs
+   `run_preflight_checks` too; errors stop the render (exit 5) with
+   `--skip-preflight` to override, `--dry-run` reports without blocking.
+
+### Still open
+
+- **TASKS.md T5** (medium) — `inspect()` cooks at one frame, so a stage whose
+  structure changes over time is described from a single moment. Wants an
+  optional frame + a warning when the settings-prim set differs between the
+  first and last frame of the range.
+- **#8 above** — the export-timing measurement.
+- **`docs/UNVERIFIED.md` A3, E8/E9, F2/F3** — versioned type-name split,
+  `--complexity`/`--purpose` values, Karma licence + Indie cap.
+- **Non-ASCII on stdout.** `hsl inspect` prints `✗ ⚠ →` to stdout; on Windows
+  that can raise `UnicodeEncodeError` when redirected to a file (stderr is safe,
+  Python uses `backslashreplace` there). Pre-existing throughout, not worth a
+  scattered fix — one pass setting an explicit encoding would do it.
 
 ## How to run / verify
 
 ```bash
-python -m unittest discover -s tests        # 59 tests, no Houdini needed
+python -m unittest discover -s tests        # 104 tests, no Houdini needed
 make check                                   # tests + boundary + drift + ui-imports (green on Windows)
 # with $HFS set to a Houdini install:
 python scripts/verify_environment.py --report
