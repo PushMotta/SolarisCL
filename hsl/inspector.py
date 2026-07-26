@@ -566,6 +566,85 @@ def filter_usd_aovs(usd_in: str, usd_out: str, keep_paths,
     return usd_out if os.path.exists(usd_out) else ""
 
 
+def override_product_paths(usd_in: str, usd_out: str, output: str,
+                           warnings: Optional[list] = None) -> str:
+    """Overlay that redirects **every** RenderProduct's output, not just the first.
+
+    husk's ``-o/--output`` overrides only the *first* product (confirmed in
+    ``husk --help``). On a multi-product shot -- beauty + cryptomatte + depth --
+    that silently leaves every other product writing to wherever the scene
+    pointed it, which is the kind of half-applied override that is only noticed
+    after the render.
+
+    So the redirect is done in USD, the same overlay trick as the AOV filter:
+
+    * ``output`` naming a **directory** (trailing separator, or an existing dir)
+      keeps each product's own filename and moves it into that directory.
+    * ``output`` naming a **file** gives that exact path to the first product,
+      and puts the others alongside it under their own filenames.
+
+    A product with no authored ``productName`` -- which happens: the SandBurst
+    products were all empty, the path coming from the ROP instead -- is named
+    after its prim, keeping ``output``'s extension.
+    """
+    warnings = warnings if warnings is not None else []
+    if Usd is None or Sdf is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+    if not output:
+        return ""
+
+    os.makedirs(os.path.dirname(os.path.abspath(usd_out)) or ".", exist_ok=True)
+
+    overlay = Sdf.Layer.CreateNew(usd_out)
+    sub_rel = os.path.relpath(os.path.abspath(usd_in),
+                              os.path.dirname(os.path.abspath(usd_out)))
+    overlay.subLayerPaths.append(sub_rel.replace(os.sep, "/"))
+
+    stage = Usd.Stage.Open(overlay)
+    if stage is None:
+        warnings.append(f"Output override: could not open {usd_in}")
+        return ""
+
+    as_dir = output.endswith(("/", "\\")) or os.path.isdir(output)
+    directory = output if as_dir else (os.path.dirname(output) or ".")
+    extension = os.path.splitext(output)[1] if not as_dir else ""
+
+    assigned: dict = {}
+    index = 0
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdRender.Product):
+            continue
+        product = UsdRender.Product(prim)
+        attr = product.GetProductNameAttr()
+        current = str((attr.Get() if attr else "") or "")
+
+        if not as_dir and index == 0:
+            new_path = output
+        else:
+            base = os.path.basename(current.replace("\\", "/"))
+            if not base:
+                base = prim.GetName() + (extension or ".exr")
+            new_path = os.path.join(directory, base)
+
+        new_path = new_path.replace(os.sep, "/")
+        if new_path in assigned:
+            warnings.append(
+                f"Output override: {prim.GetPath()} and {assigned[new_path]} both "
+                f"resolve to {new_path}; they would overwrite each other. Point "
+                f"--output at a directory instead of a file, or rename the products."
+            )
+        assigned[new_path] = str(prim.GetPath())
+
+        product.CreateProductNameAttr(new_path)
+        index += 1
+
+    overlay.Save()
+    if index == 0:
+        warnings.append("Output override: the stage declares no RenderProducts.")
+        return ""
+    return usd_out if os.path.exists(usd_out) else ""
+
+
 def _basename_index(search_dirs) -> dict:
     """Map lower-case basename -> first absolute path found under search_dirs."""
     index: dict = {}
@@ -897,6 +976,9 @@ def main(argv=None) -> int:
     parser.add_argument("--usd-out", default="", help="Overlay USD to write")
     parser.add_argument("--keep", default="",
                         help="Comma-separated RenderVar prim paths to keep")
+    parser.add_argument("--override-output", default="",
+                        help="Author an overlay redirecting every RenderProduct "
+                             "to this file or directory (husk -o only moves the first)")
     parser.add_argument("--relink", action="store_true",
                         help="Repath unresolved assets found under --search dirs")
     parser.add_argument("--search", action="append", default=[],
@@ -907,6 +989,17 @@ def main(argv=None) -> int:
         keep = [p for p in args.keep.split(",") if p]
         warnings: list[str] = []
         out = filter_usd_aovs(args.usd_in, args.usd_out, keep, warnings)
+        for warning in warnings:
+            sys.stderr.write(f"{warning}\n")
+        if not out:
+            return 1
+        sys.stdout.write(out + "\n")
+        return 0
+
+    if args.override_output:
+        warnings: list[str] = []
+        out = override_product_paths(args.usd_in, args.usd_out,
+                                     args.override_output, warnings)
         for warning in warnings:
             sys.stderr.write(f"{warning}\n")
         if not out:

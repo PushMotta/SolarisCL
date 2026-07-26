@@ -267,6 +267,49 @@ def filter_aovs(usd_in: str, enabled_var_paths, *, hython: str = "",
     return usd_out
 
 
+def override_output(usd_in: str, output: str, *, hython: str = "",
+                    usd_out: str = "", timeout: float = 300.0,
+                    env: Optional[dict] = None) -> str:
+    """Return a USD whose every RenderProduct writes under ``output``.
+
+    husk ``-o`` moves only the first product, so a multi-product render needs a
+    USD edit instead. Runs :func:`hsl.inspector.override_product_paths` under
+    hython and returns the overlay path. Raises :class:`InspectError` rather
+    than falling back, so a half-applied redirect never reaches a render.
+    """
+    if not usd_in or not output:
+        return usd_in
+
+    hython_exe = find_hython(hython)
+    if not hython_exe:
+        raise InspectError(
+            "Could not find hython to redirect the output. Set $HFS or pass a path.")
+
+    if not usd_out:
+        base, ext = os.path.splitext(usd_in)
+        usd_out = base + ".output" + (ext or ".usd")
+
+    cmd = [hython_exe, "-m", "hsl.inspector", "--override-output", output,
+           "--usd-in", usd_in, "--usd-out", usd_out]
+
+    run_env = dict(env or os.environ)
+    root = _package_root()
+    existing = run_env.get("PYTHONPATH", "")
+    run_env["PYTHONPATH"] = (root + os.pathsep + existing) if existing else root
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, env=run_env)
+    except subprocess.SubprocessError as exc:
+        raise InspectError(f"Output override failed to run under hython: {exc}")
+
+    if proc.returncode != 0 or not os.path.isfile(usd_out):
+        raise InspectError(
+            "Output override did not produce an overlay USD.\n"
+            f"exit code: {proc.returncode}\n{proc.stderr[-2000:]}")
+    return usd_out
+
+
 def relink_assets(usd_in: str, search_dirs, *, hython: str = "",
                   usd_out: str = "", timeout: float = 600.0,
                   env: Optional[dict] = None) -> dict:

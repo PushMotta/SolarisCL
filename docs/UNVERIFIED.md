@@ -210,9 +210,33 @@ file found under the chosen search dirs; husk/hython then render the relinked US
 **Verified on 22.0.368:** scan caught scalar + array texture refs, relink repathed
 both (recursive search), and a re-scan of the relinked overlay found 0 missing.
 
-The **output path** override uses husk's real `-o/--output` (confirmed in
-`--help`, "variables are expanded"), exposed as the CLI `--output` / the UI Output
-field + Browse.
+### Output path: `-o` moves only the first product  ·  `OK` (22)
+
+husk's `-o/--output` is real (confirmed in `--help`, "variables are expanded")
+but it redirects **only the first** `UsdRenderProduct`. On a multi-product shot
+— beauty + cryptomatte + depth — every other product keeps writing wherever the
+scene pointed it, a half-applied override that is only noticed after the render.
+
+So `inspector.override_product_paths()` authors an overlay (same mechanism as
+the AOV filter) setting **every** product's `productName`. `--output` naming a
+file gives that exact path to the first product and puts the rest alongside it;
+naming a directory keeps each product's own filename. The CLI only pays for the
+overlay when the settings prim has more than one product — one product still
+uses husk's own flag, and then `-o` is *not* also passed, so it cannot
+double-apply.
+
+**Verified on 22.0.368** against a synthetic three-product stage:
+
+| product | `--output /renders/v2/hero.exr` | `--output /renders/v3/` |
+|---|---|---|
+| beauty | `/renders/v2/hero.exr` | `/renders/v3/shot_beauty.$F4.exr` |
+| crypto | `/renders/v2/shot_crypto.$F4.exr` | `/renders/v3/shot_crypto.$F4.exr` |
+| depth (**empty** productName) | `/renders/v2/depth.exr` | `/renders/v3/depth.exr` |
+
+`$F4` frame tokens survive, a product with no authored `productName` (exactly
+what the real SandBurst products had) falls back to its prim name plus the
+requested extension, and the source layer is left untouched. Colliding
+destinations are reported as a warning rather than silently overwriting.
 
 ## F. Environment and licensing
 
@@ -254,6 +278,7 @@ field + Browse.
 | D7 | empty `filePath` ⇒ live volume; set ⇒ cached | 22.0.368 | 2026-07-26 | 0/8 on the real shot; synthetic stage flagged only the live volume |
 | D8 | `UsdVol.Volume` owns the field prims | 22.0.368 | 2026-07-26 | 8/8 parents `Volume`-typed |
 | D-VOL | `scan_live_volumes` + the export guard | 22.0.368 | 2026-07-26 | 4 volumes / 8 fields; `allow_volume_bake=False` wrote **0 bytes**, disk free unchanged |
+| E-OUT | `override_product_paths` redirects every product | 22.0.368 | 2026-07-26 | file + directory mode; `$F4` preserved; empty `productName` falls back to prim name; source untouched |
 | E1–E14 | every flag `build_command()` emits | 21.0.729, 22.0.368 | 2026-07-24 | via `husk --help`; `ALF_PROGRESS` literal wants a live render |
 | E-AOV | husk has no AOV flag; selection is USD `orderedVars`; overlay filter works | 22.0.368 | 2026-07-24 | `filter_usd_aovs` verified: dropping a var left the right `orderedVars` |
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |

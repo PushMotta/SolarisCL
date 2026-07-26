@@ -279,6 +279,28 @@ def cmd_render(args) -> int:
             sys.stderr.write(f"{exc}\n")
             return 3
 
+    # husk -o redirects only the FIRST product, so on a multi-product shot the
+    # crypto/depth passes would quietly keep writing where the scene pointed
+    # them. Redirect them all in USD instead. One product needs no overlay --
+    # husk's own flag does the job without a hython round-trip.
+    output_for_engine = args.output or None
+    settings_for_output = manifest.resolve_settings(rop)
+    product_count = len(settings_for_output.products) if settings_for_output else 0
+    if engine == "husk" and args.output and product_count > 1:
+        if args.dry_run:
+            print(f"# {product_count} products will be redirected under {args.output} "
+                  f"by a USD overlay authored at render time (husk -o moves only the first)")
+        else:
+            try:
+                usd_for_render = bridge.override_output(
+                    usd_for_render, args.output, hython=args.hython)
+            except bridge.InspectError as exc:
+                sys.stderr.write(f"{exc}\n")
+                return 3
+            sys.stderr.write(f"Redirected all {product_count} product(s) under "
+                             f"{args.output}.\n")
+            output_for_engine = None      # the overlay did it; don't double-apply
+
     jobs = husk_mod.jobs_for_rop(
         manifest, rop, usd_for_render,
         chunk_size=args.chunk,
@@ -286,7 +308,7 @@ def cmd_render(args) -> int:
         renderer=args.renderer or None,
         camera=args.camera or None,
         settings_prim=args.settings or None,
-        output=args.output or None,
+        output=output_for_engine,
         threads=args.threads or None,
         snapshot_interval=args.snapshot or None,
         resolution=tuple(args.res) if args.res else None,

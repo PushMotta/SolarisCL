@@ -607,6 +607,38 @@ class TestExportNarrowing(unittest.TestCase):
         self.assertIsNone(self.captured["export_frames"])
 
 
+class TestMultiProductOutput(unittest.TestCase):
+    """husk -o moves only the first product; a multi-product shot needs the
+    USD overlay, and must not also pass -o (that would double-apply)."""
+
+    def setUp(self):
+        self.manifest = sample_manifest()       # two products
+        self.manifest.rops[0].usd_path = "/tmp/shot.usd"
+        self._real_inspect = bridge.inspect_hip
+        bridge.inspect_hip = lambda *a, **k: self.manifest
+        self.addCleanup(lambda: setattr(bridge, "inspect_hip", self._real_inspect))
+
+    def _dry_run(self, extra):
+        args = build_parser().parse_args(["render", "s.hip", "--dry-run"] + extra)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = cmd_render(args)
+        return code, out.getvalue()
+
+    def test_multi_product_output_announces_the_overlay(self):
+        code, out = self._dry_run(["--engine", "husk", "--output", "/renders/out.exr"])
+        self.assertEqual(code, 0)
+        self.assertIn("2 products will be redirected", out)
+
+    def test_single_product_uses_husk_flag_directly(self):
+        settings = self.manifest.settings[0]
+        settings.products = settings.products[:1]        # one product only
+        code, out = self._dry_run(["--engine", "husk", "--output", "/renders/out.exr"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("redirected", out)
+        self.assertIn("--output", out)                   # husk's own flag
+
+
 class TestHythonSelection(unittest.TestCase):
     INSTALLS = [("Houdini 22.0.368", "/opt/hfs22/bin/hython"),
                 ("Houdini 21.0.729", "/opt/hfs21/bin/hython")]

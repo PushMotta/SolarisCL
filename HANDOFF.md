@@ -136,9 +136,13 @@ Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
    **Gotcha found:** `fieldName` is authored **empty** on real Solaris volume
    fields (8/8) — the prim name carries it, so the `or prim.GetName()` fallback
    in `scan_live_volumes` is load-bearing. Don't simplify it away.
-2. **Complete the render-path override:** husk `--output` only redirects product
-   0. Add a productName overlay to redirect **all** products to a chosen folder
-   (reuse the overlay mechanism).
+2. ~~**Complete the render-path override**~~ — **DONE, verified 22.0.368.**
+   `inspector.override_product_paths()` authors a `productName` overlay
+   redirecting **every** product; the CLI uses it only when the settings prim has
+   >1 product (and then does *not* also pass husk `-o`, so it cannot
+   double-apply). File mode gives product 0 the exact path and puts the rest
+   alongside; directory mode keeps each product's filename. `$F4` survives; an
+   empty `productName` falls back to the prim name. See `docs/UNVERIFIED.md` E-OUT.
 3. **Relink for the hython-direct engine** — ⬆ **raised: hython is now the
    default engine.** Relink only helps the husk (USD) path; `render_direct`
    renders the ROP as-authored. Would need parm-level repath. Until then the CLI
