@@ -81,6 +81,47 @@ class FilterWorker(QObject):
         self.finished.emit(out)
 
 
+class PrepareWorker(QObject):
+    """Applies the husk-engine USD edits before a render, off the Qt thread.
+
+    Render-setting overrides and the AOV filter are both overlays and each must
+    compose over the last, so they run in one worker in order rather than being
+    chained through signals. hython needs none of this — it carries the same
+    edits on its command line and applies them inside the network.
+    """
+    finished = Signal(str)      # the USD to actually render
+    failed = Signal(str)
+
+    def __init__(self, usd_in: str, settings_overrides: Optional[dict] = None,
+                 keep_paths=None, settings_prim: str = "", hython: str = ""):
+        super().__init__()
+        self.usd_in = usd_in
+        self.settings_overrides = settings_overrides or {}
+        self.keep_paths = keep_paths
+        self.settings_prim = settings_prim
+        self.hython = hython
+
+    @Slot()
+    def run(self) -> None:
+        usd = self.usd_in
+        try:
+            if self.settings_overrides:
+                result = bridge.override_settings(
+                    usd, self.settings_overrides, hython=self.hython,
+                    settings_prim=self.settings_prim)
+                if result.get("usd_out"):
+                    usd = result["usd_out"]
+                for entry in result.get("skipped", []):
+                    # Not fatal, but the user asked for it and did not get it.
+                    sys.stderr.write(f"skipped {entry['key']}: {entry['why']}\n")
+            if self.keep_paths is not None:
+                usd = bridge.filter_aovs(usd, self.keep_paths, hython=self.hython)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(usd)
+
+
 class RelinkWorker(QObject):
     """Runs bridge.relink_assets (a hython subprocess) off the Qt thread."""
     finished = Signal(object)   # the result dict
@@ -257,7 +298,13 @@ class LauncherWindow(QMainWindow):
         top_layout = QHBoxLayout(top)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.addWidget(self._build_rop_panel(), 1)
-        top_layout.addWidget(self._build_override_panel(), 1)
+
+        # Tabbed so the render-settings editor has room without pushing the
+        # window taller — and so it is visible rather than buried in a form.
+        right = QTabWidget()
+        right.addTab(self._build_override_panel(), "Overrides")
+        right.addTab(self._build_settings_panel(), "Render settings")
+        top_layout.addWidget(right, 1)
         splitter.addWidget(top)
 
         splitter.addWidget(self._build_run_panel())
@@ -268,7 +315,9 @@ class LauncherWindow(QMainWindow):
         self._build_menu()
 
     def _build_rop_panel(self) -> QWidget:
-        box = QGroupBox("Render ROPs & AOV Manager")
+        # "&&" because Qt reads a single & as a keyboard accelerator and eats it,
+        # which is why these titles used to render with the word missing.
+        box = QGroupBox("Render ROPs && AOV Manager")
         layout = QVBoxLayout(box)
 
         self.rop_combo = QComboBox()
@@ -302,8 +351,123 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.detail, 1)
         return box
 
+    def _build_settings_panel(self) -> QWidget:
+        """Editor for arbitrary karma:* / husk:* render settings."""
+        box = QWidget()
+        layout = QVBoxLayout(box)
+
+        hint = QLabel(
+            "husk has no flag for these — each one is authored as a USD overlay, "
+            "and works on either engine. Only settings the scene already declares "
+            "can be set; the type comes from the scene, so 64 stays an integer.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_STATUS_STYLES["muted"])
+        layout.addWidget(hint)
+
+        self.settings_table = QTableWidget(0, 2)
+        self.settings_table.setHorizontalHeaderLabels(["Setting", "Value"])
+        self.settings_table.verticalHeader().setVisible(False)
+        header = self.settings_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        layout.addWidget(self.settings_table, 1)
+
+        row = QHBoxLayout()
+        self.setting_add_btn = QPushButton("Add override")
+        self.setting_remove_btn = QPushButton("Remove")
+        self.setting_clear_btn = QPushButton("Clear all")
+        row.addWidget(self.setting_add_btn)
+        row.addWidget(self.setting_remove_btn)
+        row.addWidget(self.setting_clear_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return box
+
+    def _available_settings(self) -> list:
+        """Every karma:*/husk:* knob the scene declares, for the picker."""
+        if not self.manifest:
+            return []
+        names: set = set()
+        for settings in self.manifest.settings:
+            names.update(settings.renderer_settings.keys())
+        return sorted(names)
+
+    def _current_setting_value(self, key: str):
+        for settings in self.manifest.settings if self.manifest else []:
+            if key in settings.renderer_settings:
+                return settings.renderer_settings[key]
+        return None
+
+    def _setting_row_of(self, widget) -> int:
+        for row in range(self.settings_table.rowCount()):
+            if self.settings_table.cellWidget(row, 0) is widget:
+                return row
+        return -1
+
+    def _setting_overrides(self) -> dict:
+        """The table as a {key: value} dict, skipping incomplete rows."""
+        overrides: dict = {}
+        for row in range(self.settings_table.rowCount()):
+            combo = self.settings_table.cellWidget(row, 0)
+            item = self.settings_table.item(row, 1)
+            key = combo.currentText().strip() if combo else ""
+            value = item.text().strip() if item else ""
+            if key and value:
+                overrides[key] = value
+        return overrides
+
+    @Slot()
+    def add_setting_override(self) -> None:
+        names = self._available_settings()
+        if not names:
+            QMessageBox.information(
+                self, "No render settings to override",
+                "Read a scene first — the list of knobs is read from its render "
+                "settings prim, and only settings the scene declares can be set.")
+            return
+
+        row = self.settings_table.rowCount()
+        self.settings_table.insertRow(row)
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItems(names)
+        self.settings_table.setCellWidget(row, 0, combo)
+        self.settings_table.setItem(row, 1, QTableWidgetItem(""))
+        # Seed the value with what the scene currently has, so the row starts
+        # as a no-op the user edits rather than a blank that silently does nothing.
+        self._seed_setting_value(row, combo.currentText())
+        combo.currentTextChanged.connect(
+            lambda _text, c=combo: self._on_setting_key_changed(c))
+
+    def _seed_setting_value(self, row: int, key: str) -> None:
+        current = self._current_setting_value(key)
+        item = self.settings_table.item(row, 1)
+        if item is not None:
+            item.setText("" if current is None else str(current))
+
+    def _on_setting_key_changed(self, combo) -> None:
+        row = self._setting_row_of(combo)
+        if row >= 0:
+            self._seed_setting_value(row, combo.currentText())
+        self.refresh_command()
+
+    @Slot()
+    def remove_setting_override(self) -> None:
+        rows = sorted({i.row() for i in self.settings_table.selectedIndexes()},
+                      reverse=True)
+        if not rows and self.settings_table.rowCount():
+            rows = [self.settings_table.rowCount() - 1]
+        for row in rows:
+            self.settings_table.removeRow(row)
+        self.refresh_command()
+
+    @Slot()
+    def clear_setting_overrides(self) -> None:
+        self.settings_table.setRowCount(0)
+        self.refresh_command()
+
     def _build_override_panel(self) -> QWidget:
-        box = QGroupBox("Overrides & Quality Presets")
+        box = QGroupBox("Overrides && Quality Presets")
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
 
@@ -361,9 +525,20 @@ class LauncherWindow(QMainWindow):
         output_row = QHBoxLayout()
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("Leave empty to use the product name from USD")
-        self.output_browse_btn = QPushButton("Browse…")
+        # Two buttons because the two modes mean different things: a file gives
+        # the first product that exact name, a folder keeps every product's own
+        # filename. A save-file dialog alone cannot express the second.
+        self.output_browse_btn = QPushButton("File…")
+        self.output_browse_btn.setToolTip(
+            "Choose an output file. The first render product takes this exact "
+            "path; any others are written alongside it under their own names.")
+        self.output_folder_btn = QPushButton("Folder…")
+        self.output_folder_btn.setToolTip(
+            "Choose an output folder. Every render product keeps its own "
+            "filename and is written into this folder.")
         output_row.addWidget(self.output_edit, 1)
         output_row.addWidget(self.output_browse_btn)
+        output_row.addWidget(self.output_folder_btn)
         form.addRow("Output", output_row)
 
         self.chunk_spin = QSpinBox()
@@ -403,7 +578,7 @@ class LauncherWindow(QMainWindow):
         return box
 
     def _build_run_panel(self) -> QWidget:
-        box = QGroupBox("Render & Diagnostics")
+        box = QGroupBox("Render && Diagnostics")
         layout = QVBoxLayout(box)
 
         self.preflight_label = QLabel("Preflight: Ready.")
@@ -492,6 +667,11 @@ class LauncherWindow(QMainWindow):
         self.copy_btn.clicked.connect(self.copy_command)
         self.relink_btn.clicked.connect(self.relink_textures)
         self.output_browse_btn.clicked.connect(self.choose_output)
+        self.output_folder_btn.clicked.connect(self.choose_output_folder)
+        self.setting_add_btn.clicked.connect(self.add_setting_override)
+        self.setting_remove_btn.clicked.connect(self.remove_setting_override)
+        self.setting_clear_btn.clicked.connect(self.clear_setting_overrides)
+        self.settings_table.itemChanged.connect(lambda *_: self.refresh_command())
         self.farm_btn.clicked.connect(self.export_farm_job)
         self.render_btn.clicked.connect(self.start_render)
         self.cancel_btn.clicked.connect(self.cancel_render)
@@ -684,9 +864,11 @@ class LauncherWindow(QMainWindow):
     def on_scene_read(self, manifest: SceneManifest) -> None:
         self.manifest = manifest
         self.read_btn.setEnabled(True)
-        # A fresh read invalidates any prior relink, on either engine.
+        # A fresh read invalidates any prior relink, on either engine. The
+        # setting overrides go too: their knob names come from the old scene.
         self._relinked_usd.clear()
         self._relink_dirs.clear()
+        self.settings_table.setRowCount(0)
 
         self.rop_combo.blockSignals(True)
         self.rop_combo.clear()
@@ -882,6 +1064,12 @@ class LauncherWindow(QMainWindow):
             # exported USD was already relinked, so it needs nothing here.
             "relink_dirs": (list(self._relink_dirs.get(rop.node_path, []))
                             if engine == "hython" else []),
+            # hython applies these itself at render time. On husk they are
+            # authored into an overlay first, so the job must not also carry
+            # them (build_command would not emit them anyway, but keeping the
+            # job honest matters when it is exported to a farm).
+            "settings_overrides": (self._setting_overrides()
+                                   if engine == "hython" else {}),
         }
 
         # Frame range comes from the UI, not the ROP, so edits take effect.
@@ -923,6 +1111,10 @@ class LauncherWindow(QMainWindow):
         if engine == "hython" and jobs[0].relink_dirs:
             preview += ("\n\n# Missing textures will be repathed from the folder(s) "
                         "above and composed into the LOP network at render start.")
+        if engine == "husk" and self._setting_overrides():
+            listed = ", ".join(f"{k}={v}" for k, v in self._setting_overrides().items())
+            preview += (f"\n\n# Render settings ({listed}) will be authored into a "
+                        f"USD overlay at render start — husk has no flag for them.")
 
         # Resolved filenames, so the output path can be checked before starting
         # a render rather than after it lands somewhere unexpected.
@@ -944,7 +1136,8 @@ class LauncherWindow(QMainWindow):
                         lines.append(f"#   … {len(entry['files'])} files, "
                                      f"last {entry['files'][-1]}")
                 else:
-                    lines.append(f"#   {entry['template']}")
+                    lines.append(f"#   {entry['template']}   "
+                                 f"(filename decided by husk / the ROP)")
             preview += "\n" + "\n".join(lines)
         else:
             preview += ("\n\n# No output path declared in the scene — husk or the "
@@ -988,6 +1181,17 @@ class LauncherWindow(QMainWindow):
             "Images (*.exr *.png *.jpg *.tif);;All files (*)")
         if path:
             self.output_edit.setText(path)
+
+    @Slot()
+    def choose_output_folder(self) -> None:
+        start = self.output_edit.text() or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose an output folder", start)
+        if folder:
+            # Keep the trailing separator: that is what marks this as directory
+            # mode, so every product keeps its own filename instead of the first
+            # one being renamed to the folder.
+            self.output_edit.setText(folder.rstrip("/\\") + "/")
 
     @Slot()
     def relink_textures(self) -> None:
@@ -1096,21 +1300,29 @@ class LauncherWindow(QMainWindow):
             )
             return
 
-        # AOV editing is a USD edit, not a husk flag. If the user picked a
-        # subset (husk engine), author the overlay in a worker thread first,
-        # then launch the queue against it — never freeze the UI on hython.
+        # AOV selection and render-setting overrides are USD edits, not husk
+        # flags. On husk they are authored in a worker thread first and the queue
+        # runs against the result — never freeze the UI on a hython subprocess.
+        # hython needs neither: it carries both on its command line.
         keep = self._selected_aov_paths() if engine == "husk" else None
-        if keep is not None:
+        overrides = self._setting_overrides() if engine == "husk" else {}
+        if keep is not None or overrides:
             self.render_btn.setEnabled(False)
-            self._set_status("Filtering AOVs in hython…")
+            what = "render settings" if overrides and keep is None else (
+                "AOVs" if keep is not None and not overrides else
+                "render settings and AOVs")
+            self._set_status(f"Applying {what} in hython…")
+            settings_prim = self.settings_combo.currentData()
             self._filter_thread = QThread(self)
-            self._filter_worker = FilterWorker(
-                self._base_usd(self.current_rop()), keep,
+            self._filter_worker = PrepareWorker(
+                self._base_usd(self.current_rop()),
+                settings_overrides=overrides, keep_paths=keep,
+                settings_prim=settings_prim or "",
                 hython=self.hython_edit.text().strip())
             self._filter_worker.moveToThread(self._filter_thread)
             self._filter_thread.started.connect(self._filter_worker.run)
-            self._filter_worker.finished.connect(self._on_aovs_filtered)
-            self._filter_worker.failed.connect(self._on_filter_failed)
+            self._filter_worker.finished.connect(self._on_prepared)
+            self._filter_worker.failed.connect(self._on_prepare_failed)
             self._filter_worker.finished.connect(self._filter_thread.quit)
             self._filter_worker.failed.connect(self._filter_thread.quit)
             self._filter_thread.start()
@@ -1119,18 +1331,18 @@ class LauncherWindow(QMainWindow):
         self._launch_queue(jobs)
 
     @Slot(str)
-    def _on_aovs_filtered(self, filtered_usd: str) -> None:
-        jobs = self.build_jobs(usd_override=filtered_usd)
+    def _on_prepared(self, prepared_usd: str) -> None:
+        jobs = self.build_jobs(usd_override=prepared_usd)
         if not jobs:
-            self._on_filter_failed("The filtered USD produced no render jobs.")
+            self._on_prepare_failed("The prepared USD produced no render jobs.")
             return
         self._launch_queue(jobs)
 
     @Slot(str)
-    def _on_filter_failed(self, message: str) -> None:
+    def _on_prepare_failed(self, message: str) -> None:
         self.render_btn.setEnabled(True)
-        self._set_status("AOV filtering failed.", "error")
-        QMessageBox.critical(self, "Could not filter AOVs", message[-4000:])
+        self._set_status("Preparing the USD failed.", "error")
+        QMessageBox.critical(self, "Could not prepare the render", message[-4000:])
 
     def _launch_queue(self, jobs: list) -> None:
         self.log_view.clear()

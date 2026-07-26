@@ -541,6 +541,26 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(hits[0].level, "error")
         self.assertIn("wood.exr", hits[0].message)
 
+    def test_tokenless_output_over_a_sequence_warns(self):
+        job = RenderJob(usd_file="/s.usd", output="/renders/hero.exr",
+                        chunk=FrameChunk(1, 30, 1))
+        hits = [w for w in preflight.run_preflight_checks(job)
+                if w.category == "output_path" and "overwrite" in w.message]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "warning")
+
+    def test_tokenised_output_does_not_warn(self):
+        job = RenderJob(usd_file="/s.usd", output="/renders/hero.$F4.exr",
+                        chunk=FrameChunk(1, 30, 1))
+        self.assertFalse(any("overwrite" in w.message
+                             for w in preflight.run_preflight_checks(job)))
+
+    def test_single_frame_tokenless_output_is_fine(self):
+        job = RenderJob(usd_file="/s.usd", output="/renders/hero.exr",
+                        chunk=FrameChunk(1, 1, 1))
+        self.assertFalse(any("overwrite" in w.message
+                             for w in preflight.run_preflight_checks(job)))
+
     def test_scheduled_relink_downgrades_missing_assets(self):
         # A hython job repaths at render time, so the manifest still lists the
         # assets as unresolved here. Erroring would refuse to start the very
@@ -847,6 +867,23 @@ class TestPlannedOutputs(unittest.TestCase):
         entries = husk_mod.planned_outputs(m, m.rops[0], frames=[1001])
         self.assertTrue(entries[0]["unresolved"])
         self.assertEqual(entries[0]["files"], [])
+
+    def test_untokenised_name_is_one_file_not_one_per_frame(self):
+        m = sample_manifest()
+        for product in m.products:
+            product.product_name = "/renders/single.exr"
+        entries = husk_mod.planned_outputs(m, m.rops[0], frames=[1, 2, 3])
+        self.assertEqual(entries[0]["files"], ["/renders/single.exr"])
+
+    def test_folder_with_no_products_names_no_files(self):
+        # Nothing declares a filename, so inventing one would be a lie.
+        m = sample_manifest()
+        m.settings[0].products = []
+        entries = husk_mod.planned_outputs(m, m.rops[0], output="/out/v3/",
+                                           frames=[1, 2, 3])
+        self.assertEqual(entries[0]["files"], [])
+        self.assertEqual(entries[0]["template"], "/out/v3/")
+        self.assertFalse(entries[0]["unresolved"])
 
     def test_no_declared_output_is_an_empty_plan(self):
         m = sample_manifest()

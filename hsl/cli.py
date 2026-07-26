@@ -404,7 +404,8 @@ def cmd_render(args) -> int:
                         print(f"#   … {len(entry['files'])} files, last "
                               f"{entry['files'][-1]}")
                 else:
-                    print(f"#   {entry['template']}")
+                    print(f"#   {entry['template']}   "
+                          f"(filename decided by husk / the ROP)")
         else:
             print("# No output path is declared in the scene; husk/the ROP decides it.")
 

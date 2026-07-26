@@ -367,6 +367,15 @@ def has_unexpanded_tokens(path: str) -> bool:
     return bool(_UNEXPANDED.search(path))
 
 
+def has_frame_token(path: str) -> bool:
+    """True if ``path`` varies from frame to frame.
+
+    A multi-frame render whose output has no frame token writes every frame to
+    the same file, so only the last one survives.
+    """
+    return bool(_FRAME_TOKEN.search(path) or _SEQUENCE_TOKEN.search(path))
+
+
 def parse_setting_args(items) -> dict:
     """Turn ``["karma:global:samplesperpixel=64", …]`` into a dict.
 
@@ -446,20 +455,31 @@ def planned_outputs(manifest, rop, output: str = "", frames=()) -> list:
     if chosen:
         if products:
             pairs = planned_product_paths(products, chosen)
-        else:                       # nothing declared: the override is the output
+        elif chosen.endswith(("/", "\\")) or os.path.isdir(chosen):
+            # A folder, and nothing in the scene declares a filename to put in
+            # it. Naming the files here would be invention, so say only what is
+            # known: the destination.
+            return [{"product": "(from --output)",
+                     "template": chosen.replace(os.sep, "/"),
+                     "files": [], "unresolved": False}]
+        else:
             pairs = [("(from --output)", chosen.replace(os.sep, "/"))]
     else:
         pairs = [(p, name) for p, name in products if name]
 
     entries = []
     for prim_path, template in pairs:
-        files, unresolved = [], False
+        files: list = []
+        unresolved = False
         for index, frame in enumerate(frames or (), 1):
             path = expand_frame_token(template, frame, index)
             if has_unexpanded_tokens(path):
                 unresolved = True
                 break
-            files.append(path)
+            # A template with no frame token names one file however many frames
+            # are rendered -- listing it once per frame would overstate the job.
+            if path not in files:
+                files.append(path)
         entries.append({"product": prim_path, "template": template,
                         "files": files, "unresolved": unresolved})
     return entries

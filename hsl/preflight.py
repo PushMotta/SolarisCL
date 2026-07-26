@@ -14,7 +14,7 @@ import shutil
 from dataclasses import dataclass
 from typing import Optional
 
-from .husk import RenderJob
+from .husk import RenderJob, has_frame_token
 from .manifest import SceneManifest
 
 
@@ -61,6 +61,20 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
                 level="error",
                 category="output_path",
                 message=f"No write permission for output directory: {out_dir}"
+            ))
+
+        # 3b. An output with no frame token means every frame of a sequence
+        #     writes to the same file and only the last one survives. Easy to do
+        #     by accident by picking a filename in a save dialog.
+        if job.chunk.count > 1 and not has_frame_token(job.output):
+            warnings.append(PreflightWarning(
+                level="warning",
+                category="output_path",
+                message=(f"{job.output} has no frame token ($F4, %04d, <F4>, …) "
+                         f"but {job.chunk.count} frames are being rendered — every "
+                         f"frame would overwrite the same file. Add a token, or "
+                         f"point --output at a folder to keep each product's own "
+                         f"name.")
             ))
 
         # 4. Disk space check
