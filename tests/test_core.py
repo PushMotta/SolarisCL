@@ -502,6 +502,29 @@ class TestPreflight(unittest.TestCase):
         self.assertEqual(hits[0].level, "error")
         self.assertIn("wood.exr", hits[0].message)
 
+    def test_scheduled_relink_downgrades_missing_assets(self):
+        # A hython job repaths at render time, so the manifest still lists the
+        # assets as unresolved here. Erroring would refuse to start the very
+        # render that fixes them.
+        m = sample_manifest()
+        m.missing_assets = [MissingAsset(attr_path="/mat/tex.inputs:file",
+                                         asset_path="/tex/wood.exr")]
+        job = RenderJob(usd_file="", engine="hython", relink_dirs=["/tex"])
+        hits = [w for w in preflight.run_preflight_checks(job, m)
+                if w.category == "missing_asset"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "warning")
+        self.assertIn("relink will be attempted", hits[0].message)
+
+    def test_without_a_relink_missing_assets_stay_errors(self):
+        m = sample_manifest()
+        m.missing_assets = [MissingAsset(attr_path="/mat/tex.inputs:file",
+                                         asset_path="/tex/wood.exr")]
+        job = RenderJob(usd_file="", engine="hython")
+        hits = [w for w in preflight.run_preflight_checks(job, m)
+                if w.category == "missing_asset"]
+        self.assertEqual(hits[0].level, "error")
+
     def test_preflight_flags_live_volumes_for_husk(self):
         # Live volumes bake ~GB/frame on a husk USD export — warn about it.
         m = sample_manifest()

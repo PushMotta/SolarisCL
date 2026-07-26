@@ -150,6 +150,12 @@ Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
    because a weaker one would silently keep the broken paths). `--relink-from`
    now works on **both** engines. SandBurst went 4 unresolved → 0. See
    `docs/UNVERIFIED.md` G1–G3 / G-RELINK.
+   The **GUI Relink button** covers both too, but note it means different things
+   per engine: on husk it edits the exported USD *now*; on hython there is no
+   export, so it records the folder and `render_direct` composes the repaths in
+   at render start. Preflight knows the difference — unresolved assets are a
+   hard error normally, but only a **warning** when a relink is already
+   scheduled, otherwise it would refuse to start the render that fixes them.
 4. ~~**Export only the frames being rendered**~~ — **DONE.** `inspect()` takes
    `export_frames`, plumbed through `bridge.inspect_hip` and the CLI, so a husk
    run exports only `--frames` instead of the ROP's whole authored range.

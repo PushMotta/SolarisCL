@@ -78,13 +78,23 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
                 pass
 
     # 5. Missing textures / unresolved assets — husk only reports these mid-render,
-    #    so catching them here is the whole point. Each is a hard error.
+    #    so catching them here is the whole point. Normally a hard error.
+    #
+    #    Unless a relink is already scheduled: a hython job carries its search
+    #    dirs and repaths inside the LOP network *at render time*, so the
+    #    manifest still lists the assets as unresolved when this runs. Failing
+    #    on them would refuse to start the very render that fixes them. Still
+    #    reported — the relink may not find everything — but as a warning.
     if manifest and manifest.missing_assets:
+        relink_scheduled = bool(getattr(job, "relink_dirs", None))
         for asset in manifest.missing_assets:
+            message = f"Unresolved {asset.kind}: {asset.asset_path}  (at {asset.attr_path})"
+            if relink_scheduled:
+                message += "  — a relink will be attempted at render time."
             warnings.append(PreflightWarning(
-                level="error",
+                level="warning" if relink_scheduled else "error",
                 category="missing_asset",
-                message=f"Unresolved {asset.kind}: {asset.asset_path}  (at {asset.attr_path})"
+                message=message,
             ))
 
     # 5b. Live (SOP-imported) volumes bake tens of GB/frame into a USD export.

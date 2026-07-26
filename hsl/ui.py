@@ -142,7 +142,13 @@ class LauncherWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._worker: Optional[InspectWorker] = None
         # ROP node path -> relinked overlay USD, once assets have been repathed.
+        # husk only: that path edits the exported USD up front.
         self._relinked_usd: dict = {}
+        # ROP node path -> texture search dirs, for the hython engine. There is
+        # no exported USD to edit there, so a relink cannot happen until render
+        # time — render_direct composes the repaths into the LOP network. The
+        # button therefore records an intent here rather than doing work now.
+        self._relink_dirs: dict = {}
 
         self._build_ui()
         self._populate_hython_options()
@@ -678,7 +684,9 @@ class LauncherWindow(QMainWindow):
     def on_scene_read(self, manifest: SceneManifest) -> None:
         self.manifest = manifest
         self.read_btn.setEnabled(True)
-        self._relinked_usd.clear()   # a fresh read invalidates any prior relink
+        # A fresh read invalidates any prior relink, on either engine.
+        self._relinked_usd.clear()
+        self._relink_dirs.clear()
 
         self.rop_combo.blockSignals(True)
         self.rop_combo.clear()
@@ -870,6 +878,10 @@ class LauncherWindow(QMainWindow):
             "extra_args": self.extra_edit.text().split(),
             "resolution": ((self.res_x.value(), self.res_y.value())
                            if self.res_check.isChecked() else None),
+            # hython repaths inside the LOP network at render time. On husk the
+            # exported USD was already relinked, so it needs nothing here.
+            "relink_dirs": (list(self._relink_dirs.get(rop.node_path, []))
+                            if engine == "hython" else []),
         }
 
         # Frame range comes from the UI, not the ROP, so edits take effect.
@@ -908,6 +920,9 @@ class LauncherWindow(QMainWindow):
         if engine == "husk" and self._selected_aov_paths() is not None:
             preview += ("\n\n# AOVs will be filtered to your selection via a USD "
                         "overlay authored in hython at render start.")
+        if engine == "hython" and jobs[0].relink_dirs:
+            preview += ("\n\n# Missing textures will be repathed from the folder(s) "
+                        "above and composed into the LOP network at render start.")
         self.command_view.setPlainText(preview)
 
         pf_warnings = preflight.run_preflight_checks(jobs[0], self.manifest)
@@ -951,12 +966,38 @@ class LauncherWindow(QMainWindow):
     @Slot()
     def relink_textures(self) -> None:
         rop = self.current_rop()
+        engine = self._engine()
+
+        # The two engines relink at different moments. husk edits the exported
+        # USD *now*; hython has no export, so the repaths are composed into the
+        # LOP network at render time and this button only records the folder.
+        if engine == "hython":
+            if rop is None:
+                QMessageBox.information(self, "Nothing to relink",
+                                        "Read a scene and choose a render ROP first.")
+                return
+            folder = QFileDialog.getExistingDirectory(
+                self, "Choose a folder to search for missing textures",
+                os.path.expanduser("~"))
+            if not folder:
+                return
+            dirs = self._relink_dirs.setdefault(rop.node_path, [])
+            if folder not in dirs:
+                dirs.append(folder)
+            self._set_status(
+                f"Textures will be relinked from {len(dirs)} folder(s) when the "
+                f"render starts (Hython composes the repaths into the LOP network).")
+            self.refresh_command()
+            return
+
         base = self._base_usd(rop)
         if not base:
             QMessageBox.information(
                 self, "Nothing to relink",
-                "Read a scene with “Write USD while reading” enabled first — "
-                "relinking edits the exported USD.")
+                "The husk engine relinks the exported USD, so read the scene "
+                "with “Write USD while reading” enabled first.\n\n"
+                "The Hython engine does not need it — it repaths inside the "
+                "LOP network at render time.")
             return
         folder = QFileDialog.getExistingDirectory(
             self, "Choose a folder to search for missing textures",
