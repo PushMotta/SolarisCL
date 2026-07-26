@@ -29,3 +29,7 @@ manifest_*.json
 
 .DS_Store
 .idea/
+
+# The original delivery (files.zip / solaris_launcher_pack.tar.gz) and the
+# as-unpacked copies, kept for provenance. Superseded by this repo.
+/_archive/

@@ -15,9 +15,11 @@ the whole chain on a real production shot.
 
 - **Repo:** github.com/PushMotta/SolarisCL (private, `main`), clean & synced at
   commit `529e71d`. **59 tests green**; boundary/drift/ui-imports green.
-- **Project lives at:** `F:\Nexus Projects\SolarisCL\extracted\pack\solaris_launcher`
-  (unpacked from `files.zip` → `solaris_launcher_pack.tar.gz`). The git repo root
-  is that `solaris_launcher` dir.
+- **Project lives at:** `F:\Nexus Projects\SolarisCL` — that directory *is* the
+  git repo root (flattened 2026-07-26; it used to be nested at
+  `extracted\pack\solaris_launcher`). The original delivery (`files.zip`,
+  `solaris_launcher_pack.tar.gz` and the as-unpacked copies) is parked in
+  `_archive\`, which is gitignored and safe to delete.
 - **Persistent memory** already holds `houdini-env` and `solaris-cl-project`.
 
 ## Environment (this machine — critical)
