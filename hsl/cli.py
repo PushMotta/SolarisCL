@@ -179,13 +179,30 @@ def cmd_render(args) -> int:
 
     export_usd = (engine == "husk")
     allow_volume_bake = getattr(args, "allow_volume_bake", False)
-    manifest = bridge.inspect_hip(args.hip, hython=args.hython,
-                                  export_usd=export_usd, usd_dir=args.usd_dir,
-                                  flatten=args.flatten, rop=args.rop,
-                                  allow_volume_bake=allow_volume_bake,
-                                  # Export only the frames asked for, not the
-                                  # ROP's whole authored range.
-                                  export_frames=args.frames if export_usd else None)
+    # Reuse a cached scene read when there is nothing to export — that skips a
+    # whole Houdini launch. Never when exporting: the point of that run is to
+    # write the USD, and a cached manifest's usd_path may be long deleted.
+    manifest = None
+    if not export_usd and not args.no_cache:
+        manifest = bridge.load_cached(args.hip)
+        if manifest is not None:
+            sys.stderr.write(f"Using the cached scene read "
+                             f"({bridge.cache_path_for(args.hip)}); "
+                             f"--no-cache to read the scene again.\n")
+
+    if manifest is None:
+        manifest = bridge.inspect_hip(args.hip, hython=args.hython,
+                                      export_usd=export_usd, usd_dir=args.usd_dir,
+                                      flatten=args.flatten, rop=args.rop,
+                                      allow_volume_bake=allow_volume_bake,
+                                      # Export only the frames asked for, not
+                                      # the ROP's whole authored range.
+                                      export_frames=args.frames if export_usd else None)
+        if not export_usd:
+            try:
+                bridge.save_cached(manifest)
+            except OSError:
+                pass                       # a cache we cannot write is not an error
     rop = _pick_rop(manifest, args.rop)
     if rop is None:
         return 2
@@ -420,6 +437,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("--snapshot", type=int, default=0, metavar="SECONDS")
     p_render.add_argument("--extra", nargs=argparse.REMAINDER,
                           help="Everything after this is passed to husk verbatim")
+    p_render.add_argument("--no-cache", action="store_true",
+                          help="Always re-read the scene instead of reusing a "
+                               "cached read of an unchanged .hip")
     p_render.add_argument("--skip-preflight", action="store_true",
                           help="Render even if preflight reports errors (missing "
                                "textures, unwritable output path, …)")

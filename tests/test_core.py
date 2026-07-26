@@ -721,6 +721,51 @@ class TestMultiProductOutput(unittest.TestCase):
         self.assertIn("--output", out)                   # husk's own flag
 
 
+class TestManifestCache(unittest.TestCase):
+    """T8: the CLI can reuse a scene read, but only of an unchanged .hip."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.hip = os.path.join(self.dir, "shot.hip")
+        with open(self.hip, "w") as fh:
+            fh.write("not really a hip")
+
+    def test_cache_key_is_stable(self):
+        # It used to use hash(), which is randomised per process -- so the
+        # cache filename changed every run and could never hit.
+        self.assertEqual(bridge.cache_path_for(self.hip),
+                         bridge.cache_path_for(self.hip))
+
+    def test_cache_key_differs_per_hip(self):
+        other = os.path.join(self.dir, "other.hip")
+        self.assertNotEqual(bridge.cache_path_for(self.hip),
+                            bridge.cache_path_for(other))
+
+    def test_round_trip_through_the_cache(self):
+        manifest = sample_manifest()
+        manifest.hip_path = self.hip
+        bridge.save_cached(manifest)
+        self.addCleanup(lambda: os.path.exists(bridge.cache_path_for(self.hip))
+                        and os.remove(bridge.cache_path_for(self.hip)))
+        loaded = bridge.load_cached(self.hip)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.rops[0].node_path, manifest.rops[0].node_path)
+
+    def test_a_newer_hip_invalidates_the_cache(self):
+        manifest = sample_manifest()
+        manifest.hip_path = self.hip
+        cache = bridge.save_cached(manifest)
+        self.addCleanup(lambda: os.path.exists(cache) and os.remove(cache))
+        # Touch the hip to be newer than its cached read.
+        future = os.path.getmtime(cache) + 60
+        os.utime(self.hip, (future, future))
+        self.assertIsNone(bridge.load_cached(self.hip))
+
+    def test_missing_cache_is_not_an_error(self):
+        self.assertIsNone(bridge.load_cached(os.path.join(self.dir, "never.hip")))
+
+
 class TestHythonSelection(unittest.TestCase):
     INSTALLS = [("Houdini 22.0.368", "/opt/hfs22/bin/hython"),
                 ("Houdini 21.0.729", "/opt/hfs21/bin/hython")]

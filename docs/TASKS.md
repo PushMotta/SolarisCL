@@ -31,12 +31,11 @@ needed. `docs/UNVERIFIED.md` D2 is in the Verified table.
 on 22.0.368 against the real shot (4 volumes / 8 fields; guard wrote 0 bytes).
 See `docs/UNVERIFIED.md` D6–D8 / D-VOL.
 
-## T4 — `USD_ROP_TYPES` is declared but never used  ·  low
+## ~~T4 — `USD_ROP_TYPES` is declared but never used~~  ·  **DONE 2026-07-26**
 
-`hsl/inspector.py:41`. Either wire it into ROP discovery, so a scene that
-exports USD without a render ROP is still usable, or delete it.
-
-**Done when:** the constant is used or gone, and the tests reflect the choice.
+Deleted. `export_usd()` creates its own temporary `usd_rop` rather than hunting
+for one in the scene, so a list of candidate export-ROP type names had nothing
+to match against. A comment in its place says so, to stop it being re-added.
 
 ## T5 — Single-frame introspection under-reports  ·  medium
 
@@ -76,10 +75,18 @@ Tractor was already correct — one task per chunk with its real command — and
 now also loses a duplicated `-title`. Seven tests assert on the generated files,
 including that no literal start frame survives in the Deadline arguments.
 
-## T8 — Manifest caching is unused by the CLI  ·  low
+## ~~T8 — Manifest caching is unused by the CLI~~  ·  **DONE 2026-07-26**
 
-`bridge.load_cached()` / `save_cached()` exist and only the GUI writes them.
-A repeated `hsl render` on an unchanged hip reloads Houdini every time.
+`cmd_render` now reuses a cached read of an unchanged `.hip`, with `--no-cache`
+to force a re-read — but **only when nothing is being exported**. On a husk run
+the whole point is to write the USD, and a cached manifest's `usd_path` may long
+since have been deleted; reusing it would point husk at a file that is not there.
+Since hython is the default engine, that still covers the common path, saving a
+full Houdini launch per render.
 
-**Done when:** `cmd_render` uses the cache when the hip is older than it, with
-`--no-cache` to force a re-read, and a test for the staleness comparison.
+**A real bug surfaced doing this:** `cache_path_for()` keyed the filename on
+`hash(path)`, and `hash()` on a string is randomised per process — so every run
+computed a *different* cache filename and the cache could never hit across
+invocations, which is the only time it is any use. It now uses a stable SHA-1
+digest of the normalised path. Five tests cover the key stability, the round
+trip, and the staleness comparison.

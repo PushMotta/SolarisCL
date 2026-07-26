@@ -8,6 +8,7 @@ rest of your pipeline uses.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -361,9 +362,16 @@ def relink_assets(usd_in: str, search_dirs, *, hython: str = "",
 
 
 def cache_path_for(hip_path: str) -> str:
-    """Where a cached manifest for this hip lives."""
+    """Where a cached manifest for this hip lives.
+
+    The digest is a **stable** hash of the path. ``hash()`` on a string is
+    randomised per process, so using it here gave every run a different cache
+    filename -- the cache could never hit across invocations, which is the only
+    time it is any use.
+    """
     base = os.path.splitext(os.path.basename(hip_path))[0]
-    digest = str(abs(hash(os.path.abspath(hip_path))))[:8]
+    key = os.path.normcase(os.path.abspath(hip_path)).encode("utf-8", "replace")
+    digest = hashlib.sha1(key).hexdigest()[:8]
     return os.path.join(tempfile.gettempdir(), "hsl", f"{base}_{digest}.json")
 
 

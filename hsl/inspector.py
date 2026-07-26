@@ -39,7 +39,9 @@ except ImportError:  # pragma: no cover
 # Node types that can drive a husk render. Versioned type names
 # (``usdrender_rop::3.0``) are normalised by stripping at "::".
 RENDER_ROP_TYPES = {"usdrender_rop", "usdrender", "karma"}
-USD_ROP_TYPES = {"usd_rop", "usd", "usdexport"}
+# NB: there is no USD_ROP_TYPES list. `export_usd()` creates its own temporary
+# `usd_rop` rather than looking for one in the scene, so a set of candidate
+# export-ROP names had nothing to match against (docs/TASKS.md T4).
 
 # Attribute namespaces worth capturing off a RenderSettings prim.
 DELEGATE_NAMESPACES = ("karma", "ri", "arnold", "cycles", "driver", "husk")
