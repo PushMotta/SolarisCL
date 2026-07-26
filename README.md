@@ -41,7 +41,28 @@ pip install PySide6              # GUI only; the CLI has no dependencies
 ```
 
 `hython` and `husk` are found via `$HFS/bin`, then `PATH`. Override either with
-`$HSL_HYTHON` / `$HSL_HUSK`.
+`$HSL_HYTHON` / `$HSL_HUSK`. To see every Houdini install found on the machine
+and pick one:
+
+```bash
+python -m hsl.cli hython                 # list them (* = the one in use)
+python -m hsl.cli hython --set 2         # remember install #2 as the default
+```
+
+The GUI has the same list as a dropdown, with a **Rescan** button.
+
+## Two render engines
+
+| | `hython` (**default**) | `husk` |
+|---|---|---|
+| How | renders the ROP directly in hython | exports USD, then runs husk on it |
+| USD on disk | none | one file per ROP |
+| Good for | everything single-machine, and **essential for volume-heavy shots** | farm submission, `--aovs`, `--relink-from` |
+
+hython is the default because the USD export is pure overhead for a local
+render — and on a scene with live (SOP-imported) volumes it *bakes* them into
+the export at tens of GB per frame. The tool refuses that export unless you
+pass `--allow-volume-bake`. Switch engines with `--engine husk`.
 
 ## Use
 
@@ -49,13 +70,17 @@ pip install PySide6              # GUI only; the CLI has no dependencies
 # What is this scene set up to render?
 python -m hsl.cli inspect /jobs/shot/shot_v012.hip
 
-# Show the husk commands without running anything
+# Show the commands without running anything
 python -m hsl.cli render shot.hip --frames 1001-1100 --chunk 10 --dry-run
 
-# Render, four husk processes at a time
+# Render directly in hython (default engine), four processes at a time
 python -m hsl.cli render shot.hip \
     --rop /stage/usdrender_rop1 \
     --frames 1001-1100 --chunk 10 --parallel 4
+
+# Export USD and drive husk instead — needed for AOV filtering and relinking
+python -m hsl.cli render shot.hip --engine husk \
+    --frames 1001-1100 --aovs beauty,depth --relink-from /jobs/shot/tex
 
 # Quarter-res check render of a single frame
 python -m hsl.cli render shot.hip --frames 1050 --res 960 540 \

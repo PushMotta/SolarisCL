@@ -95,6 +95,58 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def _resolve_hython_choice(installs, choice: str) -> str:
+    """Map a ``hsl hython --set`` argument to a hython path.
+
+    Accepts a 1-based index into ``installs`` (as printed by ``hsl hython``) or
+    an explicit path to an executable. Returns "" if neither matches, so the
+    caller can report the problem rather than persisting a bad setting.
+    """
+    choice = (choice or "").strip()
+    if not choice:
+        return ""
+    if choice.isdigit():
+        index = int(choice)
+        if 1 <= index <= len(installs):
+            return installs[index - 1][1]
+        return ""
+    return choice if os.path.isfile(choice) else ""
+
+
+def cmd_hython(args) -> int:
+    """List the hython installations found on this machine, or set the default."""
+    installs = bridge.list_hython_installations()
+
+    if args.set:
+        target = _resolve_hython_choice(installs, args.set)
+        if not target:
+            sys.stderr.write(
+                f"Cannot use '{args.set}' as a hython: it is neither a file on "
+                f"disk nor one of the {len(installs)} listed index(es). "
+                f"Run 'hsl hython' to see the list.\n")
+            return 2
+        bridge.save_user_setting("hython_path", target)
+        print(f"Default hython set to:\n  {target}")
+        return 0
+
+    if not installs:
+        sys.stderr.write(
+            "No hython installations found.\n"
+            "Set $HFS (source houdini_setup), set $HSL_HYTHON to the hython "
+            "binary, or pass --hython explicitly.\n")
+        return 1
+
+    active = bridge.find_hython()
+    print(f"{len(installs)} hython installation(s) found "
+          f"(* = the one that will be used):\n")
+    for index, (label, path) in enumerate(installs, 1):
+        mark = "*" if os.path.normcase(path) == os.path.normcase(active) else " "
+        print(f" {mark} [{index}] {label}")
+        print(f"        {path}")
+    print("\nChoose one with:  hsl hython --set <index|path>")
+    return 0
+
+
 def _aov_keys(var) -> set:
     """Names a var can be referred to by: prim basename, label, source name."""
     basename = var.prim_path.rsplit("/", 1)[-1]
@@ -109,7 +161,27 @@ def _resolve_aovs(manifest: SceneManifest, spec: str) -> list:
 
 
 def cmd_render(args) -> int:
-    engine = "hython" if getattr(args, "direct_hython", False) else getattr(args, "engine", "husk")
+    engine = ("hython" if getattr(args, "direct_hython", False)
+              else getattr(args, "engine", husk_mod.DEFAULT_ENGINE))
+
+    # --aovs and --relink-from edit the *exported* USD, so they are husk-only.
+    # hython is the default engine now, so silently ignoring them would quietly
+    # render the wrong AOVs or leave textures unresolved. Checked before the
+    # scene is loaded — no reason to spend a Houdini launch to reject the argv.
+    if engine == "hython":
+        husk_only = []
+        if getattr(args, "aovs", ""):
+            husk_only.append("--aovs")
+        if getattr(args, "relink_from", None):
+            husk_only.append("--relink-from")
+        if husk_only:
+            sys.stderr.write(
+                f"{' and '.join(husk_only)} only apply to the husk engine: they edit "
+                f"the exported USD, and the hython engine renders the ROP directly "
+                f"without exporting.\n"
+                f"  → add --engine husk to use them, or drop them to render with hython.\n")
+            return 4
+
     export_usd = (engine == "husk")
     allow_volume_bake = getattr(args, "allow_volume_bake", False)
     manifest = bridge.inspect_hip(args.hip, hython=args.hython,
@@ -153,12 +225,19 @@ def cmd_render(args) -> int:
         rop.frame_start, rop.frame_end, rop.frame_inc = start, end, inc
         rop.use_frame_range = end != start
 
-    # Missing textures fail husk mid-render — surface them, and relink if asked.
+    # Missing textures fail the render mid-flight — surface them for *both*
+    # engines (they are a property of the scene, not of the export), and relink
+    # if asked. Reporting these was husk-only until hython became the default,
+    # which would have made broken textures silent on the common path.
     base_usd = rop.usd_path
-    if manifest.missing_assets and engine == "husk":
+    if manifest.missing_assets:
         sys.stderr.write(f"{len(manifest.missing_assets)} unresolved asset(s) in the scene:\n")
         for asset in manifest.missing_assets:
             sys.stderr.write(f"  ✗ {asset.asset_path}\n")
+        if engine == "hython":
+            sys.stderr.write(
+                "  (relink repaths the exported USD, so it needs --engine husk; "
+                "otherwise fix the paths in the scene.)\n")
 
     if engine == "husk" and getattr(args, "relink_from", None) and not args.dry_run:
         try:
@@ -269,8 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect.set_defaults(func=cmd_inspect)
 
     p_render = sub.add_parser("render", parents=[common], help="Render with husk or hython")
-    p_render.add_argument("--engine", choices=["husk", "hython"], default="husk",
-                          help="Render engine: husk (USD export) or hython (direct ROP)")
+    p_render.add_argument("--engine", choices=["husk", "hython"],
+                          default=husk_mod.DEFAULT_ENGINE,
+                          help="Render engine: hython renders the ROP directly with no "
+                               "USD export (default); husk exports USD first, which is "
+                               "what --aovs, --relink-from and farm submission need")
     p_render.add_argument("--direct-hython", action="store_true",
                           help="Shortcut for --engine hython (0 USD disk space)")
     p_render.add_argument("--rop", default="", help="ROP node path")
@@ -300,6 +382,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("--dry-run", action="store_true",
                           help="Print the husk commands and stop")
     p_render.set_defaults(func=cmd_render)
+
+    p_hython = sub.add_parser("hython",
+                              help="List the Houdini/hython installs found on this machine")
+    p_hython.add_argument("--set", default="", metavar="INDEX|PATH",
+                          help="Remember this install as the default (by list index or path)")
+    p_hython.set_defaults(func=cmd_hython)
 
     p_ui = sub.add_parser("ui", help="Open the launcher window")
     p_ui.add_argument("hip", nargs="?", default="")

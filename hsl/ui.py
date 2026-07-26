@@ -139,6 +139,10 @@ class LauncherWindow(QMainWindow):
 
     # -- construction -----------------------------------------------------
 
+    def _engine(self) -> str:
+        """The selected render engine token — "hython" (default) or "husk"."""
+        return self.engine_combo.currentData() or husk_mod.DEFAULT_ENGINE
+
     def _populate_hython_options(self) -> None:
         self.hython_combo.blockSignals(True)
         self.hython_combo.clear()
@@ -185,9 +189,14 @@ class LauncherWindow(QMainWindow):
         self.hython_edit = QLineEdit()
         self.hython_edit.setPlaceholderText("Path to hython executable")
         self.hython_browse_btn = QPushButton("Browse Hython…")
+        self.hython_rescan_btn = QPushButton("Rescan")
+        self.hython_rescan_btn.setToolTip(
+            "Search again for Houdini installations — use this after installing "
+            "a new Houdini or connecting a drive, without restarting the app.")
         hython_row.addWidget(QLabel("Hython"))
         hython_row.addWidget(self.hython_combo, 1)
         hython_row.addWidget(self.hython_edit, 2)
+        hython_row.addWidget(self.hython_rescan_btn)
         hython_row.addWidget(self.hython_browse_btn)
         outer.addLayout(hython_row)
 
@@ -274,8 +283,13 @@ class LauncherWindow(QMainWindow):
             self.preset_combo.addItem(p_name, p_name)
         form.addRow("Render Profile", self.preset_combo)
 
+        # Hython first: it is the default engine. It renders the ROP directly,
+        # so it needs no USD export -- which on a volume-heavy scene would bake
+        # tens of GB per frame. The token lives in the item data so the rest of
+        # the window never depends on the order of this list.
         self.engine_combo = QComboBox()
-        self.engine_combo.addItems(["Husk (USD Export)", "Hython (Direct ROP, 0 USD Disk Space)"])
+        self.engine_combo.addItem("Hython (direct ROP, no USD export)", "hython")
+        self.engine_combo.addItem("Husk (USD export — needed for AOV filter, relink, farm)", "husk")
         form.addRow("Render engine", self.engine_combo)
 
         self.renderer_combo = QComboBox()
@@ -436,6 +450,7 @@ class LauncherWindow(QMainWindow):
         self.hython_combo.currentIndexChanged.connect(self.on_hython_combo_changed)
         self.hython_edit.textChanged.connect(self.on_hython_path_changed)
         self.hython_browse_btn.clicked.connect(self.choose_hython)
+        self.hython_rescan_btn.clicked.connect(self.rescan_hython)
         self.rop_combo.currentIndexChanged.connect(self.on_rop_changed)
         self.preset_combo.currentIndexChanged.connect(self.on_preset_changed)
         self.aov_all_btn.clicked.connect(self.select_all_aovs)
@@ -480,6 +495,20 @@ class LauncherWindow(QMainWindow):
         path = text.strip()
         if path and os.path.isfile(path):
             bridge.save_user_setting("hython_path", path)
+
+    @Slot()
+    def rescan_hython(self) -> None:
+        """Re-run the install scan and repopulate the dropdown."""
+        current = self.hython_edit.text().strip()
+        self._populate_hython_options()
+        found = self.hython_combo.count() - 1        # last entry is "Custom path..."
+        if current:
+            index = self.hython_combo.findData(current)
+            if index >= 0:
+                self.hython_combo.setCurrentIndex(index)
+        self.status_label.setText(
+            f"Found {found} Houdini install(s)." if found
+            else "No Houdini installs found — set $HFS or browse to hython.")
 
     @Slot()
     def choose_hython(self) -> None:
@@ -794,7 +823,7 @@ class LauncherWindow(QMainWindow):
         if not rop or not self.manifest:
             return []
 
-        engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+        engine = self._engine()
         usd_file = usd_override or self._base_usd(rop)
         if engine == "husk" and not usd_file:
             return []
@@ -834,7 +863,7 @@ class LauncherWindow(QMainWindow):
         jobs = self.build_jobs()
         if not jobs:
             rop = self.current_rop()
-            engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+            engine = self._engine()
             if rop and engine == "husk" and not rop.usd_path:
                 self.command_view.setPlainText(
                     "No USD on disk for this ROP. Turn on “Write USD while "
@@ -849,7 +878,7 @@ class LauncherWindow(QMainWindow):
         preview = husk_mod.format_command(husk_mod.build_command(jobs[0]))
         if len(jobs) > 1:
             preview += f"\n\n… and {len(jobs) - 1} more chunk(s) with different --frame values."
-        engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+        engine = self._engine()
         if engine == "husk" and self._selected_aov_paths() is not None:
             preview += ("\n\n# AOVs will be filtered to your selection via a USD "
                         "overlay authored in hython at render start.")
@@ -956,13 +985,16 @@ class LauncherWindow(QMainWindow):
     def start_render(self) -> None:
         jobs = self.build_jobs()
         if not jobs:
-            QMessageBox.information(
-                self, "Nothing to render",
-                "Read a scene with “Write USD while reading” enabled first.",
-            )
+            # Only the husk engine needs a USD on disk; saying so unconditionally
+            # would send a hython user chasing an export they do not need.
+            detail = ("Read a scene with “Write USD while reading” enabled first — "
+                      "the husk engine renders an exported USD."
+                      if self._engine() == "husk"
+                      else "Read a scene and choose a render ROP first.")
+            QMessageBox.information(self, "Nothing to render", detail)
             return
 
-        engine = "hython" if self.engine_combo.currentIndex() == 1 else "husk"
+        engine = self._engine()
         if engine == "husk" and not husk_mod.find_husk():
             QMessageBox.warning(
                 self, "husk not found",

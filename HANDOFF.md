@@ -137,21 +137,29 @@ Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
 2. **Complete the render-path override:** husk `--output` only redirects product
    0. Add a productName overlay to redirect **all** products to a chosen folder
    (reuse the overlay mechanism).
-3. **Relink for the hython-direct engine:** relink currently only helps the husk
-   (USD) path; `render_direct` renders the ROP as-authored. Would need parm-level
-   repath.
+3. **Relink for the hython-direct engine** — ⬆ **raised: hython is now the
+   default engine.** Relink only helps the husk (USD) path; `render_direct`
+   renders the ROP as-authored. Would need parm-level repath. Until then the CLI
+   *rejects* `--relink-from` under hython (rather than ignoring it) and still
+   reports missing assets for both engines.
 4. **Export only the frames being rendered:** export writes the ROP's full
    authored range regardless of `--frames`; narrowing it cuts export cost.
 5. **Farm exporter is a sketch:** `farm.export_deadline_job` only emits job[0]'s
    command (no per-task frame token) — won't distribute a chunked render. Tractor
    is closer. Needs a real fix + a test that asserts frame distribution.
-6. **`render_direct` rough edges:** progress is faked (0→100, nothing between);
-   `resolutionx`/`resolutiony` overrides are unverified (likely silent no-op).
+6. **`render_direct` rough edges** — ⬆ **now the highest-value item: this is the
+   default engine.** Progress is faked (0→100, nothing between), so every default
+   render looks hung; `resolutionx`/`resolutiony` overrides are unverified
+   (likely silent no-op).
 7. **TASKS.md T1** (other `_set_parm` returns in `export_usd` unchecked) — harmless
    on 21/22 since the parms exist, but a real gap on an untested build.
 8. **Precise per-frame export TIME** was never captured (disk filled). Re-run
    `scratchpad/export_timing.py` (now flushed) with `--usd-dir`/outdir on a drive
    with hundreds of GB free.
+9. **Preflight is UI-only.** `preflight.run_preflight_checks` is called from
+   `hsl/ui.py` alone; `cmd_render` re-implements a subset inline. So CLI and farm
+   users get no disk-space / output-path / resolution checks. Consolidating is
+   cheap, removes the duplication, and is **fully testable without Houdini**.
 
 ## How to run / verify
 

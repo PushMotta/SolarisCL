@@ -14,25 +14,24 @@ and husk renders a stale file or fails on a missing path — with no warning.
 `warnings`; a missing `lopoutput` aborts the export rather than returning a
 path that was never written; `docs/UNVERIFIED.md` C1–C5 note the new behaviour.
 
-## T2 — Confirm `--verbose 3a` produces `ALF_PROGRESS`  ·  high
+## ~~T2 — Confirm `--verbose 3a` produces `ALF_PROGRESS`~~  ·  **DONE 2026-07-25**
 
-`docs/UNVERIFIED.md` E13. If the flag-letter syntax is wrong, every render
-succeeds and every progress bar sits at zero — the worst kind of bug, because
-nothing looks broken.
+Verified against `husk --help` (`a` = "Turn on Alfred progress") **and one real
+render** of `SHOT_SandBurst_ROCHA_v14` — `ALF_PROGRESS` was emitted live and
+`parse_progress()` read it. `docs/UNVERIFIED.md` E13 is in the Verified table.
 
-**Done when:** verified against `husk --help` and one real render, `--verbose`
-handling in `hsl/husk.py` matches, and E13 moves to Verified. Run
-`/verify-husk-flags`.
+## ~~T3 — AOV discovery may find nothing~~  ·  **DONE 2026-07-24**
 
-## T3 — AOV discovery may find nothing  ·  high
+`IsA(UsdRender.Var)` matched all 4 typed `UsdRender.Var` prims on a real Karma
+shot (`/hip-check` on `SHOT_SandBurst_ROCHA_v14`, Houdini 22.0.368) — `beauty`
+(LPE), `CryptoObject`, `CryptoPrimitives`, `depth`. No untyped-prim fallback is
+needed. `docs/UNVERIFIED.md` D2 is in the Verified table.
 
-`docs/UNVERIFIED.md` D2. `walk_stage()` uses `prim.IsA(UsdRender.Var)`. If
-Solaris authors these as untyped prims, the AOV list comes back empty and looks
-like a scene with no AOVs.
+## ~~T9 — Volume-bake preflight guard~~  ·  **DONE 2026-07-26**
 
-**Done when:** checked against a real scene with known AOVs. If `IsA()` misses
-them, add a fallback on `GetTypeName()` or on the products' `orderedVars`
-targets, with a test using a hand-written USD fixture.
+`inspector.scan_live_volumes()` + the `allow_volume_bake` export guard, verified
+on 22.0.368 against the real shot (4 volumes / 8 fields; guard wrote 0 bytes).
+See `docs/UNVERIFIED.md` D6–D8 / D-VOL.
 
 ## T4 — `USD_ROP_TYPES` is declared but never used  ·  low
 

@@ -25,6 +25,16 @@ DEFAULT_RENDERERS = [
     "BRAY_HdKarmaXPU",
 ]
 
+# The engine used when the caller does not name one.
+#
+# "hython" renders the ROP directly, with **no USD export**. That is the safe
+# default: exporting a volume-heavy stage bakes the live volumes into the USD
+# at tens of GB per frame (see inspector.scan_live_volumes), and the export is
+# pure overhead for a single-machine render. Choose "husk" explicitly when you
+# want the USD on disk -- for farm submission, AOV filtering or asset relinking,
+# all of which operate on the exported USD.
+DEFAULT_ENGINE = "hython"
+
 
 # --------------------------------------------------------------------------
 # Locating husk
@@ -138,7 +148,7 @@ def frame_chunks(start: int, end: int, inc: int = 1,
 class RenderJob:
     """A fully resolved husk or hython invocation, before it is turned into argv."""
     usd_file: str = ""
-    engine: str = "husk"                 # "husk" or "hython"
+    engine: str = DEFAULT_ENGINE         # "husk" or "hython"
     hip_file: str = ""
     rop_path: str = ""
     renderer: str = "BRAY_HdKarma"
@@ -261,7 +271,7 @@ def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str = "",
     settings = manifest.resolve_settings(rop)
 
     defaults = {
-        "engine": overrides.get("engine", "husk"),
+        "engine": overrides.get("engine", DEFAULT_ENGINE),
         "hip_file": manifest.hip_path,
         "rop_path": rop.node_path,
         "renderer": rop.renderer or "BRAY_HdKarma",

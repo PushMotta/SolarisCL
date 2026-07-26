@@ -4,7 +4,18 @@
 > file — edit **this** one. See `scripts/check_drift.py`.
 
 Loads a Houdini `.hip`, reads what the LOP network is set up to render, and
-launches `husk`. GUI (PySide6), CLI, and importable library.
+renders it. GUI (PySide6), CLI, and importable library.
+
+Two engines, selected by `RenderJob.engine` (`husk.DEFAULT_ENGINE`):
+
+- **`hython` — the default.** Renders the ROP directly under hython, no USD on
+  disk. Right for local renders, and *required* for volume-heavy shots: the USD
+  export bakes live SOP volumes at tens of GB per frame.
+- **`husk`.** Exports USD, then drives husk. Needed for farm submission and for
+  anything that edits the exported stage — `--aovs`, `--relink-from`.
+
+Options that edit the exported USD are husk-only, and the CLI **rejects** them
+under hython rather than ignoring them.
 
 ---
 

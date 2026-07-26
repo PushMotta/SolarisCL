@@ -1,5 +1,7 @@
 """Tests for everything that does not need Houdini installed."""
 
+import contextlib
+import io
 import os
 import stat
 import sys
@@ -9,14 +11,16 @@ import unittest
 import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hsl import farm, preflight, presets
+from hsl import bridge, farm, preflight, presets
 from hsl.bridge import (
     find_hython, list_hython_installations, load_user_settings, save_user_setting,
 )
-from hsl.cli import parse_frames
+from hsl.cli import (
+    _resolve_hython_choice, build_parser, cmd_render, parse_frames,
+)
 from hsl.husk import (
-    FrameChunk, RenderJob, build_command, format_command, frame_chunks,
-    jobs_for_rop, looks_like_error, parse_progress,
+    DEFAULT_ENGINE, FrameChunk, RenderJob, build_command, format_command,
+    frame_chunks, jobs_for_rop, looks_like_error, parse_progress,
 )
 from hsl.manifest import (
     Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
@@ -163,6 +167,9 @@ class TestChunking(unittest.TestCase):
 
 class TestCommand(unittest.TestCase):
     def build(self, **kwargs):
+        # These assert on husk argv, so pin the engine: the app-wide default is
+        # now hython, which builds an entirely different command.
+        kwargs.setdefault("engine", "husk")
         job = RenderJob(usd_file="/tmp/shot.usd", husk_exe="/opt/hfs/bin/husk",
                         **kwargs)
         return build_command(job)
@@ -320,6 +327,7 @@ class TestRenderQueue(unittest.TestCase):
     def job(self, start, fail=False):
         return RenderJob(
             usd_file=os.path.join(self.dir, "shot.usd"),
+            engine="husk",              # the fake executable is a husk stand-in
             husk_exe=self.fake_exe,
             chunk=FrameChunk(start, 2, 1),
             extra_args=["--make-it-fail"] if fail else [],
@@ -353,7 +361,7 @@ class TestRenderQueue(unittest.TestCase):
         self.assertTrue(queue.finished)
 
     def test_missing_executable_fails_cleanly(self):
-        job = RenderJob(usd_file="/tmp/shot.usd",
+        job = RenderJob(usd_file="/tmp/shot.usd", engine="husk",
                         husk_exe="/definitely/not/here/husk")
         queue, _ = self._run([job])
         self.assertEqual(queue.tasks[0].state, State.FAILED)
@@ -450,6 +458,93 @@ class TestPreflight(unittest.TestCase):
         self.assertFalse(any(w.category == "volume_bake" for w in warnings))
 
 
+class TestDefaultEngine(unittest.TestCase):
+    """hython is the app default: it renders the ROP with no USD export."""
+
+    def test_default_is_hython(self):
+        self.assertEqual(DEFAULT_ENGINE, "hython")
+        self.assertEqual(RenderJob(usd_file="/s.usd").engine, "hython")
+
+    def test_jobs_for_rop_defaults_to_hython(self):
+        m = sample_manifest()
+        job = jobs_for_rop(m, m.rops[0], "/tmp/shot.usd")[0]
+        self.assertEqual(job.engine, "hython")
+        # The hython command renders the .hip, so the hip path must come through.
+        self.assertEqual(job.hip_file, m.hip_path)
+        self.assertEqual(job.rop_path, m.rops[0].node_path)
+
+    def test_default_job_builds_a_direct_render_command(self):
+        m = sample_manifest()
+        cmd = build_command(jobs_for_rop(m, m.rops[0], "/tmp/shot.usd")[0])
+        self.assertIn("--render-direct", cmd)
+        self.assertIn("-m", cmd)
+        self.assertIn("hsl.inspector", cmd)
+        # A husk-only flag must never appear on a hython command line.
+        self.assertNotIn("--make-output-path", cmd)
+
+    def test_husk_still_available_explicitly(self):
+        m = sample_manifest()
+        cmd = build_command(
+            jobs_for_rop(m, m.rops[0], "/tmp/shot.usd", engine="husk")[0])
+        self.assertNotIn("--render-direct", cmd)
+        self.assertEqual(cmd[-1], "/tmp/shot.usd")
+
+
+class TestCliEngineGuards(unittest.TestCase):
+    """--aovs / --relink-from edit the exported USD, so hython must reject them
+    rather than silently ignore them."""
+
+    def test_render_defaults_to_hython(self):
+        self.assertEqual(build_parser().parse_args(["render", "s.hip"]).engine,
+                         "hython")
+
+    def _render(self, argv):
+        """cmd_render with its explanatory stderr swallowed, so test output stays clean."""
+        args = build_parser().parse_args(argv)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cmd_render(args)
+        return code, err.getvalue()
+
+    def test_aovs_with_hython_is_rejected(self):
+        # Rejected on argv alone -- no Houdini launch, so this is safe to assert.
+        code, message = self._render(["render", "s.hip", "--aovs", "beauty"])
+        self.assertEqual(code, 4)
+        self.assertIn("--engine husk", message)
+
+    def test_relink_with_hython_is_rejected(self):
+        code, message = self._render(["render", "s.hip", "--relink-from", "/tex"])
+        self.assertEqual(code, 4)
+        self.assertIn("--engine husk", message)
+
+    def test_aovs_allowed_with_explicit_husk(self):
+        args = build_parser().parse_args(
+            ["render", "s.hip", "--engine", "husk", "--aovs", "beauty"])
+        # The guard must NOT fire; it proceeds and fails later on the missing hip.
+        with self.assertRaises(bridge.InspectError):
+            cmd_render(args)
+
+
+class TestHythonSelection(unittest.TestCase):
+    INSTALLS = [("Houdini 22.0.368", "/opt/hfs22/bin/hython"),
+                ("Houdini 21.0.729", "/opt/hfs21/bin/hython")]
+
+    def test_index_picks_that_install(self):
+        self.assertEqual(_resolve_hython_choice(self.INSTALLS, "2"),
+                         "/opt/hfs21/bin/hython")
+
+    def test_index_out_of_range_is_refused(self):
+        self.assertEqual(_resolve_hython_choice(self.INSTALLS, "9"), "")
+
+    def test_path_that_does_not_exist_is_refused(self):
+        self.assertEqual(_resolve_hython_choice(self.INSTALLS, "/no/such/hython"), "")
+
+    def test_real_path_is_accepted(self):
+        self.assertEqual(_resolve_hython_choice(self.INSTALLS, __file__), __file__)
+
+    def test_empty_choice_is_refused(self):
+        self.assertEqual(_resolve_hython_choice(self.INSTALLS, ""), "")
+
+
 class TestPresets(unittest.TestCase):
     def test_default_presets(self):
         all_p = presets.get_default_presets()
@@ -466,7 +561,7 @@ class TestPresets(unittest.TestCase):
 
 class TestFarm(unittest.TestCase):
     def test_export_deadline_job(self):
-        job = RenderJob(usd_file="/jobs/shot.usd", husk_exe="husk")
+        job = RenderJob(usd_file="/jobs/shot.usd", engine="husk", husk_exe="husk")
         temp_dir = tempfile.mkdtemp()
         try:
             j_path, p_path = farm.export_deadline_job([job], temp_dir)
@@ -476,7 +571,7 @@ class TestFarm(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_export_tractor_job(self):
-        job = RenderJob(usd_file="/jobs/shot.usd", husk_exe="husk")
+        job = RenderJob(usd_file="/jobs/shot.usd", engine="husk", husk_exe="husk")
         temp_dir = tempfile.mkdtemp()
         try:
             out_file = os.path.join(temp_dir, "tractor_job.alf")
