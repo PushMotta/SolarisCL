@@ -577,10 +577,26 @@ class TestCliEngineGuards(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("--engine husk", message)
 
-    def test_relink_with_hython_is_rejected(self):
-        code, message = self._render(["render", "s.hip", "--relink-from", "/tex"])
-        self.assertEqual(code, 4)
-        self.assertIn("--engine husk", message)
+    def test_relink_is_accepted_on_hython(self):
+        # hython sublayers the repaths into the LOP network, so this is NOT
+        # husk-only: the guard must not fire (it fails later on the missing hip).
+        args = build_parser().parse_args(["render", "s.hip", "--relink-from", "/tex"])
+        with self.assertRaises(bridge.InspectError):
+            cmd_render(args)
+
+    def test_relink_dirs_reach_the_hython_command(self):
+        m = sample_manifest()
+        job = jobs_for_rop(m, m.rops[0], "", engine="hython",
+                           relink_dirs=["/tex/a", "/tex/b"])[0]
+        cmd = build_command(job)
+        self.assertEqual(cmd[cmd.index("--search") + 1], "/tex/a")
+        self.assertEqual(cmd.count("--search"), 2)
+
+    def test_husk_command_never_gets_search_dirs(self):
+        m = sample_manifest()
+        job = jobs_for_rop(m, m.rops[0], "/tmp/s.usd", engine="husk",
+                           relink_dirs=["/tex/a"])[0]
+        self.assertNotIn("--search", build_command(job))
 
     def test_aovs_allowed_with_explicit_husk(self):
         args = build_parser().parse_args(

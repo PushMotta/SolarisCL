@@ -198,6 +198,31 @@ a thin overlay that sublayers the export and overrides each product's
 product left `orderedVars = [C, depth]` in the flattened composition, the other
 product untouched.
 
+### Relinking on the hython engine  ·  `OK` (22, real scene)
+
+The husk path relinks by overlaying the *exported* USD. `render_direct` has no
+export — it renders the LOP network's composed stage — so the repaths have to
+get into the network. `inspector.author_relink_overlay()` writes an
+**opinions-only** layer (`over` prims carrying just the fixed asset paths, built
+with `Sdf.AttributeSpec`), and `_insert_relink_layer()` composes it in with a
+**Sublayer LOP** wired between the ROP and its input.
+
+Two things had to be true, and both were checked rather than assumed:
+
+| # | Assumption | Status | Evidence |
+|---|---|---|---|
+| G1 | a `sublayer` LOP type exists | `OK` (22) | `createNode("sublayer")` succeeds; `layer` does **not** exist |
+| G2 | its file composes **stronger** than the incoming stage | `OK` (22) | two chained Sublayer LOPs: the downstream file's opinion won, and it sat *before* the base in `subLayerPaths` (earlier = stronger in USD) |
+| G3 | the file parm is `filepath1` | `OK` (22) | set through `_set_parm`, and the override then took effect |
+
+G2 is the load-bearing one: a sublayer composing *weaker* would leave the broken
+paths winning and produce a confidently wrong render.
+
+**Verified end to end on `SHOT_SandBurst_ROCHA_v14` (22.0.368):** the shot's 4
+unresolved gravel textures (dead `D:/Dropbox/…` absolute paths) went to **0
+missing** after relinking from the real `tex` directory, with the ROP's input
+rewired to the inserted `/stage/hsl_relink` node.
+
 ### Missing textures & relinking  ·  `OK` (22)
 
 husk has **no pre-scan** for missing textures — it only errors mid-render, which
@@ -279,6 +304,8 @@ destinations are reported as a warning rather than silently overwriting.
 | D8 | `UsdVol.Volume` owns the field prims | 22.0.368 | 2026-07-26 | 8/8 parents `Volume`-typed |
 | D-VOL | `scan_live_volumes` + the export guard | 22.0.368 | 2026-07-26 | 4 volumes / 8 fields; `allow_volume_bake=False` wrote **0 bytes**, disk free unchanged |
 | E-OUT | `override_product_paths` redirects every product | 22.0.368 | 2026-07-26 | file + directory mode; `$F4` preserved; empty `productName` falls back to prim name; source untouched |
+| G1–G3 | Sublayer LOP exists, composes stronger, parm is `filepath1` | 22.0.368 | 2026-07-26 | `layer` is not a type; downstream file's opinion wins |
+| G-RELINK | hython-engine relink on the real shot | 22.0.368 | 2026-07-26 | SandBurst: 4 unresolved → **0** after relink; ROP input rewired to `/stage/hsl_relink` |
 | E1–E14 | every flag `build_command()` emits | 21.0.729, 22.0.368 | 2026-07-24 | via `husk --help`; `ALF_PROGRESS` literal wants a live render |
 | E-AOV | husk has no AOV flag; selection is USD `orderedVars`; overlay filter works | 22.0.368 | 2026-07-24 | `filter_usd_aovs` verified: dropping a var left the right `orderedVars` |
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |

@@ -174,6 +174,9 @@ class RenderJob:
     # only to catch a render that exits 0 having written nothing; empty means
     # "unknown", and the check is then skipped rather than guessed at.
     expected_outputs: list[str] = field(default_factory=list)
+    # Directories to search for unresolved assets (hython engine only -- the
+    # husk path relinks the exported USD before the job is ever built).
+    relink_dirs: list[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -203,6 +206,8 @@ def build_command(job: RenderJob) -> list[str]:
             cmd += ["--output", job.output]
         if job.resolution:
             cmd += ["--res", str(job.resolution[0]), str(job.resolution[1])]
+        for directory in job.relink_dirs:
+            cmd += ["--search", directory]
         cmd += list(job.extra_args)
         return cmd
 

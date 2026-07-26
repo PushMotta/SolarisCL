@@ -143,11 +143,13 @@ Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
    double-apply). File mode gives product 0 the exact path and puts the rest
    alongside; directory mode keeps each product's filename. `$F4` survives; an
    empty `productName` falls back to the prim name. See `docs/UNVERIFIED.md` E-OUT.
-3. **Relink for the hython-direct engine** — ⬆ **raised: hython is now the
-   default engine.** Relink only helps the husk (USD) path; `render_direct`
-   renders the ROP as-authored. Would need parm-level repath. Until then the CLI
-   *rejects* `--relink-from` under hython (rather than ignoring it) and still
-   reports missing assets for both engines.
+3. ~~**Relink for the hython-direct engine**~~ — **DONE, verified on the real
+   shot.** Not parm-level repath after all: `author_relink_overlay()` writes an
+   opinions-only layer and `_insert_relink_layer()` composes it in with a
+   **Sublayer LOP** (which sits *stronger* than the incoming stage — checked,
+   because a weaker one would silently keep the broken paths). `--relink-from`
+   now works on **both** engines. SandBurst went 4 unresolved → 0. See
+   `docs/UNVERIFIED.md` G1–G3 / G-RELINK.
 4. **Export only the frames being rendered:** export writes the ROP's full
    authored range regardless of `--frames`; narrowing it cuts export cost.
 5. ~~**Farm exporter is a sketch**~~ — **DONE.** Deadline now substitutes

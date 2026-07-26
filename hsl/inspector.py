@@ -657,6 +657,99 @@ def _basename_index(search_dirs) -> dict:
     return index
 
 
+def _author_asset_opinion(layer, attr, value_type, value) -> None:
+    """Write a single ``over`` opinion for ``attr`` into ``layer``."""
+    prim_path = attr.GetPath().GetPrimPath()
+    Sdf.CreatePrimInLayer(layer, prim_path)
+    prim_spec = layer.GetPrimAtPath(prim_path)
+    prim_spec.specifier = Sdf.SpecifierOver
+
+    attr_spec = layer.GetAttributeAtPath(attr.GetPath())
+    if attr_spec is None:
+        attr_spec = Sdf.AttributeSpec(prim_spec, attr.GetName(), value_type)
+    attr_spec.default = value
+
+
+def author_relink_overlay(stage, search_dirs, out_path: str,
+                          warnings: Optional[list] = None) -> dict:
+    """Author a standalone layer of repath opinions for a **live** stage.
+
+    :func:`relink_assets` overlays an exported USD *file*, which the husk engine
+    has and the hython engine does not -- ``render_direct`` renders the LOP
+    network's own composed stage. So this writes an opinions-only layer (``over``
+    prims carrying just the fixed asset paths) that can be sublayered back into
+    the network by a Sublayer LOP, which composes **stronger** than the incoming
+    stage (verified on 22.0.368).
+
+    Returns ``{"out", "relinked": [...], "still_missing": [...]}``.
+    """
+    warnings = warnings if warnings is not None else []
+    if Usd is None or Sdf is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+
+    index = _basename_index(search_dirs)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    layer = Sdf.Layer.CreateNew(out_path)
+    relinked: list = []
+    still_missing: list = []
+
+    def _find(path: str) -> str:
+        base = path.replace("\\", "/").rsplit("/", 1)[-1]
+        return index.get(base.lower(), "")
+
+    for prim in stage.Traverse():
+        for attr in prim.GetAttributes():
+            type_name = attr.GetTypeName()
+
+            if type_name == Sdf.ValueTypeNames.Asset:
+                asset = attr.Get()
+                path = (getattr(asset, "path", "") or "") if asset else ""
+                resolved = (getattr(asset, "resolvedPath", "") or "") if asset else ""
+                if not path or resolved:
+                    continue
+                new = _find(path)
+                if new:
+                    _author_asset_opinion(layer, attr, Sdf.ValueTypeNames.Asset,
+                                          Sdf.AssetPath(new))
+                    relinked.append({"attr": str(attr.GetPath()), "old": path, "new": new})
+                else:
+                    still_missing.append({"attr": str(attr.GetPath()), "path": path})
+
+            elif type_name == Sdf.ValueTypeNames.AssetArray:
+                assets = list(attr.Get() or [])
+                new_list, changed = [], False
+                for asset in assets:
+                    path = getattr(asset, "path", "") or ""
+                    resolved = getattr(asset, "resolvedPath", "") or ""
+                    if path and not resolved:
+                        new = _find(path)
+                        if new:
+                            new_list.append(Sdf.AssetPath(new))
+                            relinked.append({"attr": str(attr.GetPath()),
+                                             "old": path, "new": new})
+                            changed = True
+                            continue
+                        still_missing.append({"attr": str(attr.GetPath()), "path": path})
+                    new_list.append(asset)
+                if changed:
+                    _author_asset_opinion(layer, attr, Sdf.ValueTypeNames.AssetArray,
+                                          Sdf.AssetPathArray(new_list))
+
+    layer.Save()
+    if not relinked:
+        warnings.append(
+            "Relink: nothing was repathed — no unresolved asset had a "
+            "same-named file under the search directories.")
+    return {
+        "out": out_path if os.path.exists(out_path) else "",
+        "relinked": relinked,
+        "still_missing": still_missing,
+    }
+
+
 def relink_assets(usd_in: str, usd_out: str, search_dirs) -> dict:
     """Author an overlay that repaths unresolved assets found under search_dirs.
 
@@ -856,9 +949,51 @@ def inspect(hip_path: str, export: bool = False,
     return manifest
 
 
+def _insert_relink_layer(target_rop, search_dirs, warnings: list) -> int:
+    """Repath the ROP's unresolved assets by sublayering a relink overlay in.
+
+    Returns the number of assets repathed. The overlay is composed into the
+    network with a Sublayer LOP, which sits *stronger* than the incoming stage,
+    so the fixed paths win over the scene's broken ones.
+    """
+    stage, _lop = stage_for(target_rop, warnings)
+    if stage is None:
+        warnings.append(f"{target_rop.path()}: no stage to relink.")
+        return 0
+
+    overlay_path = os.path.join(tempfile.gettempdir(), "hsl", "relink_direct.usda")
+    result = author_relink_overlay(stage, search_dirs, overlay_path, warnings)
+    if not result["out"] or not result["relinked"]:
+        return 0
+
+    inputs = [n for n in target_rop.inputs() if n is not None]
+    if not inputs:
+        warnings.append(
+            f"{target_rop.path()}: has no input LOP, so the relink overlay "
+            f"could not be composed in.")
+        return 0
+
+    sub = target_rop.parent().createNode("sublayer", "hsl_relink")
+    if not _set_parm(sub, "filepath1", result["out"]):
+        warnings.append("Sublayer LOP has no 'filepath1' parameter; relink skipped.")
+        try:
+            sub.destroy()
+        except Exception:
+            pass
+        return 0
+
+    sub.setInput(0, inputs[0])
+    target_rop.setInput(0, sub)
+    if result["still_missing"]:
+        warnings.append(f"{len(result['still_missing'])} asset(s) are still "
+                        f"unresolved after the relink.")
+    return len(result["relinked"])
+
+
 def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] = None,
                   frame_count: int = 1, frame_inc: int = 1, renderer: str = "",
-                  camera: str = "", output: str = "", res: Optional[tuple[int, int]] = None) -> int:
+                  camera: str = "", output: str = "", res: Optional[tuple[int, int]] = None,
+                  relink_from=None) -> int:
     """Render a LOP ROP directly in hython without exporting USD to disk.
 
     This is the default engine (``husk.DEFAULT_ENGINE``), so its progress
@@ -885,6 +1020,17 @@ def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] 
         return 1
 
     target_rop = rop_nodes[0]
+
+    # Relink before anything else: it rewires the ROP's input, and everything
+    # below reads from that. Unlike the husk path there is no exported USD to
+    # overlay, so the repaths are sublayered straight into the network.
+    if relink_from:
+        relink_warnings: list[str] = []
+        count = _insert_relink_layer(target_rop, relink_from, relink_warnings)
+        for message in relink_warnings:
+            sys.stderr.write(f"warning: {message}\n")
+        sys.stderr.write(f"Relinked {count} asset(s) into the LOP network.\n")
+        sys.stderr.flush()
 
     # Every override reports whether it actually landed. `resolutionx` /
     # `resolutiony` in particular are unconfirmed on usdrender_rop -- if they
@@ -1021,7 +1167,8 @@ def main(argv=None) -> int:
         return render_direct(args.hip, rop_path=args.rop, frame_start=args.frame_start,
                              frame_count=args.frame_count, frame_inc=args.frame_inc,
                              renderer=args.renderer, camera=args.camera,
-                             output=args.output, res=res)
+                             output=args.output, res=res,
+                             relink_from=args.search or None)
 
     try:
         manifest = inspect(args.hip, export=args.export_usd,
