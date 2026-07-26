@@ -306,6 +306,10 @@ def scan_live_volumes(stage) -> list[LiveVolume]:
         if path:
             continue                      # references a real .vdb -- cheap to export
 
+        # `fieldName` is authored empty on every SOP-imported field observed on
+        # Houdini 22.0.368 (8/8 on SandBurst) -- the prim *name* carries it
+        # ("density", "vel"). So the fallback is load-bearing, not defensive:
+        # without it every warning would name its fields as empty strings.
         name_attr = asset.GetFieldNameAttr()
         field_name = str((name_attr.Get() if name_attr else "") or prim.GetName())
 

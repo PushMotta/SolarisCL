@@ -112,7 +112,7 @@ mean "no outputs". The inspector also correctly *warned* — rather than failing
 silently — when the second ROP's input LOP did not cook to a stage at the
 current frame.
 
-### Live volumes bake on export  ·  `?` (grounded, function not yet run)
+### Live volumes bake on export  ·  `OK` (22, real scene)
 
 `inspector.scan_live_volumes()` flags volumes that will **bake** into a USD
 export. A SOP-imported volume has no `.vdb` on disk: its `UsdVolOpenVDBAsset`
@@ -129,17 +129,35 @@ never exports), and — the real guard — `inspect(..., allow_volume_bake=False
 `hsl render --engine husk` aborts with advice instead of filling the disk
 (`--allow-volume-bake` overrides).
 
-| # | Assumption | Status | How to check |
+| # | Assumption | Status | Evidence |
 |---|---|---|---|
-| D6 | `prim.IsA(UsdVol.OpenVDBAsset)` matches Houdini's SOP-imported volume fields | `?` | traverse the SandBurst stage, print `[p for p in stage.Traverse() if p.IsA(UsdVol.OpenVDBAsset)]` — expect 8 |
-| D7 | `UsdVolOpenVDBAsset.GetFilePathAttr().Get().path` is empty for a live field, set for a `.vdb`-referenced one | `?` (raw data seen) | the handoff's `volume_probe.py` already observed **0 filePaths** across 8 field assets; confirm `scan_live_volumes()` returns those 4 volumes |
-| D8 | `UsdVol.Volume` owns the field prims (fields are children) | `?` | print each field prim's parent chain; expect a `Volume`-typed ancestor |
+| D6 | `prim.IsA(UsdVol.OpenVDBAsset)` matches Houdini's SOP-imported volume fields | `OK` (22, real scene) | SandBurst `/stage/Render_01` → **8** `OpenVDBAsset` prims, matching the count `volume_probe.py` saw |
+| D7 | `GetFilePathAttr().Get().path` is empty for a live field, set for a `.vdb`-referenced one | `OK` (22, real + synthetic) | **0 of 8** fields carried a `filePath` on the real shot; a synthetic stage with one live and one `.vdb`-backed volume flagged **only** the live one |
+| D8 | `UsdVol.Volume` owns the field prims (fields are children) | `OK` (22, real scene) | all 8 fields' parents were `Volume`-typed; `_owning_volume()` resolved to that parent every time |
 
-**Do not guess these from recall** — the failure mode is either a false "safe"
-(a real bake slips through and fills the disk) or a false alarm (a cached-VDB
-scene wrongly aborts). Verify against the SandBurst shot, whose live-volume
-counts are already known (4 volumes / 8 fields / 0 filePaths), then move D6–D8
-into the Verified table.
+**Verified 2026-07-26 on Houdini 22.0.368** against
+`SHOT_SandBurst_ROCHA_v14_Motta.hiplc`. `scan_live_volumes()` returned exactly
+**4 volumes × 2 fields = 8** — SAND_BURST, SAND_Dev_07, SAND_Dev_06, SAND_Front,
+each `[vel, density]` — matching the independently-observed raw counts.
+
+**The guard was proven end to end on that shot:** `inspect(export=True,
+allow_volume_bake=False)` on `/stage/Render_01` skipped the export —
+`usd_path` empty, **0 bytes written**, C: free space unchanged (58.7 GB before
+and after) — and emitted the explanatory warning. The ~44 GB/frame bake was
+genuinely prevented, not merely reported. `allow_volume_bake=True` was
+deliberately **not** exercised: that *is* the multi-GB bake, and C: has ~57 GB
+free.
+
+**`fieldName` is authored empty on real Solaris volumes** (8/8 on SandBurst) —
+the field name lives in the **prim name** (`density`, `vel`). So
+`scan_live_volumes()`'s `or prim.GetName()` fallback is load-bearing, not
+defensive: reading `GetFieldNameAttr()` alone would label every warning with
+empty field names. Do not "simplify" it away.
+
+**Division of labour with the missing-asset scan** (confirmed on the synthetic
+stage): an **empty** `filePath` is a *live volume* (bake risk); an **authored
+but unresolved** `filePath` is a *missing asset* and is reported by
+`scan_missing_assets` instead. The two never double-report the same field.
 
 ## E. husk CLI flags — `hsl/husk.py` `build_command()`
 
@@ -232,6 +250,10 @@ field + Browse.
 | D4 | `karma:*` / `husk:*` attrs on the settings prim | 22.0.368 | 2026-07-24 | ~90 knobs read from the same scene |
 | D5 | `LopNode.stage()` returns composed stage | 21.0.729, 22.0.368 | 2026-07-24 | current-frame cook limitation stands (T5) |
 | D-ASSET | missing-texture scan (`Sdf.AssetPath.resolvedPath == ""`) + overlay relink | 22.0.368 | 2026-07-25 | verified scalar + array assets, recursive search; re-scan of relinked overlay = 0 missing |
+| D6 | `IsA(UsdVol.OpenVDBAsset)` matches SOP-imported fields | 22.0.368 | 2026-07-26 | SandBurst: 8 field prims |
+| D7 | empty `filePath` ⇒ live volume; set ⇒ cached | 22.0.368 | 2026-07-26 | 0/8 on the real shot; synthetic stage flagged only the live volume |
+| D8 | `UsdVol.Volume` owns the field prims | 22.0.368 | 2026-07-26 | 8/8 parents `Volume`-typed |
+| D-VOL | `scan_live_volumes` + the export guard | 22.0.368 | 2026-07-26 | 4 volumes / 8 fields; `allow_volume_bake=False` wrote **0 bytes**, disk free unchanged |
 | E1–E14 | every flag `build_command()` emits | 21.0.729, 22.0.368 | 2026-07-24 | via `husk --help`; `ALF_PROGRESS` literal wants a live render |
 | E-AOV | husk has no AOV flag; selection is USD `orderedVars`; overlay filter works | 22.0.368 | 2026-07-24 | `filter_usd_aovs` verified: dropping a var left the right `orderedVars` |
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |
@@ -241,10 +263,6 @@ field + Browse.
 ## Still unknown (do not guess)
 
 - **A3** — the `::`-versioned type-name split path.
-- **D6/D7/D8** — the `UsdVol` live-volume scan (`scan_live_volumes`): schema
-  match, empty-`filePath` semantics, and volume/field ownership. Raw counts for
-  SandBurst are known (4 volumes / 8 fields / 0 filePaths); the function itself
-  has not been run. Verify against that shot before trusting the abort.
 - **E8/E9** — accepted values for `--complexity` and `--purpose`.
 - **F2/F3** — Karma license behaviour and the Indie resolution cap.
 

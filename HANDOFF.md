@@ -110,22 +110,30 @@ Both are **USD overlays authored under hython** (`hsl/inspector.py`), run via
   one frame) — the export **bakes** volumes because they're live SOP-imported
   (`OpenVDBAsset.filePath` is empty; verified 4 volumes / 8 field assets, 0
   filePaths). A full 1–30 export ≈ ~1 TB and won't fit on C:. **For volume-heavy
-  shots, the hython-direct engine (no export) is the right choice.**
+  shots, the hython-direct engine (no export) is the right choice.** This is now
+  **enforced, not just documented**: the export is skipped unless
+  `--allow-volume-bake` is passed (follow-up #1, verified 2026-07-26).
 
 ## Open follow-ups (prioritized)
 
-1. ~~**Volume-bake preflight warning**~~ — **BUILT (2026-07-25 cont.), Houdini
-   verification pending.** `inspector.scan_live_volumes()` groups empty-`filePath`
+1. ~~**Volume-bake preflight warning**~~ — **DONE and VERIFIED on 22.0.368
+   (2026-07-26).** `inspector.scan_live_volumes()` groups empty-`filePath`
    `OpenVDBAsset` fields under their owning `UsdVol.Volume` into
    `manifest.live_volumes`. Preflight raises a `volume_bake` **warning** for the
    husk engine; and the real guard — `inspect(allow_volume_bake=False)` **skips
    the export** for a live-volume ROP, so `hsl render --engine husk` aborts with
    advice (use `--engine hython`, cache to `.vdb`, or `--allow-volume-bake`)
    instead of filling the disk. Surfaced in CLI `inspect`/`render` and the UI
-   status/preflight tooltip. Plain-Python layer tested (62 tests green); the
-   `UsdVol` scan itself is **unverified on a real install** — see `docs/UNVERIFIED.md`
-   D6–D8. **Next:** run against SandBurst (known 4 volumes / 8 fields / 0
-   filePaths) and move D6–D8 to Verified.
+   status/preflight tooltip. 62 tests green.
+   **Verified on the real shot:** `scan_live_volumes` returned exactly the
+   expected 4 volumes / 8 fields (SAND_BURST, SAND_Dev_07, SAND_Dev_06,
+   SAND_Front — each `[vel, density]`), and the guard wrote **0 bytes** with C:
+   free space unchanged (58.7 GB before and after). A synthetic stage confirmed
+   the negative case: a `.vdb`-backed volume is *not* flagged. See
+   `docs/UNVERIFIED.md` D6–D8 / D-VOL.
+   **Gotcha found:** `fieldName` is authored **empty** on real Solaris volume
+   fields (8/8) — the prim name carries it, so the `or prim.GetName()` fallback
+   in `scan_live_volumes` is load-bearing. Don't simplify it away.
 2. **Complete the render-path override:** husk `--output` only redirects product
    0. Add a productName overlay to redirect **all** products to a chosen folder
    (reuse the overlay mechanism).
