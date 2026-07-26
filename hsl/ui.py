@@ -114,6 +114,18 @@ class QueueBridge(QObject):
         getattr(self, event).emit(*args)
 
 
+# Severity colours for the scene status line. It used to be fixed at
+# `palette(mid)` for its whole life, so the messages that matter most — missing
+# textures, volumes that will bake tens of GB on export — were drawn in the same
+# dim grey as the idle placeholder, and were unreadable on a dark theme.
+_STATUS_STYLES = {
+    "muted": "color: palette(mid);",
+    "info": "color: palette(text);",
+    "warning": "color: #FF9800; font-weight: bold;",
+    "error": "color: #F44336; font-weight: bold;",
+}
+
+
 # --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
@@ -142,6 +154,17 @@ class LauncherWindow(QMainWindow):
     def _engine(self) -> str:
         """The selected render engine token — "hython" (default) or "husk"."""
         return self.engine_combo.currentData() or husk_mod.DEFAULT_ENGINE
+
+    def _set_status(self, text: str, level: str = "info") -> None:
+        """Set the scene status line and colour it by severity.
+
+        Always go through here rather than touching ``status_label`` directly:
+        the colour is part of the message, and one left over from a previous
+        state is misleading.
+        """
+        self.status_label.setStyleSheet(
+            _STATUS_STYLES.get(level, _STATUS_STYLES["info"]))
+        self.status_label.setText(text)
 
     def _populate_hython_options(self) -> None:
         self.hython_combo.blockSignals(True)
@@ -216,8 +239,9 @@ class LauncherWindow(QMainWindow):
         opts_row.addWidget(self.flatten_check)
         opts_row.addStretch(1)
         self.status_label = QLabel("No scene read yet.")
-        self.status_label.setStyleSheet("color: palette(mid);")
-        opts_row.addWidget(self.status_label)
+        self.status_label.setStyleSheet(_STATUS_STYLES["muted"])
+        self.status_label.setWordWrap(True)
+        opts_row.addWidget(self.status_label, 1)
         outer.addLayout(opts_row)
 
         # --- middle splitter ---
@@ -506,7 +530,7 @@ class LauncherWindow(QMainWindow):
             index = self.hython_combo.findData(current)
             if index >= 0:
                 self.hython_combo.setCurrentIndex(index)
-        self.status_label.setText(
+        self._set_status(
             f"Found {found} Houdini install(s)." if found
             else "No Houdini installs found — set $HFS or browse to hython.")
 
@@ -618,7 +642,7 @@ class LauncherWindow(QMainWindow):
     def read_scene(self, force_reload: bool = False) -> None:
         hip_path = self.hip_edit.text().strip()
         if not hip_path:
-            self.status_label.setText("Choose a .hip file first.")
+            self._set_status("Choose a .hip file first.", "warning")
             return
         if not os.path.isfile(hip_path):
             QMessageBox.warning(self, "Scene not found",
@@ -629,11 +653,11 @@ class LauncherWindow(QMainWindow):
             cached = bridge.load_cached(hip_path)
             if cached:
                 self.on_scene_read(cached)
-                self.status_label.setText(f"Loaded cached manifest for {os.path.basename(hip_path)} (Instant).")
+                self._set_status(f"Loaded cached manifest for {os.path.basename(hip_path)} (Instant).")
                 return
 
         self.read_btn.setEnabled(False)
-        self.status_label.setText("Reading scene in hython. Large scenes take a while…")
+        self._set_status("Reading scene in hython. Large scenes take a while…")
 
         self._thread = QThread(self)
         self._worker = InspectWorker(
@@ -692,6 +716,8 @@ class LauncherWindow(QMainWindow):
             self.renderer_combo.setCurrentText(current)
 
         found = f"{len(manifest.rops)} ROP(s), {len(manifest.settings)} render settings prim(s)"
+        # Anything worth a ⚠ colours the whole line, so it reads as a warning.
+        level = "warning" if (manifest.missing_assets or manifest.live_volumes) else "info"
         if manifest.missing_assets:
             found += f" — ⚠ {len(manifest.missing_assets)} missing texture(s), use Relink"
         if manifest.live_volumes:
@@ -699,7 +725,7 @@ class LauncherWindow(QMainWindow):
                       f"prefer Hython engine")
         if manifest.warnings:
             found += f" — {len(manifest.warnings)} warning(s)"
-        self.status_label.setText(found)
+        self._set_status(found, level)
 
         self._set_scene_loaded(bool(manifest.rops))
         if manifest.rops:
@@ -714,7 +740,7 @@ class LauncherWindow(QMainWindow):
     @Slot(str)
     def on_scene_failed(self, message: str) -> None:
         self.read_btn.setEnabled(True)
-        self.status_label.setText("Reading the scene failed.")
+        self._set_status("Reading the scene failed.", "error")
         QMessageBox.critical(self, "Could not read the scene", message[-4000:])
 
     # -- ROP selection ----------------------------------------------------
@@ -903,7 +929,7 @@ class LauncherWindow(QMainWindow):
     @Slot()
     def copy_command(self) -> None:
         QApplication.clipboard().setText(self.command_view.toPlainText())
-        self.status_label.setText("Command copied.")
+        self._set_status("Command copied.")
 
     # -- assets & output --------------------------------------------------
 
@@ -939,7 +965,7 @@ class LauncherWindow(QMainWindow):
             return
 
         self.relink_btn.setEnabled(False)
-        self.status_label.setText("Relinking textures in hython…")
+        self._set_status("Relinking textures in hython…")
         self._relink_thread = QThread(self)
         self._relink_worker = RelinkWorker(base, [folder],
                                            hython=self.hython_edit.text().strip())
@@ -966,7 +992,7 @@ class LauncherWindow(QMainWindow):
             self.manifest.missing_assets = [
                 a for a in self.manifest.missing_assets if a.asset_path not in done]
         msg = f"Relinked {len(relinked)} texture(s); {len(still)} still missing."
-        self.status_label.setText(msg)
+        self._set_status(msg, "warning" if still else "info")
         if still:
             QMessageBox.warning(
                 self, "Some textures still missing",
@@ -976,7 +1002,7 @@ class LauncherWindow(QMainWindow):
     @Slot(str)
     def _on_relink_failed(self, message: str) -> None:
         self.relink_btn.setEnabled(True)
-        self.status_label.setText("Relink failed.")
+        self._set_status("Relink failed.", "error")
         QMessageBox.critical(self, "Could not relink textures", message[-4000:])
 
     # -- rendering --------------------------------------------------------
@@ -1009,7 +1035,7 @@ class LauncherWindow(QMainWindow):
         keep = self._selected_aov_paths() if engine == "husk" else None
         if keep is not None:
             self.render_btn.setEnabled(False)
-            self.status_label.setText("Filtering AOVs in hython…")
+            self._set_status("Filtering AOVs in hython…")
             self._filter_thread = QThread(self)
             self._filter_worker = FilterWorker(
                 self._base_usd(self.current_rop()), keep,
@@ -1036,7 +1062,7 @@ class LauncherWindow(QMainWindow):
     @Slot(str)
     def _on_filter_failed(self, message: str) -> None:
         self.render_btn.setEnabled(True)
-        self.status_label.setText("AOV filtering failed.")
+        self._set_status("AOV filtering failed.", "error")
         QMessageBox.critical(self, "Could not filter AOVs", message[-4000:])
 
     def _launch_queue(self, jobs: list) -> None:
@@ -1057,14 +1083,14 @@ class LauncherWindow(QMainWindow):
 
         self.render_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self.status_label.setText(f"Rendering {len(jobs)} chunk(s).")
+        self._set_status(f"Rendering {len(jobs)} chunk(s).")
         self.queue.start()
 
     @Slot()
     def cancel_render(self) -> None:
         if self.queue:
             self.queue.cancel()
-            self.status_label.setText("Cancelling…")
+            self._set_status("Cancelling…")
 
     def _populate_task_table(self) -> None:
         self.task_table.setRowCount(len(self.tasks))
@@ -1119,9 +1145,9 @@ class LauncherWindow(QMainWindow):
         done = sum(1 for t in queue.tasks if t.state is State.DONE)
         self.overall_bar.setValue(100)
         if failed:
-            self.status_label.setText(f"{done} chunk(s) rendered, {failed} failed.")
+            self._set_status(f"{done} chunk(s) rendered, {failed} failed.", "error")
         else:
-            self.status_label.setText(f"{done} chunk(s) rendered.")
+            self._set_status(f"{done} chunk(s) rendered.")
 
 
 def main(argv=None) -> int:
