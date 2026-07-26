@@ -311,6 +311,61 @@ def override_output(usd_in: str, output: str, *, hython: str = "",
     return usd_out
 
 
+def override_settings(usd_in: str, overrides: dict, *, hython: str = "",
+                      usd_out: str = "", settings_prim: str = "",
+                      timeout: float = 300.0,
+                      env: Optional[dict] = None) -> dict:
+    """Return a USD whose render-settings attributes carry ``overrides``.
+
+    husk has no flag for arbitrary ``karma:*`` knobs — they are USD attributes,
+    so this runs :func:`hsl.inspector.override_render_settings` under hython to
+    author an overlay. Raises :class:`InspectError` rather than falling back to
+    the unmodified USD, so a dropped override never turns into a render that
+    quietly ignored it.
+    """
+    if not usd_in or not overrides:
+        return {"usd_out": usd_in, "applied": [], "skipped": []}
+
+    hython_exe = find_hython(hython)
+    if not hython_exe:
+        raise InspectError(
+            "Could not find hython to override render settings. Set $HFS or pass a path.")
+
+    if not usd_out:
+        base, ext = os.path.splitext(usd_in)
+        usd_out = base + ".settings" + (ext or ".usd")
+
+    cmd = [hython_exe, "-m", "hsl.inspector", "--override-settings",
+           "--usd-in", usd_in, "--usd-out", usd_out]
+    if settings_prim:
+        cmd += ["--rop", settings_prim]
+    for key, value in overrides.items():
+        cmd += ["--set", f"{key}={value}"]
+
+    run_env = dict(env or os.environ)
+    root = _package_root()
+    existing = run_env.get("PYTHONPATH", "")
+    run_env["PYTHONPATH"] = (root + os.pathsep + existing) if existing else root
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, env=run_env)
+    except subprocess.SubprocessError as exc:
+        raise InspectError(f"Render-setting override failed to run under hython: {exc}")
+
+    marker = "@@HSL_SETTINGS@@"
+    for line in reversed(proc.stdout.splitlines()):
+        index = line.find(marker)
+        if index != -1:
+            try:
+                return json.loads(line[index + len(marker):])
+            except ValueError:
+                break
+    raise InspectError(
+        "Render-setting override produced no result.\n"
+        f"exit code: {proc.returncode}\n{proc.stderr[-2000:]}")
+
+
 def relink_assets(usd_in: str, search_dirs, *, hython: str = "",
                   usd_out: str = "", timeout: float = 600.0,
                   env: Optional[dict] = None) -> dict:

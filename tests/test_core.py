@@ -751,6 +751,54 @@ class TestExportNarrowing(unittest.TestCase):
         self.assertIsNone(self.captured["export_frames"])
 
 
+class TestSettingOverrides(unittest.TestCase):
+    """Karma knobs are USD attributes — husk has no flag for them."""
+
+    def test_parses_key_value(self):
+        self.assertEqual(
+            husk_mod.parse_setting_args(["karma:global:samplesperpixel=64"]),
+            {"karma:global:samplesperpixel": "64"})
+
+    def test_value_may_contain_equals(self):
+        self.assertEqual(husk_mod.parse_setting_args(["k=a=b"]), {"k": "a=b"})
+
+    def test_missing_equals_is_rejected(self):
+        with self.assertRaises(ValueError):
+            husk_mod.parse_setting_args(["karma:global:samplesperpixel"])
+
+    def test_empty_key_is_rejected(self):
+        with self.assertRaises(ValueError):
+            husk_mod.parse_setting_args(["=64"])
+
+    def test_reaches_the_hython_command(self):
+        m = sample_manifest()
+        job = jobs_for_rop(m, m.rops[0], "", engine="hython",
+                           settings_overrides={"karma:global:samplesperpixel": "64"})[0]
+        cmd = build_command(job)
+        self.assertEqual(cmd[cmd.index("--set") + 1],
+                         "karma:global:samplesperpixel=64")
+
+    def test_husk_command_never_gets_set_flags(self):
+        # husk would reject an unknown option; the overlay carries these instead.
+        m = sample_manifest()
+        job = jobs_for_rop(m, m.rops[0], "/tmp/s.usd", engine="husk",
+                           settings_overrides={"karma:global:samplesperpixel": "64"})[0]
+        self.assertNotIn("--set", build_command(job))
+
+    def test_set_does_not_clobber_the_settings_prim_argument(self):
+        args = build_parser().parse_args(
+            ["render", "s.hip", "--settings", "/Render/rs", "--set", "k=1"])
+        self.assertEqual(args.settings, "/Render/rs")
+        self.assertEqual(args.setting_overrides, ["k=1"])
+
+    def test_malformed_set_is_rejected_before_loading_the_scene(self):
+        args = build_parser().parse_args(["render", "s.hip", "--set", "nonsense"])
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cmd_render(args)
+        self.assertEqual(code, 4)
+        self.assertIn("KEY=VALUE", err.getvalue())
+
+
 class TestPlannedOutputs(unittest.TestCase):
     """The filename preview must match what the overlay actually authors."""
 

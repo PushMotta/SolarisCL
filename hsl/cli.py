@@ -188,6 +188,15 @@ def cmd_render(args) -> int:
             "  → add --engine husk to use it, or drop it to render with hython.\n")
         return 4
 
+    # Parsed before the scene loads: a malformed --set should not cost a
+    # Houdini launch to discover.
+    try:
+        settings_overrides = husk_mod.parse_setting_args(
+            getattr(args, "setting_overrides", []))
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 4
+
     export_usd = (engine == "husk")
     allow_volume_bake = getattr(args, "allow_volume_bake", False)
     # Reuse a cached scene read when there is nothing to export — that skips a
@@ -301,6 +310,24 @@ def cmd_render(args) -> int:
             sys.stderr.write(f"{exc}\n")
             return 3
 
+    # Karma knobs are USD attributes, not husk flags. On husk they go into an
+    # overlay now; on hython render_direct sublayers them at render start.
+    if engine == "husk" and settings_overrides and not args.dry_run:
+        try:
+            result = bridge.override_settings(usd_for_render, settings_overrides,
+                                              hython=args.hython,
+                                              settings_prim=args.settings or "")
+        except bridge.InspectError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 3
+        if result.get("usd_out"):
+            usd_for_render = result["usd_out"]
+        for entry in result.get("applied", []):
+            sys.stderr.write(f"  {entry['key']}: {entry['old']!r} -> {entry['new']!r}\n")
+        if result.get("skipped"):
+            for entry in result["skipped"]:
+                sys.stderr.write(f"  skipped {entry['key']}: {entry['why']}\n")
+
     # husk -o redirects only the FIRST product, so on a multi-product shot the
     # crypto/depth passes would quietly keep writing where the scene pointed
     # them. Redirect them all in USD instead. One product needs no overlay --
@@ -337,6 +364,7 @@ def cmd_render(args) -> int:
         # hython repaths inside the LOP network at render time; the husk path
         # already relinked the exported USD above, so it needs nothing here.
         relink_dirs=(args.relink_from or None) if engine == "hython" else None,
+        settings_overrides=(settings_overrides or None) if engine == "hython" else None,
         extra_args=args.extra or None,
     )
 
@@ -461,6 +489,14 @@ def build_parser() -> argparse.ArgumentParser:
                                "Others are dropped from the USD products (husk only)")
     p_render.add_argument("--relink-from", action="append", default=[], metavar="DIR",
                           help="Search DIR for missing textures and repath them "
+                               "(repeatable; works on both engines)")
+    # NB: dest is deliberately not "settings" — that is already --settings, the
+    # RenderSettings prim path, and reusing it would silently clobber it.
+    p_render.add_argument("--set", action="append", default=[],
+                          dest="setting_overrides", metavar="KEY=VALUE",
+                          help="Override a render-settings attribute, e.g. "
+                               "karma:global:samplesperpixel=64. husk has no flag "
+                               "for these, so they are authored as a USD overlay "
                                "(repeatable; works on both engines)")
     p_render.add_argument("--allow-volume-bake", action="store_true",
                           help="Export live (SOP-imported) volumes to USD even though "

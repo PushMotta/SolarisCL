@@ -192,6 +192,10 @@ class RenderJob:
     # Directories to search for unresolved assets (hython engine only -- the
     # husk path relinks the exported USD before the job is ever built).
     relink_dirs: list[str] = field(default_factory=list)
+    # Render-settings attributes to override, e.g.
+    # {"karma:global:samplesperpixel": "64"} (hython engine only -- the husk
+    # path authors them into the USD before the job is built).
+    settings_overrides: dict = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -223,6 +227,8 @@ def build_command(job: RenderJob) -> list[str]:
             cmd += ["--res", str(job.resolution[0]), str(job.resolution[1])]
         for directory in job.relink_dirs:
             cmd += ["--search", directory]
+        for key, value in job.settings_overrides.items():
+            cmd += ["--set", f"{key}={value}"]
         cmd += list(job.extra_args)
         return cmd
 
@@ -359,6 +365,25 @@ def expand_frame_token(path: str, frame: int, index: Optional[int] = None) -> st
 def has_unexpanded_tokens(path: str) -> bool:
     """True if ``path`` still holds a token, i.e. it is not a real filename yet."""
     return bool(_UNEXPANDED.search(path))
+
+
+def parse_setting_args(items) -> dict:
+    """Turn ``["karma:global:samplesperpixel=64", …]`` into a dict.
+
+    Values stay strings: only the stage knows what type a knob is, so the
+    conversion happens there (``inspector._coerce_setting``) rather than being
+    guessed from how the text looks.
+    """
+    settings: dict = {}
+    for item in items or []:
+        key, sep, value = str(item).partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(
+                f"Cannot read {item!r} as a setting. Use KEY=VALUE, e.g. "
+                f"karma:global:samplesperpixel=64.")
+        settings[key] = value.strip()
+    return settings
 
 
 def planned_product_paths(products, output: str) -> list:

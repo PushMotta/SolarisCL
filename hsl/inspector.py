@@ -26,7 +26,7 @@ from .manifest import (
 )
 # Plain-Python, no Houdini: the output-naming rule, shared with the UI/CLI
 # preview so the two can never disagree about where a render lands.
-from .husk import planned_product_paths
+from .husk import parse_setting_args as _parse_settings, planned_product_paths
 
 try:
     import hou
@@ -653,6 +653,154 @@ def _basename_index(search_dirs) -> dict:
     return index
 
 
+def _coerce_setting(text, current):
+    """Turn a command-line string into the type the attribute already holds.
+
+    USD attributes are typed, and husk has no flag to set them, so these are
+    authored by hand -- which makes the type our problem. Writing an int knob
+    as a string is exactly the silently-wrong edit this project refuses, so the
+    type is taken from the value already on the stage rather than guessed from
+    how the text looks ("1" is a perfectly good int, float, bool or string).
+    """
+    if not isinstance(text, str):
+        return text
+    if isinstance(current, bool):          # before int: bool is an int subclass
+        lowered = text.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(f"expected a true/false value, got {text!r}")
+    if isinstance(current, int):
+        return int(text)
+    if isinstance(current, float):
+        return float(text)
+    if isinstance(current, str):
+        return text
+    raise ValueError(f"cannot set a {type(current).__name__} from the command line")
+
+
+def _author_settings_opinions(stage, overrides: dict, layer,
+                              settings_prim: str = "",
+                              warnings: Optional[list] = None) -> dict:
+    """Author ``over`` opinions for render-settings attributes onto ``layer``.
+
+    Works for either engine: husk gets a layer that sublayers the exported USD,
+    hython gets a standalone layer sublayered into the LOP network. Only
+    attributes that already exist on the settings prim can be set -- an absent
+    one has no discoverable type, and inventing it would author a knob the
+    delegate may not read. Those are reported, not guessed.
+    """
+    warnings = warnings if warnings is not None else []
+    applied: list = []
+    skipped: list = []
+
+    targets = [p for p in stage.Traverse() if p.IsA(UsdRender.Settings)]
+    if settings_prim:
+        targets = [p for p in targets if str(p.GetPath()) == settings_prim]
+    if not targets:
+        warnings.append(
+            f"No UsdRenderSettings prim{' at ' + settings_prim if settings_prim else ''} "
+            f"to override.")
+        return {"applied": applied, "skipped": skipped}
+
+    for prim in targets:
+        for key, raw in overrides.items():
+            attr = prim.GetAttribute(key)
+            if not attr:
+                skipped.append({"key": key, "why": "not present on this settings prim"})
+                continue
+            current = attr.Get()
+            if current is None:
+                skipped.append({"key": key, "why": "has no value to take a type from"})
+                continue
+            try:
+                value = _coerce_setting(raw, current)
+            except (ValueError, TypeError) as exc:
+                skipped.append({"key": key, "why": str(exc)})
+                continue
+
+            prim_path = prim.GetPath()
+            Sdf.CreatePrimInLayer(layer, prim_path)
+            prim_spec = layer.GetPrimAtPath(prim_path)
+            prim_spec.specifier = Sdf.SpecifierOver
+            attr_spec = layer.GetAttributeAtPath(attr.GetPath())
+            if attr_spec is None:
+                attr_spec = Sdf.AttributeSpec(prim_spec, key, attr.GetTypeName())
+            attr_spec.default = value
+            applied.append({"prim": str(prim_path), "key": key,
+                            "old": current, "new": value})
+
+    for entry in skipped:
+        warnings.append(f"Render setting {entry['key']}: {entry['why']}.")
+    return {"applied": applied, "skipped": skipped}
+
+
+def override_render_settings(usd_in: str, usd_out: str, overrides: dict,
+                             settings_prim: str = "",
+                             warnings: Optional[list] = None) -> dict:
+    """Overlay over ``usd_in`` that changes render-settings attributes.
+
+    husk exposes only a fixed handful of overrides (``--camera``, ``--output``,
+    ``--res``, ``--complexity`` …) and has **no** flag to set an arbitrary
+    ``karma:*`` knob. They are ordinary USD attributes on the settings prim, so
+    they are set the same way the AOV filter and the output redirect are: a thin
+    overlay husk renders in place of the raw export.
+    """
+    warnings = warnings if warnings is not None else []
+    if Usd is None or Sdf is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+    if not overrides:
+        return {"usd_out": "", "applied": [], "skipped": []}
+
+    os.makedirs(os.path.dirname(os.path.abspath(usd_out)) or ".", exist_ok=True)
+    if os.path.exists(usd_out):
+        os.remove(usd_out)
+
+    overlay = Sdf.Layer.CreateNew(usd_out)
+    sub_rel = os.path.relpath(os.path.abspath(usd_in),
+                              os.path.dirname(os.path.abspath(usd_out)))
+    overlay.subLayerPaths.append(sub_rel.replace(os.sep, "/"))
+
+    stage = Usd.Stage.Open(overlay)
+    if stage is None:
+        warnings.append(f"Render-setting override: could not open {usd_in}")
+        return {"usd_out": "", "applied": [], "skipped": []}
+
+    result = _author_settings_opinions(stage, overrides, overlay,
+                                       settings_prim, warnings)
+    overlay.Save()
+    result["usd_out"] = usd_out if (os.path.exists(usd_out) and result["applied"]) else ""
+    return result
+
+
+def author_settings_overlay(stage, overrides: dict, out_path: str,
+                            settings_prim: str = "",
+                            warnings: Optional[list] = None) -> dict:
+    """Standalone render-settings overlay for a **live** stage (hython engine).
+
+    Same idea as :func:`author_relink_overlay`: ``render_direct`` has no
+    exported USD to overlay, so the opinions go into their own layer and a
+    Sublayer LOP composes them into the network.
+    """
+    warnings = warnings if warnings is not None else []
+    if Usd is None or Sdf is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+    if not overrides:
+        return {"out": "", "applied": [], "skipped": []}
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    layer = Sdf.Layer.CreateNew(out_path)
+    result = _author_settings_opinions(stage, overrides, layer,
+                                       settings_prim, warnings)
+    layer.Save()
+    result["out"] = out_path if (os.path.exists(out_path) and result["applied"]) else ""
+    return result
+
+
 def _author_asset_opinion(layer, attr, value_type, value) -> None:
     """Write a single ``over`` opinion for ``attr`` into ``layer``."""
     prim_path = attr.GetPath().GetPrimPath()
@@ -945,6 +1093,36 @@ def inspect(hip_path: str, export: bool = False,
     return manifest
 
 
+def _sublayer_into_network(target_rop, layer_path: str, name: str,
+                           warnings: list) -> bool:
+    """Compose ``layer_path`` into the ROP's input with a Sublayer LOP.
+
+    A Sublayer LOP's file sits **stronger** than the incoming stage (verified on
+    22.0.368), which is what makes this work: the overlay's opinions win over
+    the scene's. A weaker one would leave the original values in place and the
+    render would look fine while ignoring every override.
+    """
+    inputs = [n for n in target_rop.inputs() if n is not None]
+    if not inputs:
+        warnings.append(
+            f"{target_rop.path()}: has no input LOP, so the {name} overlay "
+            f"could not be composed in.")
+        return False
+
+    sub = target_rop.parent().createNode("sublayer", name)
+    if not _set_parm(sub, "filepath1", layer_path):
+        warnings.append(f"Sublayer LOP has no 'filepath1' parameter; {name} skipped.")
+        try:
+            sub.destroy()
+        except Exception:
+            pass
+        return False
+
+    sub.setInput(0, inputs[0])
+    target_rop.setInput(0, sub)
+    return True
+
+
 def _insert_relink_layer(target_rop, search_dirs, warnings: list) -> int:
     """Repath the ROP's unresolved assets by sublayering a relink overlay in.
 
@@ -962,24 +1140,8 @@ def _insert_relink_layer(target_rop, search_dirs, warnings: list) -> int:
     if not result["out"] or not result["relinked"]:
         return 0
 
-    inputs = [n for n in target_rop.inputs() if n is not None]
-    if not inputs:
-        warnings.append(
-            f"{target_rop.path()}: has no input LOP, so the relink overlay "
-            f"could not be composed in.")
+    if not _sublayer_into_network(target_rop, result["out"], "hsl_relink", warnings):
         return 0
-
-    sub = target_rop.parent().createNode("sublayer", "hsl_relink")
-    if not _set_parm(sub, "filepath1", result["out"]):
-        warnings.append("Sublayer LOP has no 'filepath1' parameter; relink skipped.")
-        try:
-            sub.destroy()
-        except Exception:
-            pass
-        return 0
-
-    sub.setInput(0, inputs[0])
-    target_rop.setInput(0, sub)
     if result["still_missing"]:
         warnings.append(f"{len(result['still_missing'])} asset(s) are still "
                         f"unresolved after the relink.")
@@ -989,7 +1151,7 @@ def _insert_relink_layer(target_rop, search_dirs, warnings: list) -> int:
 def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] = None,
                   frame_count: int = 1, frame_inc: int = 1, renderer: str = "",
                   camera: str = "", output: str = "", res: Optional[tuple[int, int]] = None,
-                  relink_from=None) -> int:
+                  relink_from=None, settings_overrides: Optional[dict] = None) -> int:
     """Render a LOP ROP directly in hython without exporting USD to disk.
 
     This is the default engine (``husk.DEFAULT_ENGINE``), so its progress
@@ -1026,6 +1188,30 @@ def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] 
         for message in relink_warnings:
             sys.stderr.write(f"warning: {message}\n")
         sys.stderr.write(f"Relinked {count} asset(s) into the LOP network.\n")
+        sys.stderr.flush()
+
+    # Karma knobs are USD attributes on the settings prim, so they are overridden
+    # the same way — an overlay sublayered into the network. husk has no flag for
+    # these either; this is the only route on both engines.
+    if settings_overrides:
+        setting_warnings: list[str] = []
+        stage, _lop = stage_for(target_rop, setting_warnings)
+        if stage is None:
+            setting_warnings.append("no stage to apply render-setting overrides to.")
+        else:
+            overlay_path = os.path.join(tempfile.gettempdir(), "hsl",
+                                        "settings_direct.usda")
+            result = author_settings_overlay(stage, settings_overrides, overlay_path,
+                                             warnings=setting_warnings)
+            if result["out"] and _sublayer_into_network(
+                    target_rop, result["out"], "hsl_settings", setting_warnings):
+                for entry in result["applied"]:
+                    sys.stderr.write(f"  {entry['key']}: {entry['old']!r} -> "
+                                     f"{entry['new']!r}\n")
+                sys.stderr.write(f"Applied {len(result['applied'])} render-setting "
+                                 f"override(s).\n")
+        for message in setting_warnings:
+            sys.stderr.write(f"warning: {message}\n")
         sys.stderr.flush()
 
     # Every override reports whether it actually landed. `resolutionx` /
@@ -1118,6 +1304,12 @@ def main(argv=None) -> int:
     parser.add_argument("--usd-out", default="", help="Overlay USD to write")
     parser.add_argument("--keep", default="",
                         help="Comma-separated RenderVar prim paths to keep")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        dest="settings",
+                        help="Override a render-settings attribute, e.g. "
+                             "karma:global:samplesperpixel=64 (repeatable)")
+    parser.add_argument("--override-settings", action="store_true",
+                        help="Write an overlay applying --set to --usd-in")
     parser.add_argument("--override-output", default="",
                         help="Author an overlay redirecting every RenderProduct "
                              "to this file or directory (husk -o only moves the first)")
@@ -1137,6 +1329,20 @@ def main(argv=None) -> int:
             return 1
         sys.stdout.write(out + "\n")
         return 0
+
+    settings_overrides = _parse_settings(args.settings)
+
+    if args.override_settings:
+        warnings: list[str] = []
+        result = override_render_settings(args.usd_in, args.usd_out,
+                                          settings_overrides,
+                                          settings_prim=args.rop, warnings=warnings)
+        for warning in warnings:
+            sys.stderr.write(f"{warning}\n")
+        # Sentinel-tagged so the caller finds it past any Houdini banners.
+        sys.stdout.write("@@HSL_SETTINGS@@" + json.dumps(result) + "\n")
+        sys.stdout.flush()
+        return 0 if result.get("usd_out") else 1
 
     if args.override_output:
         warnings: list[str] = []
@@ -1164,7 +1370,8 @@ def main(argv=None) -> int:
                              frame_count=args.frame_count, frame_inc=args.frame_inc,
                              renderer=args.renderer, camera=args.camera,
                              output=args.output, res=res,
-                             relink_from=args.search or None)
+                             relink_from=args.search or None,
+                             settings_overrides=settings_overrides or None)
 
     try:
         manifest = inspect(args.hip, export=args.export_usd,

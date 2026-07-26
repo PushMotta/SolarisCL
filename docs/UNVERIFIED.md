@@ -198,6 +198,44 @@ a thin overlay that sublayers the export and overrides each product's
 product left `orderedVars = [C, depth]` in the flattened composition, the other
 product untouched.
 
+### Overriding Karma render settings  ·  `OK` (22, real scene)
+
+**husk cannot do this.** Its `Render Settings Overrides` section is a fixed,
+short list — `--camera`, `--output`, `--res`, `--res-scale`, `--pixel-aspect`,
+`--make-output-path`, `--disable-disk-check`, `--extra-metadata` — plus a few
+Karma-specific ones (`--karma-percent-of-samples`, `--convergence-mode`,
+`--disable-motionblur`, `--complexity`, `--purpose`) and `--settings` /
+`--list-settings` to choose *which* settings prim. There is **no** flag to set
+an arbitrary `karma:*` knob. Checked against `husk --help`; do not add one.
+
+They are ordinary USD attributes on the RenderSettings prim, so they are set
+the same way everything else here is — an overlay. Both engines are covered by
+one implementation: `override_render_settings()` sublayers the exported USD for
+husk, `author_settings_overlay()` + a Sublayer LOP composes into the network for
+hython.
+
+**Types come from the stage, never from the text.** `"1"` is a perfectly good
+int, float, bool or string, so `_coerce_setting()` reads the value already on
+the attribute and converts to *that* type. A knob that is not already present
+has no discoverable type and is **refused** — inventing it would author
+something the delegate may never read.
+
+**Verified on `SHOT_SandBurst_ROCHA_v14` (22.0.368).** The settings prim carries
+**113** `karma:*` / `husk:*` attributes (the earlier note said ~90). One of each
+type was overridden through the hython path and read back off the re-cooked
+stage:
+
+| knob | type | before → after | type preserved |
+|---|---|---|---|
+| `husk:default_delegate` | str | `BRAY_HdKarmaXPU` → `BRAY_HdKarmaXPU_hsl` | yes |
+| `husk:scene_lights` | bool | `True` → `False` | yes |
+| `karma:global:bucketsize` | int | `32` → `39` | yes |
+| `karma:global:cacheratio` | float | `0.25` → `0.75` | yes |
+
+A deliberately bogus `karma:global:definitelynotareal_knob` was reported as "not
+present on this settings prim" rather than authored. The ROP's input became
+`/stage/hsl_settings`, confirming the Sublayer composition.
+
 ### Relinking on the hython engine  ·  `OK` (22, real scene)
 
 The husk path relinks by overlaying the *exported* USD. `render_direct` has no
@@ -318,6 +356,7 @@ destinations are reported as a warning rather than silently overwriting.
 | E-OUT | `override_product_paths` redirects every product | 22.0.368 | 2026-07-26 | file + directory mode; `$F4` preserved; empty `productName` falls back to prim name; source untouched |
 | G1–G3 | Sublayer LOP exists, composes stronger, parm is `filepath1` | 22.0.368 | 2026-07-26 | `layer` is not a type; downstream file's opinion wins |
 | G-RELINK | hython-engine relink on the real shot | 22.0.368 | 2026-07-26 | SandBurst: 4 unresolved → **0** after relink; ROP input rewired to `/stage/hsl_relink` |
+| H-SET | arbitrary `karma:*` / `husk:*` overrides via overlay | 22.0.368 | 2026-07-26 | 113 knobs present; str/bool/int/float each overridden and read back with its type intact; unknown knob refused |
 | E1–E14 | every flag `build_command()` emits | 21.0.729, 22.0.368 | 2026-07-24 | via `husk --help`; `ALF_PROGRESS` literal wants a live render |
 | E-AOV | husk has no AOV flag; selection is USD `orderedVars`; overlay filter works | 22.0.368 | 2026-07-24 | `filter_usd_aovs` verified: dropping a var left the right `orderedVars` |
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |
