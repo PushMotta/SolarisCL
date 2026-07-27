@@ -35,6 +35,10 @@ farm submission.
 
 ## Install
 
+> Handing hsl to someone who just wants to *run* it? Point them at
+> [`INSTALL.md`](INSTALL.md) and a zip from `make release` — this section
+> assumes you are working on the source.
+
 ```bash
 export HFS=/opt/hfs20.5          # or: cd /opt/hfs20.5 && source houdini_setup
 pip install PySide6              # GUI only; the CLI has no dependencies
@@ -176,7 +180,7 @@ On Indie, husk is capped at 1920×1080.
 ## Verified vs. not
 
 The manifest, chunking, command construction, progress parsing and the process
-queue are covered by 46 tests, including a fake husk that exercises the full
+queue are covered by 139 tests, including a fake husk that exercises the full
 run/cancel/failure path:
 
 ```bash

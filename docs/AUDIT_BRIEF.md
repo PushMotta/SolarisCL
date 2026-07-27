@@ -52,10 +52,10 @@ Do not spend the audit re-discovering these; they are logged:
 | `presets.py` | 95 | **2 tests** | medium — barely checked |
 | `cli.py` | 481 | partial | medium |
 | `bridge.py` | 362 | partial — subprocess paths mostly unexercised | **high** |
-| `inspector.py` | 1201 | **none** (needs Houdini) | **high** |
+| `inspector.py` | 1201 | 3 mocked overlay-path tests; no live Houdini coverage | **high** |
 | `ui.py` | 1255 | **import-check only** | **high** |
 
-`tests/test_core.py` has 132 tests in 24 classes and must stay green without
+`tests/test_core.py` has 139 tests in 26 classes and must stay green without
 Houdini installed.
 
 ### The single biggest gap
@@ -130,14 +130,11 @@ Judge these on merit; some may be deliberate omissions.
 - **Cancel** mid-render on both engines: does hython actually die, and do child
   processes go with it? `runner._terminate` uses `CTRL_BREAK_EVENT` on Windows.
 - A **read-only or full output directory**.
-- Two `hsl` instances rendering at once. **This is a known bug, not a
-  hypothetical** — `inspector._insert_relink_layer` and `render_direct` write
-  their overlays to *fixed* paths, `%TEMP%\hsl\relink_direct.usda` and
-  `%TEMP%\hsl\settings_direct.usda`. Two concurrent hython renders (including
-  two chunks of the *same* job, since `--parallel` spawns several) will
-  overwrite each other's overlay. Worth confirming the blast radius and fixing
-  with a per-process or per-ROP name. Reported here rather than quietly patched
-  so it is not mistaken for intentional.
+- Two `hsl` instances rendering at once. The known fixed-path collision is now
+  addressed: `inspector._direct_overlay_path` gives relink/settings overlays a
+  PID-scoped filename, and parallel chunks run in separate hython processes.
+  Still worth exercising concurrently in real Houdini to confirm there is no
+  different shared-state failure outside those overlay files.
 - A `.hip` that fails to load, a ROP with no input LOP, a scene with zero ROPs.
 
 ---

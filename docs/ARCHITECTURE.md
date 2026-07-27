@@ -33,7 +33,7 @@ file in the project and the one to read first.
 composed stage and writes USD. Tens of seconds to minutes. It runs once, in a
 subprocess, and hands back a small JSON document.
 
-**Everything else gets to be tested.** 46 tests run with no Houdini installed,
+**Everything else gets to be tested.** 139 tests run with no Houdini installed,
 including the full husk process lifecycle against a fake binary. That is only
 possible because no module outside `inspector.py` touches `hou`.
 

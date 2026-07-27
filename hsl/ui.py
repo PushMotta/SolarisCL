@@ -11,7 +11,7 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QFont, QKeySequence
+from PySide6.QtGui import QAction, QFont, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -20,11 +20,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from . import bridge, farm, husk as husk_mod, preflight, presets
+from . import bridge, farm, husk as husk_mod, preflight, presets, resources
 from .manifest import RenderRop, SceneManifest
 from .runner import RenderQueue, State, Task
 
 MONO = "Menlo" if sys.platform == "darwin" else ("Consolas" if os.name == "nt" else "DejaVu Sans Mono")
+
+# Windows groups taskbar buttons by this string and takes the button's icon
+# from whichever app owns it. Left unset, we inherit the host interpreter's
+# identity -- so the launcher shows python.exe's icon no matter what Qt is
+# told. Any unique dotted string works; keep it stable or pinned shortcuts
+# will detach.
+APP_USER_MODEL_ID = "PushMotta.SolarisCL.Launcher"
 
 
 # --------------------------------------------------------------------------
@@ -175,6 +182,9 @@ class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Solaris Render Launcher")
+        icon = QIcon(resources.icon_path())
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         self.resize(1180, 820)
 
         self.manifest: Optional[SceneManifest] = None
@@ -1429,10 +1439,37 @@ class LauncherWindow(QMainWindow):
             self._set_status(f"{done} chunk(s) rendered.")
 
 
+def _claim_windows_taskbar_identity() -> None:
+    """Tell the Windows shell this process is its own application.
+
+    Without it the launcher is just another window belonging to python.exe (or
+    hython.exe), so the taskbar shows the interpreter's icon and groups us with
+    any other Python window. Setting the icon in Qt alone does not fix that.
+
+    Has to happen before the first window exists -- the shell reads the id when
+    the window is created, not when it is shown. Best-effort: an old shell32 or
+    a non-Windows host just means we keep the default identity.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            APP_USER_MODEL_ID
+        )
+    except (ImportError, AttributeError, OSError):
+        pass
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv if argv is None else argv)
+    _claim_windows_taskbar_identity()
     app = QApplication(argv)
     app.setApplicationName("Solaris Render Launcher")
+    icon = QIcon(resources.icon_path())
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     window = LauncherWindow()
     if len(argv) > 1 and argv[1].endswith((".hip", ".hipnc", ".hiplc")):
         window.hip_edit.setText(argv[1])

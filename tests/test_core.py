@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import stat
+import struct
 import sys
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ import unittest
 import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hsl import bridge, farm, husk as husk_mod, preflight, presets
+from hsl import bridge, farm, husk as husk_mod, inspector, preflight, presets, resources
 from hsl.bridge import (
     find_hython, list_hython_installations, load_user_settings, save_user_setting,
 )
@@ -638,6 +639,92 @@ class TestDefaultEngine(unittest.TestCase):
         self.assertEqual(cmd[-1], "/tmp/shot.usd")
 
 
+class TestDirectOverlayPaths(unittest.TestCase):
+    def _replace_inspector_attr(self, name, value):
+        original = getattr(inspector, name)
+        setattr(inspector, name, value)
+        self.addCleanup(setattr, inspector, name, original)
+
+    def _set_fake_pid(self, value):
+        original = inspector.os.getpid
+        inspector.os.getpid = lambda: value
+        self.addCleanup(setattr, inspector.os, "getpid", original)
+
+    def test_parallel_hython_processes_get_distinct_overlay_paths(self):
+        self._set_fake_pid(101)
+        first = inspector._direct_overlay_path("relink")
+        inspector.os.getpid = lambda: 202
+        second = inspector._direct_overlay_path("relink")
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(os.path.basename(first), "relink_direct_101.usda")
+        self.assertEqual(os.path.basename(second), "relink_direct_202.usda")
+
+    def test_relink_call_site_uses_process_scoped_path(self):
+        captured = {}
+        self._set_fake_pid(303)
+        self._replace_inspector_attr("stage_for", lambda *args: (object(), None))
+
+        def fake_author(stage, search_dirs, out_path, warnings):
+            captured["path"] = out_path
+            return {"out": out_path, "relinked": ["asset"], "still_missing": []}
+
+        self._replace_inspector_attr("author_relink_overlay", fake_author)
+        self._replace_inspector_attr("_sublayer_into_network",
+                                     lambda *args: True)
+
+        count = inspector._insert_relink_layer(object(), ["C:/textures"], [])
+
+        self.assertEqual(count, 1)
+        self.assertEqual(os.path.basename(captured["path"]),
+                         "relink_direct_303.usda")
+
+    def test_settings_call_site_uses_process_scoped_path(self):
+        captured = {}
+        self._set_fake_pid(404)
+
+        class FakeHipFile:
+            @staticmethod
+            def load(*args, **kwargs):
+                pass
+
+        class FakeHou:
+            Error = RuntimeError
+            hipFile = FakeHipFile()
+
+        class FakeRop:
+            def parm(self, name):
+                return None
+
+            def path(self):
+                return "/stage/render"
+
+            def render(self, *args, **kwargs):
+                pass
+
+        def fake_author(stage, overrides, out_path, warnings=None):
+            captured["path"] = out_path
+            return {"out": out_path, "applied": [], "skipped": []}
+
+        self._replace_inspector_attr("hou", FakeHou())
+        self._replace_inspector_attr("find_render_rops", lambda: [FakeRop()])
+        self._replace_inspector_attr("stage_for", lambda *args: (object(), None))
+        self._replace_inspector_attr("author_settings_overlay", fake_author)
+        self._replace_inspector_attr("_sublayer_into_network",
+                                     lambda *args: True)
+
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = inspector.render_direct(
+                "shot.hip", frame_start=1,
+                settings_overrides={"karma:global:samplesperpixel": 64},
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(os.path.basename(captured["path"]),
+                         "settings_direct_404.usda")
+
+
 class TestCliEngineGuards(unittest.TestCase):
     """--aovs / --relink-from edit the exported USD, so hython must reject them
     rather than silently ignore them."""
@@ -1095,6 +1182,66 @@ class TestFarm(unittest.TestCase):
             self.assertIn("Job -title", content)
             self.assertIn("RemoteCmd", content)
         finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestAppIcon(unittest.TestCase):
+    """The taskbar icon is an asset, not code, so the thing worth testing is
+    that it ships and that Windows can actually parse it. ``ui.py`` itself
+    stays out of here -- it needs Qt, and this suite must not."""
+
+    def _entries(self):
+        """Parse the ICO directory: [(width, height, nbytes, offset), ...]."""
+        with open(resources.icon_path(), "rb") as fh:
+            blob = fh.read()
+        reserved, kind, count = struct.unpack("<HHH", blob[:6])
+        self.assertEqual(reserved, 0)
+        self.assertEqual(kind, 1, "type 1 is an icon; 2 would be a cursor")
+        entries = []
+        for i in range(count):
+            head = blob[6 + i * 16:22 + i * 16]
+            width, height, _colors, _res, _planes, _bpp, nbytes, offset = \
+                struct.unpack("<BBBBHHII", head)
+            # The size byte is one byte wide, so 256 has to be encoded as 0.
+            entries.append((width or 256, height or 256, nbytes, offset))
+        return blob, entries
+
+    def test_icon_ships_inside_the_package(self):
+        path = resources.icon_path()
+        self.assertTrue(path, "icon_path() returned empty -- asset missing")
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(os.path.basename(path), "hsl.ico")
+        # Inside hsl/ so it survives an install, not next to the repo root.
+        self.assertEqual(os.path.basename(os.path.dirname(path)), "assets")
+
+    def test_icon_carries_the_sizes_windows_asks_for(self):
+        _blob, entries = self._entries()
+        sizes = {width for width, _h, _n, _o in entries}
+        # 16 = taskbar and title bar, 32 = alt-tab, 48 = Explorer,
+        # 256 = the large tile. A missing size gets downscaled by the shell.
+        for expected in (16, 32, 48, 256):
+            self.assertIn(expected, sizes)
+        for width, height, _n, _o in entries:
+            self.assertEqual(width, height, "icons must be square")
+
+    def test_every_entry_points_inside_the_file(self):
+        """Catches a mis-packed directory, which renders as a blank icon
+        rather than as any kind of error."""
+        blob, entries = self._entries()
+        for width, _h, nbytes, offset in entries:
+            self.assertGreater(nbytes, 0, f"{width}px entry is empty")
+            self.assertLessEqual(offset + nbytes, len(blob),
+                                 f"{width}px entry runs past the end of the file")
+
+    def test_missing_asset_reports_empty_rather_than_raising(self):
+        """A stripped install should lose its icon, not fail to launch."""
+        temp_dir = tempfile.mkdtemp()
+        original = resources.ASSET_DIR
+        resources.ASSET_DIR = temp_dir
+        try:
+            self.assertEqual(resources.icon_path(), "")
+        finally:
+            resources.ASSET_DIR = original
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 

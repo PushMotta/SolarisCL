@@ -11,8 +11,9 @@ Houdini `.hip` under **hython**, reads the render setup from the composed USD
 stage, and renders — either **directly in hython** (the default) or by exporting
 USD and driving **husk**. The plain-Python half stays testable without Houdini.
 
-- **Repo:** github.com/PushMotta/SolarisCL (private, `main`), clean and synced at
-  `5e23bad`. **132 tests green**; boundary / drift / ui-imports green.
+- **Repo:** github.com/PushMotta/SolarisCL (private, `main`), baseline commit
+  `5e23bad` plus the working-tree overlay collision fix. **139 tests green**;
+  boundary / drift / ui-imports green.
 - **Project root:** `F:\Nexus Projects\SolarisCL` — the working dir **is** the
   git root (flattened this session; it used to be nested three levels down at
   `extracted\pack\solaris_launcher`, that path is dead). The original delivery
@@ -117,11 +118,10 @@ and no farm file has been submitted to a real scheduler.
 
 ## Open work
 
-- **Known bug, introduced this session:** the hython overlays are written to
-  *fixed* paths — `%TEMP%\hsl\relink_direct.usda` and `settings_direct.usda`.
-  Two concurrent hython renders overwrite each other's overlay, and
-  `--parallel > 1` spawns exactly that. Needs a per-process or per-ROP name.
-  Left unpatched deliberately so the audit pass sees a real defect in place.
+- **Fixed after handoff:** hython relink/settings overlays are PID-scoped
+  (`relink_direct_<pid>.usda`, `settings_direct_<pid>.usda`). Parallel chunks
+  run in separate hython processes, so `--parallel > 1` no longer makes them
+  overwrite each other's live overlay.
 - **TASKS.md T5** (medium) — `inspect()` cooks at one frame, so a stage whose
   structure changes over time is described from a single moment.
 - **Per-frame export timing** was never captured (the disk filled). Safe to
@@ -138,7 +138,7 @@ and no farm file has been submitted to a real scheduler.
 ## How to run / verify
 
 ```bash
-python -m unittest discover -s tests          # 132 tests, no Houdini needed
+python -m unittest discover -s tests          # 139 tests, no Houdini needed
 python scripts/check_drift.py                 # config pointers still valid
 python scripts/check_ui_imports.py            # ui.py imports + Qt names resolve
 python scripts/verify_environment.py --report # probe a real Houdini install

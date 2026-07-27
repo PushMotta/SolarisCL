@@ -1123,6 +1123,18 @@ def _sublayer_into_network(target_rop, layer_path: str, name: str,
     return True
 
 
+def _direct_overlay_path(name: str) -> str:
+    """Return a process-scoped path for a hython-direct USD overlay.
+
+    Parallel chunks run in separate hython processes. Including the PID keeps
+    their relink/settings layers from overwriting one another while each ROP is
+    still rendering from its own overlay.
+    """
+    return os.path.join(
+        tempfile.gettempdir(), "hsl", f"{name}_direct_{os.getpid()}.usda",
+    )
+
+
 def _insert_relink_layer(target_rop, search_dirs, warnings: list) -> int:
     """Repath the ROP's unresolved assets by sublayering a relink overlay in.
 
@@ -1135,7 +1147,7 @@ def _insert_relink_layer(target_rop, search_dirs, warnings: list) -> int:
         warnings.append(f"{target_rop.path()}: no stage to relink.")
         return 0
 
-    overlay_path = os.path.join(tempfile.gettempdir(), "hsl", "relink_direct.usda")
+    overlay_path = _direct_overlay_path("relink")
     result = author_relink_overlay(stage, search_dirs, overlay_path, warnings)
     if not result["out"] or not result["relinked"]:
         return 0
@@ -1199,8 +1211,7 @@ def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] 
         if stage is None:
             setting_warnings.append("no stage to apply render-setting overrides to.")
         else:
-            overlay_path = os.path.join(tempfile.gettempdir(), "hsl",
-                                        "settings_direct.usda")
+            overlay_path = _direct_overlay_path("settings")
             result = author_settings_overlay(stage, settings_overrides, overlay_path,
                                              warnings=setting_warnings)
             if result["out"] and _sublayer_into_network(

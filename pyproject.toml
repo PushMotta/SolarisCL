@@ -11,6 +11,11 @@ gui = ["PySide6>=6.5"]
 [project.scripts]
 hsl = "hsl.cli:main"
 
+[tool.setuptools.package-data]
+# Without this the .ico is left behind by an install and the launcher falls
+# back to the interpreter's icon. Regenerate it with scripts/make_icon.py.
+hsl = ["assets/*.ico"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py39"
