@@ -372,6 +372,12 @@ destinations are reported as a warning rather than silently overwriting.
 
 ## Still unknown (do not guess)
 
+- **K10** — the **Tractor `.alf` dependency dialect**. `export_tractor_job` now
+  encodes a DAG with `-id`, `Instance {}` and `-serialsubtasks 1`, and there are
+  tests that the right structure is emitted — but no Tractor exists here to
+  accept it. Check: submit a two-task job and confirm the dependant does not
+  start until its prerequisite finishes. Deadline export *refuses* dependent
+  work rather than guessing, so it needs no equivalent check.
 - **K7** — whether `--output` on a **File Cache SOP** cook actually repoints the
   cache. `cook_task` sets the SOP's own `file` parm (the one an artist sees) and
   falls back to the inner ROP's `sopoutput`, but whether the two are linked in

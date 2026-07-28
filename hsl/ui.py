@@ -716,6 +716,28 @@ class LauncherWindow(QMainWindow):
         else:
             self.cook_hint.setText("")
 
+    def _unticked_dependencies(self, chosen) -> list:
+        """Tasks ``chosen`` needs that are in the scene but were not ticked.
+
+        Transitive: pulling in a cache may pull in whatever *it* waits on.
+        Dependencies the scene does not describe are left alone -- the queue
+        treats those as already satisfied and says so in its warnings.
+        """
+        if not self.manifest:
+            return []
+        needed, seen = [], {t.node_path for t in chosen}
+        queue = list(chosen)
+        while queue:
+            for path in queue.pop().depends_on:
+                if path in seen:
+                    continue
+                seen.add(path)
+                upstream = self.manifest.task(path)
+                if upstream is not None:
+                    needed.append(upstream)
+                    queue.append(upstream)
+        return needed
+
     @Slot()
     def cook_selected(self) -> None:
         if not self.manifest:
@@ -731,6 +753,22 @@ class LauncherWindow(QMainWindow):
         if not chosen:
             self._set_status("Tick at least one cache or simulation.", "error")
             return
+
+        extra = self._unticked_dependencies(chosen)
+        if extra:
+            names = "\n".join(f"    {t.node_path}" for t in extra)
+            answer = QMessageBox.question(
+                self, "Include what this depends on?",
+                f"The ticked work depends on {len(extra)} task(s) that are "
+                f"not ticked:\n\n{names}\n\nCooking without them reuses "
+                f"whatever is already on disk, which may be stale or missing.",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Cancel:
+                return
+            if answer == QMessageBox.Yes:
+                chosen = extra + chosen
 
         hython = self.hython_combo.currentData() or ""
         jobs = []

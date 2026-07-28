@@ -207,7 +207,7 @@ On Indie, husk is capped at 1920×1080.
 ## Verified vs. not
 
 The manifest, chunking, command construction, progress parsing and the process
-queue are covered by 177 tests, including a fake husk that exercises the full
+queue are covered by 186 tests, including a fake husk that exercises the full
 run/cancel/failure path:
 
 ```bash

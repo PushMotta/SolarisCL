@@ -202,11 +202,15 @@ class RenderJob:
     # queue behaves exactly as before unless these are set.
     task_id: str = ""
     depends_on: list[str] = field(default_factory=list)
-    # What this job cooks. Anything other than a render goes to the inspector's
-    # --cook path instead of --render-direct.
+    # What this job produces, for display and reporting.
     task_kind: str = TASK_RENDER
     # Frame N depends on N-1, so the chunk must be cooked in one ordered call.
     sequential: bool = False
+    # Route to the inspector's --cook path rather than --render-direct.
+    # Set explicitly rather than inferred from task_kind: a Mantra or OpenGL
+    # ROP is a *render* that --render-direct cannot drive, because that path
+    # resolves its node through find_render_rops() and only knows USD ones.
+    cook: bool = False
 
     @property
     def label(self) -> str:
@@ -221,7 +225,7 @@ def build_command(job: RenderJob) -> list[str]:
     if job.engine == "hython":
         from .bridge import find_hython   # lives in bridge (smart discovery)
         exe = job.hython_exe or find_hython() or "hython"
-        cooking = job.task_kind != TASK_RENDER
+        cooking = job.cook
         mode = "--cook" if cooking else "--render-direct"
         cmd: list[str] = [exe, "-m", "hsl.inspector",
                           job.hip_file or job.usd_file, mode]
@@ -382,19 +386,36 @@ def jobs_for_task(manifest: SceneManifest, task: OutputTask, *,
                   chunk_size: int = 0, **overrides) -> list[RenderJob]:
     """Build one RenderJob per frame chunk for any cookable node.
 
-    The counterpart to :func:`jobs_for_rop` for work that is not a Solaris
-    render ROP. Every chunk carries the task's identity and dependencies, so
-    the queue can order them.
+    Every chunk carries the task's identity and dependencies, so the queue can
+    order them.
 
-    Non-render kinds are pinned to the hython engine: husk consumes USD and
-    cannot cook a SOP or advance a solver. Asking for it raises rather than
-    silently falling back, which is how the CLI already treats the other
-    husk-only options.
+    A task that *is* a Solaris render ROP is handed to :func:`jobs_for_rop`
+    rather than rebuilt here. That function already resolves the renderer,
+    camera and settings prim from the composed stage; duplicating it here is
+    how those came back as bare Karma defaults, silently rendering the wrong
+    thing.
+
+    Everything else is cooked, and is pinned to the hython engine: husk only
+    consumes USD, so it can drive neither a File Cache SOP nor a Mantra ROP.
+    Asking for it raises rather than quietly falling back, which is how the CLI
+    already treats the other husk-only options.
     """
+    rop = manifest.rop(task.node_path)
+    if rop is not None:
+        jobs = jobs_for_rop(manifest, rop, rop.usd_path,
+                            chunk_size=0 if task.sequential else chunk_size,
+                            **overrides)
+        for job in jobs:
+            job.task_id = task.node_path
+            job.depends_on = list(task.depends_on)
+            job.task_kind = task.kind
+            job.sequential = task.sequential
+        return jobs
+
     engine = overrides.get("engine") or DEFAULT_ENGINE
-    if task.kind != TASK_RENDER and engine != "hython":
+    if engine != "hython":
         raise ValueError(
-            f"{task.node_path} is a '{task.kind}' task and husk cannot cook it "
+            f"{task.node_path} is a '{task.kind}' task that husk cannot run "
             f"-- husk only consumes USD. Use engine='hython'."
         )
 
@@ -407,11 +428,12 @@ def jobs_for_task(manifest: SceneManifest, task: OutputTask, *,
         "expected_outputs": list(task.outputs),
         "task_kind": task.kind,
         "sequential": task.sequential,
+        "cook": True,
     }
-    if task.kind != TASK_RENDER:
-        # A renderer name is meaningless for a cache or a solver, and
-        # RenderJob defaults it to Karma.
-        defaults["renderer"] = ""
+    # RenderJob defaults the renderer to Karma, which is meaningless for a
+    # cache, a solver or a Mantra ROP -- and the cook path does not emit it
+    # anyway. Clear it so nothing downstream reads a value we never chose.
+    defaults["renderer"] = ""
     defaults.update({k: v for k, v in overrides.items() if v is not None})
 
     return [RenderJob(chunk=chunk, **defaults)

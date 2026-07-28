@@ -118,7 +118,7 @@ are the known-dangerous ones.
 
 Tested here:
 
-- `make check` — 177 tests, boundary lint, 55 drift checks, UI import check.
+- `make check` — 186 tests, boundary lint, 55 drift checks, UI import check.
 - The hook, against 12 allow/block cases including the try/except workaround
   and false positives like `import hounddog`.
 - `check_drift.py` against deliberately broken configs (severed symlink,

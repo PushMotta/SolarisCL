@@ -1366,12 +1366,110 @@ class TestSequentialChunking(unittest.TestCase):
             jobs_for_task(manifest, self._task(kind=TASK_CACHE), engine="husk")
         self.assertIn("husk", str(ctx.exception))
 
-    def test_husk_is_still_allowed_for_a_render_task(self):
+    def test_husk_is_still_allowed_for_a_solaris_render_rop(self):
+        """husk drives USD, so it is fine for the one kind of render that has
+        an exported stage behind it."""
         manifest = SceneManifest(hip_path="/jobs/shot.hip")
-        jobs = jobs_for_task(manifest, self._task(kind=TASK_RENDER),
-                             engine="husk", chunk_size=50)
+        manifest.rops = [RenderRop(node_path="/stage/usdrender_rop1",
+                                   node_type="usdrender_rop",
+                                   frame_start=1, frame_end=100,
+                                   use_frame_range=True)]
+        task = self._task(kind=TASK_RENDER, node_path="/stage/usdrender_rop1")
+        jobs = jobs_for_task(manifest, task, engine="husk", chunk_size=50)
         self.assertEqual(len(jobs), 2)
         self.assertEqual(jobs[0].engine, "husk")
+        self.assertFalse(jobs[0].cook)
+
+    def test_husk_is_refused_for_a_render_it_cannot_drive(self):
+        manifest = SceneManifest(hip_path="/jobs/shot.hip")
+        with self.assertRaises(ValueError) as ctx:
+            jobs_for_task(manifest, self._task(kind=TASK_RENDER,
+                                               node_path="/out/mantra1"),
+                          engine="husk")
+        self.assertIn("husk", str(ctx.exception))
+
+
+class TestFarmDependencies(unittest.TestCase):
+    """A farm runs tasks on different machines with nothing to serialise them,
+    so a dropped dependency there is worse than locally."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.manifest = SceneManifest(hip_path="/jobs/shot.hip")
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def _jobs(self):
+        cache = OutputTask(node_path="/out/cache", kind=TASK_CACHE,
+                           use_frame_range=True, frame_start=1, frame_end=4)
+        sim = OutputTask(node_path="/out/sim", kind=TASK_SIM,
+                         use_frame_range=True, frame_start=1, frame_end=4,
+                         depends_on=["/out/cache"])
+        return (jobs_for_task(self.manifest, cache, chunk_size=2)
+                + jobs_for_task(self.manifest, sim))
+
+    def test_tractor_orders_dependent_work(self):
+        path = farm.export_tractor_job(self._jobs(),
+                                       os.path.join(self.dir, "job.alf"))
+        text = self._read(path)
+        self.assertIn("-id {/out/cache}", text)
+        self.assertIn("Instance {/out/cache}", text)
+        # The dependent group must run its prerequisites before its own work.
+        self.assertIn("-serialsubtasks 1", text)
+        waits = text.index("Instance {/out/cache}")
+        work = text.index("--rop /out/sim") if "--rop /out/sim" in text \
+            else text.index("/out/sim")
+        self.assertLess(waits, work)
+
+    def test_a_shared_dependency_is_referenced_not_duplicated(self):
+        """Two dependants must not each run the cache."""
+        cache = OutputTask(node_path="/out/cache", kind=TASK_CACHE)
+        a = OutputTask(node_path="/out/a", kind=TASK_CACHE,
+                       depends_on=["/out/cache"])
+        b = OutputTask(node_path="/out/b", kind=TASK_CACHE,
+                       depends_on=["/out/cache"])
+        jobs = sum((jobs_for_task(self.manifest, t) for t in (cache, a, b)), [])
+        path = farm.export_tractor_job(jobs, os.path.join(self.dir, "d.alf"))
+        text = self._read(path)
+        self.assertEqual(text.count("-id {/out/cache}"), 1)
+        self.assertEqual(text.count("Instance {/out/cache}"), 2)
+        self.assertEqual(text.count("--rop /out/cache"), 1)
+
+    def test_independent_work_keeps_the_flat_shape(self):
+        """The Solaris path has no task ids; its output must not change."""
+        jobs = [RenderJob(usd_file="/jobs/shot.usd", engine="husk",
+                          husk_exe="husk", chunk=FrameChunk(n, 1, 1))
+                for n in (1, 2)]
+        path = farm.export_tractor_job(jobs, os.path.join(self.dir, "f.alf"))
+        text = self._read(path)
+        self.assertNotIn("Instance", text)
+        self.assertNotIn("-serialsubtasks", text)
+        self.assertEqual(text.count("RemoteCmd"), 2)
+
+    def test_deadline_refuses_work_it_cannot_order(self):
+        with self.assertRaises(ValueError) as ctx:
+            farm.export_deadline_job(self._jobs(), self.dir)
+        message = str(ctx.exception)
+        self.assertIn("dependenc", message.lower())
+        self.assertIn("Tractor", message)
+
+    def test_deadline_refuses_several_tasks_in_one_job(self):
+        cache = OutputTask(node_path="/out/cache", kind=TASK_CACHE)
+        other = OutputTask(node_path="/out/other", kind=TASK_CACHE)
+        jobs = (jobs_for_task(self.manifest, cache)
+                + jobs_for_task(self.manifest, other))
+        with self.assertRaises(ValueError):
+            farm.export_deadline_job(jobs, self.dir)
+
+    def test_deadline_still_exports_a_plain_render(self):
+        jobs = [RenderJob(usd_file="/jobs/shot.usd", engine="husk",
+                          husk_exe="husk", chunk=FrameChunk(1, 4, 1))]
+        info, plugin = farm.export_deadline_job(jobs, self.dir)
+        self.assertTrue(os.path.isfile(info))
+        self.assertTrue(os.path.isfile(plugin))
 
 
 class TestCookCli(unittest.TestCase):
@@ -1503,10 +1601,48 @@ class TestCookCommands(unittest.TestCase):
         self.assertIn("--rop", cmd)
         self.assertEqual(cmd[cmd.index("--rop") + 1], "/obj/geo1/filecache1")
 
-    def test_a_render_job_is_unchanged(self):
-        cmd, _ = self._cmd(self._task(kind=TASK_RENDER))
+    def _solaris_manifest(self):
+        """A manifest where the task IS a described Solaris render ROP."""
+        manifest = SceneManifest(hip_path="/jobs/shot.hip",
+                                 default_settings_prim="/Render/rs")
+        manifest.rops = [RenderRop(
+            node_path="/stage/usdrender_rop1", node_type="usdrender_rop",
+            renderer="BRAY_HdKarmaXPU", settings_prim="/Render/rs",
+            camera="/cameras/shotcam", frame_start=1, frame_end=4,
+            use_frame_range=True)]
+        manifest.tasks = [OutputTask(
+            node_path="/stage/usdrender_rop1", node_type="usdrender_rop",
+            kind=TASK_RENDER, frame_start=1, frame_end=4, use_frame_range=True)]
+        return manifest
+
+    def test_a_solaris_render_still_goes_to_render_direct(self):
+        manifest = self._solaris_manifest()
+        jobs = jobs_for_task(manifest, manifest.tasks[0], hython_exe="hython")
+        cmd = build_command(jobs[0])
         self.assertIn("--render-direct", cmd)
         self.assertNotIn("--cook", cmd)
+
+    def test_a_solaris_render_keeps_the_settings_the_scene_asked_for(self):
+        """Rebuilding the job here instead of deferring to jobs_for_rop lost
+        the renderer, camera and settings prim -- so the render silently ran
+        with bare Karma defaults and no camera."""
+        manifest = self._solaris_manifest()
+        job = jobs_for_task(manifest, manifest.tasks[0], hython_exe="hython")[0]
+        self.assertEqual(job.renderer, "BRAY_HdKarmaXPU")
+        self.assertEqual(job.camera, "/cameras/shotcam")
+        self.assertEqual(job.settings_prim, "/Render/rs")
+        # ...and it is still identified as part of its task.
+        self.assertEqual(job.task_id, "/stage/usdrender_rop1")
+
+    def test_a_render_rop_usd_cannot_drive_is_cooked_instead(self):
+        """Mantra and OpenGL are renders, but --render-direct resolves its node
+        through find_render_rops(), which only knows USD ones -- so sending
+        them there would fail to find the node at all."""
+        cmd, job = self._cmd(self._task(kind=TASK_RENDER,
+                                        node_path="/out/mantra1"))
+        self.assertIn("--cook", cmd)
+        self.assertNotIn("--render-direct", cmd)
+        self.assertTrue(job.cook)
 
     def test_a_simulation_asks_for_an_ordered_single_call(self):
         cmd, job = self._cmd(self._task(kind=TASK_SIM))

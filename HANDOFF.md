@@ -12,7 +12,7 @@ stage, and renders — either **directly in hython** (the default) or by exporti
 USD and driving **husk**. The plain-Python half stays testable without Houdini.
 
 - **Repo:** github.com/PushMotta/SolarisCL (private, `main`), baseline commit
-  `5e23bad` plus the working-tree overlay collision fix. **177 tests green**;
+  `5e23bad` plus the working-tree overlay collision fix. **186 tests green**;
   boundary / drift / ui-imports green.
 - **Project root:** `F:\Nexus Projects\SolarisCL` — the working dir **is** the
   git root (flattened this session; it used to be nested three levels down at
@@ -138,7 +138,7 @@ and no farm file has been submitted to a real scheduler.
 ## How to run / verify
 
 ```bash
-python -m unittest discover -s tests          # 177 tests, no Houdini needed
+python -m unittest discover -s tests          # 186 tests, no Houdini needed
 python scripts/check_drift.py                 # config pointers still valid
 python scripts/check_ui_imports.py            # ui.py imports + Qt names resolve
 python scripts/verify_environment.py --report # probe a real Houdini install

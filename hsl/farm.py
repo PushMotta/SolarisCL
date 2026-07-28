@@ -76,8 +76,34 @@ def export_deadline_job(jobs: Sequence[RenderJob], output_dir: str,
                         job_name: str = "Solaris Render") -> tuple[str, str]:
     """Write Thinkbox Deadline job info and plugin info files.
 
+    One Deadline job, one command, frames split by the scheduler. That model
+    cannot express "run this after that": dependencies there are between whole
+    *jobs*, keyed by job IDs that do not exist until submission.
+
+    So work with dependencies is refused rather than exported. Writing it
+    anyway would produce a job that looks right and runs a simulation beside
+    the cache feeding it. Use :func:`export_tractor_job`, or submit each task
+    as its own Deadline job and wire the dependencies in the submitter.
+
     Returns (job_info_path, plugin_info_path).
     """
+    dependent = [j for j in jobs if j.depends_on]
+    if dependent:
+        names = ", ".join(sorted({j.task_id or j.label for j in dependent}))
+        raise ValueError(
+            f"Deadline export cannot express task dependencies ({names} waits "
+            f"on other work). Export to Tractor instead, or submit each task "
+            f"separately and set the job dependencies in Deadline."
+        )
+
+    groups = {j.task_id for j in jobs}
+    if len(groups) > 1:
+        raise ValueError(
+            f"Deadline export writes one job, but these {len(jobs)} chunk(s) "
+            f"span {len(groups)} different tasks. Export them one task at a "
+            f"time."
+        )
+
     os.makedirs(output_dir, exist_ok=True)
     job_info_path = os.path.join(output_dir, "deadline_job.job")
     plugin_info_path = os.path.join(output_dir, "plugin_info.job")
@@ -101,9 +127,32 @@ def export_deadline_job(jobs: Sequence[RenderJob], output_dir: str,
     return job_info_path, plugin_info_path
 
 
+def _quote_argv(argv) -> str:
+    return " ".join(f'"{arg}"' if " " in arg else arg for arg in argv)
+
+
+def _grouped(jobs: Sequence[RenderJob]):
+    """Jobs by ``task_id``, preserving first-seen order."""
+    groups: dict = {}
+    for job in jobs:
+        groups.setdefault(job.task_id, []).append(job)
+    return groups
+
+
 def export_tractor_job(jobs: Sequence[RenderJob], output_path: str,
                        job_name: str = "Solaris Render") -> str:
-    """Write Pixar Tractor .alf script file.
+    """Write a Pixar Tractor .alf script.
+
+    When any job declares a dependency the script becomes a DAG rather than a
+    flat list. Emitting dependent work as flat siblings -- which this used to
+    do -- lets a farm start a simulation at the same time as the cache feeding
+    it, on a different machine, with nothing to serialise them.
+
+    Each task group gets an ``-id`` so a shared dependency is defined once and
+    referenced by ``Instance`` rather than run twice. A group that waits on
+    something is marked ``-serialsubtasks 1`` with its prerequisites in the
+    first subtask and its own chunks in the second, so the chunks cannot start
+    until the prerequisites are done.
 
     Returns output_path.
     """
@@ -116,12 +165,45 @@ def export_tractor_job(jobs: Sequence[RenderJob], output_path: str,
         f'Job -title {{{job_name}}} -subservice {{husk}} -children {{',
     ]
 
-    for i, job in enumerate(jobs, start=1):
-        argv = build_command(job)
-        cmd_str = " ".join(f'"{arg}"' if " " in arg else arg for arg in argv)
-        lines.append(f'  Task -title {{{job.label}}} -cmds {{')
-        lines.append(f'    RemoteCmd {{{cmd_str}}}')
-        lines.append(f'  }}')
+    if not any(job.depends_on for job in jobs):
+        # Nothing to order: keep the flat shape the Solaris path has always
+        # produced rather than wrapping every render in a pointless group.
+        for job in jobs:
+            lines.append(f'  Task -title {{{job.label}}} -cmds {{')
+            lines.append(f'    RemoteCmd {{{_quote_argv(build_command(job))}}}')
+            lines.append('  }')
+    else:
+        for task_id, members in _grouped(jobs).items():
+            title = task_id or members[0].label
+            deps = []
+            for job in members:
+                for dep in job.depends_on:
+                    if dep not in deps:
+                        deps.append(dep)
+
+            chunk_lines = []
+            for job in members:
+                chunk_lines.append(f'      Task -title {{{job.label}}} -cmds {{')
+                chunk_lines.append(
+                    f'        RemoteCmd {{{_quote_argv(build_command(job))}}}')
+                chunk_lines.append('      }')
+
+            if deps:
+                lines.append(f'  Task -title {{{title}}} -id {{{task_id}}} '
+                             f'-serialsubtasks 1 -subtasks {{')
+                lines.append(f'    Task -title {{{title} waits for}} -subtasks {{')
+                for dep in deps:
+                    lines.append(f'      Instance {{{dep}}}')
+                lines.append('    }')
+                lines.append(f'    Task -title {{{title} work}} -subtasks {{')
+                lines.extend(chunk_lines)
+                lines.append('    }')
+                lines.append('  }')
+            else:
+                lines.append(f'  Task -title {{{title}}} -id {{{task_id}}} '
+                             f'-subtasks {{')
+                lines.extend(chunk_lines)
+                lines.append('  }')
 
     lines.append('}')
 
