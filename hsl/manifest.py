@@ -16,7 +16,10 @@ import json
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from typing import Any, Optional
 
-SCHEMA_VERSION = 1
+# 2 added ``SceneManifest.tasks``. The change is additive: a v1 manifest still
+# loads (``tasks`` defaults to empty) and nothing gates behaviour on this
+# number, so it is here to describe the shape, not to reject anything.
+SCHEMA_VERSION = 2
 
 
 # --------------------------------------------------------------------------
@@ -151,6 +154,68 @@ class RenderRop:
         return self.node_path
 
 
+# --------------------------------------------------------------------------
+# Generalised work description -- any ROP, not only Solaris
+# --------------------------------------------------------------------------
+
+# What a task produces. Anything the inspector cannot classify stays
+# ``unknown`` rather than being guessed into a bucket.
+TASK_RENDER = "render"
+TASK_CACHE = "cache"
+TASK_SIM = "sim"
+TASK_UNKNOWN = "unknown"
+
+# Kinds whose frames are *not* independent -- see ``OutputTask.sequential``.
+SEQUENTIAL_KINDS = frozenset({TASK_SIM})
+
+
+@dataclass
+class OutputTask:
+    """One node that can be cooked to produce files, and when it may run.
+
+    Generalises :class:`RenderRop`. A USD render ROP, a Mantra ROP, a File
+    Cache SOP and a DOP simulation are all "cook this node over these frames,
+    then check what it wrote" -- only the description differs. ``RenderRop``
+    keeps the USD-specific detail; this is the *scheduling* unit, and the only
+    thing the queue needs to understand.
+    """
+    node_path: str
+    node_type: str = ""
+    kind: str = TASK_UNKNOWN
+    frame_start: int = 1
+    frame_end: int = 1
+    frame_inc: int = 1
+    use_frame_range: bool = False       # False => single (current) frame
+    # Output path templates, frame tokens ($F4, $SF, ...) still in place.
+    outputs: list[str] = field(default_factory=list)
+    # True when frame N depends on N-1, so the range must be cooked in one
+    # process, in order. Splitting such a task across chunks does not merely
+    # run slowly: each process starts cold at its chunk boundary and writes a
+    # result that is wrong with no error to say so.
+    sequential: bool = False
+    # ``node_path`` of every task that must finish before this one starts.
+    depends_on: list[str] = field(default_factory=list)
+    # Everything the inspector managed to read, for debugging / display.
+    raw_parms: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # A simulation claiming its frames are independent is not a preference
+        # to be respected, it is a bug -- so it cannot be expressed at all.
+        if self.kind in SEQUENTIAL_KINDS:
+            self.sequential = True
+
+    @property
+    def frame_count(self) -> int:
+        if not self.use_frame_range:
+            return 1
+        inc = self.frame_inc or 1
+        return max(1, (self.frame_end - self.frame_start) // inc + 1)
+
+    @property
+    def label(self) -> str:
+        return self.node_path
+
+
 @dataclass
 class SceneManifest:
     """Everything the launcher needs to know about one .hip file."""
@@ -162,6 +227,9 @@ class SceneManifest:
     stage_end_time_code: Optional[float] = None
     default_settings_prim: str = ""     # stage metadata 'renderSettingsPrimPath'
     rops: list[RenderRop] = field(default_factory=list)
+    # Every cookable node, render or otherwise. ``rops`` stays the USD-specific
+    # view of the subset that are Solaris render ROPs.
+    tasks: list[OutputTask] = field(default_factory=list)
     settings: list[RenderSettings] = field(default_factory=list)
     products: list[RenderProduct] = field(default_factory=list)
     vars: list[RenderVar] = field(default_factory=list)
@@ -174,6 +242,12 @@ class SceneManifest:
 
     def rop(self, node_path: str) -> Optional[RenderRop]:
         return next((r for r in self.rops if r.node_path == node_path), None)
+
+    def task(self, node_path: str) -> Optional[OutputTask]:
+        return next((t for t in self.tasks if t.node_path == node_path), None)
+
+    def tasks_of_kind(self, *kinds: str) -> list[OutputTask]:
+        return [t for t in self.tasks if t.kind in kinds]
 
     def settings_for(self, prim_path: str) -> Optional[RenderSettings]:
         return next((s for s in self.settings if s.prim_path == prim_path), None)
@@ -238,6 +312,7 @@ def _fallback(obj: Any) -> Any:
 # annotations``.
 _ELEMENT_TYPES = {
     "rops": RenderRop,
+    "tasks": OutputTask,
     "settings": RenderSettings,
     "products": RenderProduct,
     "vars": RenderVar,

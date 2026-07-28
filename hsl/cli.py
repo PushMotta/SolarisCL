@@ -11,10 +11,13 @@ import os
 import re
 import sys
 import threading
+from dataclasses import replace
 from typing import Optional
 
 from . import bridge, husk as husk_mod, preflight
-from .manifest import RenderRop, SceneManifest
+from .manifest import (
+    TASK_CACHE, TASK_RENDER, TASK_SIM, RenderRop, SceneManifest,
+)
 from .runner import RenderQueue, State
 
 _FRAMES = re.compile(r"^(-?\d+)(?:[-:](-?\d+))?(?:[x/](\d+))?$")
@@ -88,21 +91,160 @@ def cmd_inspect(args) -> int:
             if aovs:
                 print(f"    aovs       {', '.join(v.label for v in aovs)}")
 
+    cookable = [t for t in manifest.tasks if t.kind != TASK_RENDER]
+    if cookable:
+        print(f"\n  {len(cookable)} cookable task(s) — 'hsl cook' runs these:")
+        for task in cookable:
+            frames = (f"{task.frame_start}-{task.frame_end}"
+                      if task.use_frame_range else str(task.frame_start))
+            flags = "  sequential" if task.sequential else ""
+            print(f"    {task.node_path}  [{task.kind}]  frames {frames}{flags}")
+            if task.outputs:
+                print(f"      -> {task.outputs[0]}")
+            if task.depends_on:
+                print(f"      after: {', '.join(task.depends_on)}")
+
     if manifest.missing_assets:
         print(f"\n  {len(manifest.missing_assets)} missing asset(s) — render will fail without a relink:")
         for asset in manifest.missing_assets:
-            print(f"    ✗ {asset.asset_path}  (at {asset.attr_path})")
+            print(f"    [x] {asset.asset_path}  (at {asset.attr_path})")
 
     if manifest.live_volumes:
         total_fields = sum(v.field_count for v in manifest.live_volumes)
         print(f"\n  {len(manifest.live_volumes)} live volume(s), {total_fields} field(s) "
               f"with no on-disk VDB — a husk USD export will bake ~GB/frame:")
         for v in manifest.live_volumes:
-            print(f"    ⚠ {v.prim_path}  ({', '.join(v.field_names)})")
-        print("    → render with --engine hython (no export) or cache the volumes to .vdb.")
+            print(f"    [!] {v.prim_path}  ({', '.join(v.field_names)})")
+        print("    -> render with --engine hython (no export) or cache the volumes to .vdb.")
 
     for warning in manifest.warnings:
         print(f"\n  warning: {warning}")
+    return 0
+
+
+def _select_tasks(manifest: SceneManifest, paths, kinds):
+    """(tasks to run, node paths that matched nothing)."""
+    if paths:
+        chosen, missing = [], []
+        for path in paths:
+            task = manifest.task(path)
+            if task is None:
+                missing.append(path)
+            else:
+                chosen.append(task)
+        return chosen, missing
+    return [t for t in manifest.tasks if t.kind in kinds], []
+
+
+def _describe_plan(tasks, chunk: int) -> None:
+    """Print what is about to be cooked, and why some of it will not split."""
+    print(f"{len(tasks)} task(s) to cook:")
+    for task in tasks:
+        chunks = husk_mod.chunks_for_task(task, chunk)
+        frames = (f"{task.frame_start}-{task.frame_end}"
+                  if task.use_frame_range else str(task.frame_start))
+        note = ""
+        if task.sequential and chunk:
+            # Say so rather than letting --chunk look respected.
+            note = "  (sequential: one process, --chunk ignored)"
+        elif len(chunks) > 1:
+            note = f"  ({len(chunks)} chunks)"
+        print(f"  {task.node_path}  [{task.kind}]  frames {frames}{note}")
+        if task.depends_on:
+            print(f"      after: {', '.join(task.depends_on)}")
+
+
+def cmd_cook(args) -> int:
+    """Cook caches, simulations and non-Solaris ROPs.
+
+    Rendering has its own command; this one drives everything else a .hip can
+    produce. Dependencies come from the scene, so tasks run in the right order
+    without the caller sequencing them.
+    """
+    manifest = bridge.inspect_hip(args.hip, hython=args.hython, export_usd=False)
+
+    # Rendering has its own command, so plain `hsl cook` means the other work.
+    kinds = (args.kind,) if args.kind else (TASK_CACHE, TASK_SIM)
+    tasks, missing = _select_tasks(manifest, args.task, kinds)
+
+    for path in missing:
+        sys.stderr.write(f"error: no task at {path}\n")
+    if missing:
+        known = ", ".join(t.node_path for t in manifest.tasks) or "none"
+        sys.stderr.write(f"Tasks found in this scene: {known}\n")
+        return 2
+
+    if not tasks:
+        sys.stderr.write(
+            "No cookable tasks matched. This scene has "
+            f"{len(manifest.tasks)} task(s); use --kind or --task to pick one, "
+            "or 'hsl inspect' to list them.\n")
+        return 2
+
+    if args.output and len(tasks) > 1:
+        sys.stderr.write(
+            "--output sets one path, but this would cook "
+            f"{len(tasks)} tasks. Narrow it with --task.\n")
+        return 4
+
+    if args.frames:
+        start, end, inc = args.frames
+        tasks = [replace(t, frame_start=start, frame_end=end, frame_inc=inc,
+                         use_frame_range=True) for t in tasks]
+
+    jobs = []
+    for task in tasks:
+        jobs += husk_mod.jobs_for_task(
+            manifest, task, chunk_size=args.chunk,
+            hython_exe=args.hython or None,
+            output=args.output or None,
+        )
+
+    _describe_plan(tasks, args.chunk)
+
+    if args.dry_run:
+        print()
+        for job in jobs:
+            print(husk_mod.format_command(husk_mod.build_command(job)))
+        return 0
+
+    lock = threading.Lock()
+
+    def on_event(event, *payload):
+        if event == "task_output":
+            task, line = payload
+            with lock:
+                sys.stdout.write(f"[{task.job.task_id} {task.job.chunk}] {line}\n")
+                sys.stdout.flush()
+        elif event == "task_finished":
+            task = payload[0]
+            with lock:
+                sys.stderr.write(f"[{task.job.task_id} {task.job.chunk}] "
+                                 f"{task.state.value} in {task.duration:.1f}s\n")
+
+    try:
+        queue = RenderQueue(jobs, max_parallel=args.parallel, on_event=on_event)
+    except ValueError as exc:
+        # A dependency cycle in the scene -- nothing can be scheduled.
+        sys.stderr.write(f"error: {exc}\n")
+        return 4
+
+    queue.start(block=True)
+
+    for warning in queue.warnings:
+        sys.stderr.write(f"warning: {warning}\n")
+
+    failed = [t for t in queue.tasks if t.state is State.FAILED]
+    skipped = [t for t in queue.tasks if t.state is State.SKIPPED]
+    if failed or skipped:
+        parts = []
+        if failed:
+            parts.append(f"{len(failed)} failed")
+        if skipped:
+            parts.append(f"{len(skipped)} skipped (a dependency did not finish)")
+        sys.stderr.write(f"\n{', '.join(parts)}, of {len(queue.tasks)} chunk(s).\n")
+        return 1
+    sys.stderr.write(f"\nCooked {len(queue.tasks)} chunk(s).\n")
     return 0
 
 
@@ -185,7 +327,7 @@ def cmd_render(args) -> int:
             "--aovs only applies to the husk engine: it rewrites the exported "
             "USD's product orderedVars, and the hython engine renders the ROP "
             "directly without exporting.\n"
-            "  → add --engine husk to use it, or drop it to render with hython.\n")
+            "  -> add --engine husk to use it, or drop it to render with hython.\n")
         return 4
 
     # Parsed before the scene loads: a malformed --set should not cost a
@@ -236,11 +378,11 @@ def cmd_render(args) -> int:
         sys.stderr.write(
             f"Aborted: {n} live volume(s) ({total_fields} field(s) with no "
             f"on-disk VDB) would bake tens of GB per frame into the USD export.\n"
-            f"  → render with --engine hython (no export, recommended for this shot),\n"
-            f"  → or cache the volumes to .vdb and re-read,\n"
-            f"  → or pass --allow-volume-bake to export anyway.\n")
+            f"  -> render with --engine hython (no export, recommended for this shot),\n"
+            f"  -> or cache the volumes to .vdb and re-read,\n"
+            f"  -> or pass --allow-volume-bake to export anyway.\n")
         for v in manifest.live_volumes:
-            sys.stderr.write(f"    ⚠ {v.prim_path}  ({', '.join(v.field_names)})\n")
+            sys.stderr.write(f"    [!] {v.prim_path}  ({', '.join(v.field_names)})\n")
         return 3
 
     if engine == "husk" and manifest.live_volumes and allow_volume_bake:
@@ -268,7 +410,7 @@ def cmd_render(args) -> int:
     if manifest.missing_assets:
         sys.stderr.write(f"{len(manifest.missing_assets)} unresolved asset(s) in the scene:\n")
         for asset in manifest.missing_assets:
-            sys.stderr.write(f"  ✗ {asset.asset_path}\n")
+            sys.stderr.write(f"  [x] {asset.asset_path}\n")
         if engine == "hython" and not getattr(args, "relink_from", None):
             sys.stderr.write(
                 "  (pass --relink-from DIR to repath them, or fix the scene.)\n")
@@ -432,9 +574,20 @@ def cmd_render(args) -> int:
     queue = RenderQueue(jobs, max_parallel=args.parallel, on_event=on_event)
     queue.start(block=True)
 
+    for warning in queue.warnings:
+        sys.stderr.write(f"warning: {warning}\n")
+
     failed = [t for t in queue.tasks if t.state is State.FAILED]
-    if failed:
-        sys.stderr.write(f"\n{len(failed)} of {len(queue.tasks)} chunk(s) failed.\n")
+    # A skipped chunk never ran because something upstream of it did not
+    # finish. Nothing was rendered, so it cannot count as success either.
+    skipped = [t for t in queue.tasks if t.state is State.SKIPPED]
+    if failed or skipped:
+        parts = []
+        if failed:
+            parts.append(f"{len(failed)} failed")
+        if skipped:
+            parts.append(f"{len(skipped)} skipped (a dependency did not finish)")
+        sys.stderr.write(f"\n{', '.join(parts)}, of {len(queue.tasks)} chunk(s).\n")
         return 1
     sys.stderr.write(f"\nRendered {len(queue.tasks)} chunk(s).\n")
     return 0
@@ -518,6 +671,28 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Print the render commands and stop")
     p_render.set_defaults(func=cmd_render)
 
+    p_cook = sub.add_parser(
+        "cook", parents=[common],
+        help="Cook caches, simulations and non-Solaris ROPs")
+    p_cook.add_argument("--task", action="append", default=[], metavar="PATH",
+                        help="Node path to cook (repeatable). Default: every "
+                             "cache and simulation in the scene")
+    p_cook.add_argument("--kind", choices=[TASK_CACHE, TASK_SIM, TASK_RENDER],
+                        default="",
+                        help="Cook only tasks of this kind")
+    p_cook.add_argument("--frames", type=parse_frames, default=None,
+                        help="Override the range: 1001, 1001-1100 or 1001-1100x2")
+    p_cook.add_argument("--chunk", type=int, default=0,
+                        help="Frames per process (0 = one). Ignored for "
+                             "sequential tasks, which cannot be split")
+    p_cook.add_argument("--parallel", type=int, default=1,
+                        help="Concurrent processes")
+    p_cook.add_argument("--output", default="",
+                        help="Override the output path (one task only)")
+    p_cook.add_argument("--dry-run", action="store_true",
+                        help="Print the commands without running them")
+    p_cook.set_defaults(func=cmd_cook)
+
     p_hython = sub.add_parser("hython",
                               help="List the Houdini/hython installs found on this machine")
     p_hython.add_argument("--set", default="", metavar="INDEX|PATH",
@@ -531,7 +706,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _make_console_safe() -> None:
+    """Stop an unencodable character turning a report into a traceback.
+
+    cp1252 is still the default code page on a fresh Windows console and has
+    no mapping for a lot of punctuation. With the default 'strict' handler,
+    printing one raises ``UnicodeEncodeError`` *part way through* a report --
+    so the user loses the output and gets a stack trace about a decoration.
+
+    Nothing hsl prints is currently unmappable (there is a test), but a report
+    is the wrong place to be strict about typography.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass        # not a reconfigurable stream (redirected, or 3.6)
+
+
 def main(argv=None) -> int:
+    _make_console_safe()
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

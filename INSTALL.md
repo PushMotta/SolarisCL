@@ -118,6 +118,28 @@ bin\hsl.bat render shot.hip --frames 1050 --res 960 540
 
 `bin\hsl.bat --help` and `bin\hsl.bat render --help` list everything.
 
+**Caches and simulations**
+
+hsl also cooks the non-rendering parts of a scene without opening Houdini —
+File Cache SOPs, Geometry/Alembic/DOP ROPs and the other `/out` contexts.
+
+```
+REM What can be cooked? (inspect lists these alongside the render ROPs)
+bin\hsl.bat inspect shot.hip
+
+REM Cook every cache and simulation, in dependency order
+bin\hsl.bat cook shot.hip
+
+REM Just one, and show the command first
+bin\hsl.bat cook shot.hip --task /obj/geo1/filecache1 --dry-run
+```
+
+Order is taken from the scene, so a cache that feeds a sim runs first. Anything
+that carries state between frames — simulations, and File Cache SOPs with
+"Cache Simulation" on — is cooked in a single ordered process; `--chunk` is
+deliberately ignored for those, because splitting them would write a wrong
+cache without reporting an error.
+
 ### Two render engines
 
 `--engine hython` is the **default**: it renders the ROP directly inside

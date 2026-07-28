@@ -21,7 +21,8 @@ import traceback
 from typing import Any, Iterable, Optional
 
 from .manifest import (
-    Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
+    TASK_CACHE, TASK_RENDER, TASK_SIM, TASK_UNKNOWN, Camera, LiveVolume,
+    MissingAsset, OutputTask, RenderProduct, RenderRop, RenderSettings,
     RenderVar, SceneManifest,
 )
 # Plain-Python, no Houdini: the output-naming rule, shared with the UI/CLI
@@ -42,6 +43,52 @@ except ImportError:  # pragma: no cover
 # Node types that can drive a husk render. Versioned type names
 # (``usdrender_rop::3.0``) are normalised by stripping at "::".
 RENDER_ROP_TYPES = {"usdrender_rop", "usdrender", "karma"}
+
+# --- Non-Solaris work -----------------------------------------------------
+# Everything below was probed on **21.0.729 and 22.0.368**, which agreed
+# exactly; see docs/UNVERIFIED.md for the transcript and how to re-run it.
+#
+# Driver-context types that write files, and what each produces. Every one of
+# these exposes ``.render()``.
+TASK_ROP_KINDS = {
+    "geometry": TASK_CACHE,
+    "rop_geometry": TASK_CACHE,
+    "alembic": TASK_CACHE,
+    "filmboxfbx": TASK_CACHE,
+    "channel": TASK_CACHE,
+    "dop": TASK_SIM,
+    "ifd": TASK_RENDER,          # Mantra
+    "opengl": TASK_RENDER,
+    "comp": TASK_RENDER,
+    "baketexture": TASK_RENDER,
+    "karma": TASK_RENDER,
+    "usdrender_rop": TASK_RENDER,
+    "usdrender": TASK_RENDER,
+}
+
+# SOP-level cache nodes. These have **no** ``.render()`` of their own -- they
+# wrap a ROP that does. See ``_cookable_node``.
+SOP_CACHE_KINDS = {"filecache": TASK_CACHE}
+
+# Where each type keeps its output path. Read through ``_parm``, so a name
+# that moved between builds falls back rather than raising.
+TASK_OUTPUT_PARMS = {
+    "geometry": ("sopoutput",),
+    "rop_geometry": ("sopoutput",),
+    "filecache": ("file", "sopoutput"),
+    "dop": ("dopoutput",),
+    "alembic": ("filename",),
+    "ifd": ("vm_picture",),
+    "opengl": ("picture",),
+    "comp": ("copoutput",),
+    "baketexture": ("vm_uvoutputpicture1",),
+}
+
+# Parameters that mean "this node carries state from one frame to the next".
+# ``cachesim`` defaults to 1 on filecache::2.0, so a stock File Cache SOP is
+# treated as sequential -- deliberately conservative: a wrongly parallelised
+# cache is silently wrong, a needlessly serial one is merely slower.
+SEQUENTIAL_PARMS = ("cachesim", "initsim")
 # NB: there is no USD_ROP_TYPES list. `export_usd()` creates its own temporary
 # `usd_rop` rather than looking for one in the scene, so a set of candidate
 # export-ROP names had nothing to match against (docs/TASKS.md T4).
@@ -364,6 +411,177 @@ def find_render_rops(roots: Iterable[str] = ("/stage", "/out")) -> list:
             if _type_name(node) in RENDER_ROP_TYPES:
                 found.append(node)
     return found
+
+
+# --------------------------------------------------------------------------
+# Non-Solaris work: caches, simulations and the other ROP contexts
+# --------------------------------------------------------------------------
+
+def _parm_raw(node, names, default: str = "") -> str:
+    """The *unexpanded* string of a parameter.
+
+    ``_parm`` evaluates, which turns ``geo.$F4.bgeo.sc`` into the filename for
+    whatever frame happens to be current -- so an output path read that way
+    would claim every frame writes to frame 1's file. Output templates have to
+    keep their tokens; the runner expands them per frame itself.
+    """
+    if isinstance(names, str):
+        names = (names,)
+    for name in names:
+        parm = node.parm(name)
+        if parm is None:
+            continue
+        for reader in ("unexpandedString", "rawValue"):
+            try:
+                return getattr(parm, reader)()
+            except Exception:
+                continue
+    return default
+
+
+def _inside_cache_node(node) -> bool:
+    """True for the ROP *inside* a File Cache SOP, which is not its own task."""
+    parent = node.parent()
+    while parent is not None:
+        if _type_name(parent) in SOP_CACHE_KINDS:
+            return True
+        parent = parent.parent()
+    return False
+
+
+def find_output_tasks(roots: Iterable[str] = ("/out", "/stage", "/obj")) -> list:
+    """Every node in the scene that can be cooked to produce files.
+
+    Wider than :func:`find_render_rops`: caches and simulations too. ``/obj``
+    is included because a File Cache SOP lives inside a geometry object rather
+    than in ``/out``.
+    """
+    found = []
+    for root_path in roots:
+        root = hou.node(root_path)
+        if root is None:
+            continue
+        for node in root.allSubChildren():
+            name = _type_name(node)
+            if name not in TASK_ROP_KINDS and name not in SOP_CACHE_KINDS:
+                continue
+            if _inside_cache_node(node):
+                continue        # implementation detail of the SOP that owns it
+            found.append(node)
+    return found
+
+
+def _cookable_node(node, warnings: list):
+    """The node whose ``render()`` actually does the work, or None.
+
+    A File Cache SOP has no ``render()`` of its own. Probed on 21.0.729 and
+    22.0.368: it wraps a ``render`` node of type ``rop_geometry`` that does,
+    and driving *that* honours an explicit frame range -- whereas pressing the
+    SOP's own ``execute`` button ignores one and cooks whatever ``$FSTART`` and
+    ``$FEND`` evaluate to, which would quietly cache the wrong frames.
+    """
+    if hasattr(node, "render"):
+        return node
+    inner = node.node("render")
+    if inner is not None and hasattr(inner, "render"):
+        return inner
+    for child in node.children():
+        if hasattr(child, "render"):
+            return child
+    warnings.append(
+        f"{node.path()}: nothing inside it can be cooked -- skipped. Point hsl "
+        f"at the ROP that writes this instead."
+    )
+    return None
+
+
+def _task_kind(node) -> str:
+    name = _type_name(node)
+    kind = TASK_ROP_KINDS.get(name) or SOP_CACHE_KINDS.get(name)
+    return kind or TASK_UNKNOWN
+
+
+def _is_sequential(node) -> bool:
+    """True when the node carries state from one frame to the next."""
+    return any(bool(_parm(node, name, 0)) for name in SEQUENTIAL_PARMS)
+
+
+def _task_dependencies(node, task_paths) -> list:
+    """Task node paths that must finish before ``node`` can cook.
+
+    Walks the input chain, following ``fetch`` nodes to their ``source`` parm
+    and passing straight through anything that is not itself a task -- a merge
+    produces nothing, so it is traversed rather than reported. Stops at the
+    first task on each branch: whatever *that* depends on is its own business.
+    """
+    found, seen = set(), set()
+    queue = [n for n in node.inputs() if n is not None]
+    while queue:
+        current = queue.pop()
+        path = current.path()
+        if path in seen:
+            continue
+        seen.add(path)
+
+        if _type_name(current) == "fetch":
+            target = _parm(current, "source", "")
+            source = hou.node(target) if target else None
+            if source is not None:
+                queue.append(source)
+            continue
+        if path in task_paths:
+            found.add(path)
+            continue
+        queue.extend(n for n in current.inputs() if n is not None)
+    return sorted(found)
+
+
+def describe_task(node, task_paths, warnings: list) -> OutputTask:
+    """Read one cookable node into an :class:`OutputTask`."""
+    trange = _parm(node, "trange", 0)
+    f1 = _parm(node, "f1", None)
+    f2 = _parm(node, "f2", None)
+    f3 = _parm(node, "f3", 1)
+    if f1 is None:
+        f1 = hou.frame()
+    if f2 is None:
+        f2 = f1
+
+    outputs = []
+    template = _parm_raw(node, TASK_OUTPUT_PARMS.get(_type_name(node), ()))
+    if template:
+        outputs.append(template)
+    else:
+        warnings.append(
+            f"{node.path()}: could not read an output path, so hsl cannot "
+            f"check whether it wrote anything."
+        )
+
+    try:
+        start, end, inc = int(f1), int(f2), int(f3 or 1)
+    except (TypeError, ValueError):
+        warnings.append(f"{node.path()}: unreadable frame range; using frame 1.")
+        start, end, inc = 1, 1, 1
+
+    return OutputTask(
+        node_path=node.path(),
+        node_type=node.type().name(),
+        kind=_task_kind(node),
+        frame_start=start,
+        frame_end=end,
+        frame_inc=inc or 1,
+        use_frame_range=bool(trange),
+        outputs=outputs,
+        sequential=_is_sequential(node),
+        depends_on=_task_dependencies(node, task_paths),
+    )
+
+
+def scan_tasks(warnings: list) -> list:
+    """Describe every cookable node in the loaded scene."""
+    nodes = find_output_tasks()
+    paths = {n.path() for n in nodes}
+    return [describe_task(n, paths, warnings) for n in nodes]
 
 
 def describe_rop(node, warnings: list[str]) -> RenderRop:
@@ -1089,6 +1307,12 @@ def inspect(hip_path: str, export: bool = False,
     manifest.cameras = list(seen_cameras.values())
     manifest.missing_assets = list(seen_assets.values())
     manifest.live_volumes = list(seen_volumes.values())
+    # Caches, sims and the non-Solaris ROPs. Failing to describe these must not
+    # cost the caller its render manifest, which is what it actually asked for.
+    try:
+        manifest.tasks = scan_tasks(warnings)
+    except Exception as exc:                       # noqa: BLE001
+        warnings.append(f"Could not scan cookable tasks: {exc}")
     manifest.warnings = warnings
     return manifest
 
@@ -1276,6 +1500,74 @@ def render_direct(hip_path: str, rop_path: str = "", frame_start: Optional[int] 
         return 1
 
 
+def cook_task(hip_path: str, node_path: str, frame_start: Optional[int] = None,
+              frame_count: int = 1, frame_inc: int = 1,
+              sequential: bool = False, output: str = "") -> int:
+    """Cook a cache, a simulation or a non-Solaris ROP under hython.
+
+    Progress mirrors :func:`render_direct`: one ``render()`` call per frame
+    with an ``ALF_PROGRESS`` line after each, so the queue's bars move.
+
+    **Except when the task is sequential.** Frame N of a simulation depends on
+    N-1, and separate ``render()`` calls do not carry solver state across them
+    -- so the whole range goes in a single call instead, which can only report
+    0% and then 100%. A truthful pair of numbers beats a smooth bar over a
+    corrupted cache.
+    """
+    if hou is None:
+        raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
+
+    hou.hipFile.load(hip_path, suppress_save_prompt=True, ignore_load_warnings=True)
+
+    node = hou.node(node_path)
+    if node is None:
+        sys.stderr.write(f"No node at {node_path} in {hip_path}\n")
+        return 1
+
+    warnings: list[str] = []
+    target = _cookable_node(node, warnings)
+    if output:
+        # Prefer the node the user pointed at -- on a File Cache SOP that is
+        # the parameter they can see. _apply_override records it if neither
+        # node has the parameter, rather than letting the override vanish.
+        names = TASK_OUTPUT_PARMS.get(_type_name(node), ())
+        if names and not _apply_override(node, names, output, "output", warnings):
+            if target is not None:
+                _apply_override(target, TASK_OUTPUT_PARMS.get(_type_name(target), ()),
+                                output, "output", warnings)
+    for message in warnings:
+        sys.stderr.write(f"warning: {message}\n")
+    sys.stderr.flush()
+    if target is None:
+        return 1
+
+    frames = ([] if frame_start is None
+              else [frame_start + i * frame_inc for i in range(max(1, frame_count))])
+
+    try:
+        sys.stdout.write("ALF_PROGRESS 0%\n")
+        sys.stdout.flush()
+
+        if frames and not sequential:
+            total = len(frames)
+            for index, frame in enumerate(frames, 1):
+                target.render(frame_range=(frame, frame, 1), verbose=False)
+                sys.stdout.write("ALF_PROGRESS %d%%\n" % int(index * 100 / total))
+                sys.stdout.flush()
+        else:
+            if frames:
+                target.render(frame_range=(frames[0], frames[-1], frame_inc),
+                              verbose=False)
+            else:
+                target.render(verbose=False)
+            sys.stdout.write("ALF_PROGRESS 100%\n")
+            sys.stdout.flush()
+        return 0
+    except hou.Error as exc:
+        sys.stderr.write(f"Cook failed on {node.path()}: {exc}\n")
+        return 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="hython -m hsl.inspector",
@@ -1302,6 +1594,12 @@ def main(argv=None) -> int:
                              "(default: skip the export for such ROPs)")
     parser.add_argument("--render-direct", action="store_true",
                         help="Render the ROP directly inside hython (0 USD disk space)")
+    parser.add_argument("--cook", action="store_true",
+                        help="Cook a cache/simulation/non-Solaris ROP instead "
+                             "of rendering (needs --rop)")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Cook the whole range in one call, in order. "
+                             "Required for simulations: frame N depends on N-1")
     parser.add_argument("--frame-start", type=int, default=None, help="Start frame")
     parser.add_argument("--frame-count", type=int, default=1, help="Frame count")
     parser.add_argument("--frame-inc", type=int, default=1, help="Frame increment")
@@ -1374,6 +1672,13 @@ def main(argv=None) -> int:
 
     if not args.hip:
         parser.error("hip path is required unless --filter-aovs is given")
+
+    if args.cook:
+        if not args.rop:
+            parser.error("--cook needs --rop to say which node to cook")
+        return cook_task(args.hip, args.rop, frame_start=args.frame_start,
+                         frame_count=args.frame_count, frame_inc=args.frame_inc,
+                         sequential=args.sequential, output=args.output)
 
     if args.render_direct:
         res = tuple(args.res) if args.res else None

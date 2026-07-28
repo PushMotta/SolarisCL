@@ -13,7 +13,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
-from .manifest import RenderRop, SceneManifest
+from .manifest import TASK_RENDER, OutputTask, RenderRop, SceneManifest
 
 # husk emits `ALF_PROGRESS 42%` when run with -Valfred.
 _ALF_PROGRESS = re.compile(r"ALF_PROGRESS\s+(\d+)\s*%")
@@ -196,6 +196,17 @@ class RenderJob:
     # {"karma:global:samplesperpixel": "64"} (hython engine only -- the husk
     # path authors them into the USD before the job is built).
     settings_overrides: dict = field(default_factory=dict)
+    # Which OutputTask this job is a chunk of, and what that task waits for.
+    # Every chunk of one task shares both. Empty ``task_id`` means the job
+    # stands alone, which is what the Solaris path has always done -- so the
+    # queue behaves exactly as before unless these are set.
+    task_id: str = ""
+    depends_on: list[str] = field(default_factory=list)
+    # What this job cooks. Anything other than a render goes to the inspector's
+    # --cook path instead of --render-direct.
+    task_kind: str = TASK_RENDER
+    # Frame N depends on N-1, so the chunk must be cooked in one ordered call.
+    sequential: bool = False
 
     @property
     def label(self) -> str:
@@ -210,13 +221,26 @@ def build_command(job: RenderJob) -> list[str]:
     if job.engine == "hython":
         from .bridge import find_hython   # lives in bridge (smart discovery)
         exe = job.hython_exe or find_hython() or "hython"
-        cmd: list[str] = [exe, "-m", "hsl.inspector", job.hip_file or job.usd_file, "--render-direct"]
+        cooking = job.task_kind != TASK_RENDER
+        mode = "--cook" if cooking else "--render-direct"
+        cmd: list[str] = [exe, "-m", "hsl.inspector",
+                          job.hip_file or job.usd_file, mode]
         if job.rop_path:
             cmd += ["--rop", job.rop_path]
         cmd += ["--frame-start", str(job.chunk.start)]
         cmd += ["--frame-count", str(job.chunk.count)]
         if job.chunk.inc != 1:
             cmd += ["--frame-inc", str(job.chunk.inc)]
+        if cooking:
+            # A cache has no renderer, camera, resolution or render settings.
+            # Emitting them would be noise at best and a wrong override at
+            # worst, so the cook path takes only what it can actually use.
+            if job.sequential:
+                cmd += ["--sequential"]
+            if job.output:
+                cmd += ["--output", job.output]
+            cmd += list(job.extra_args)
+            return cmd
         if job.renderer:
             cmd += ["--renderer", job.renderer]
         if job.camera:
@@ -333,6 +357,65 @@ def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str = "",
 
     return [RenderJob(usd_file=usd_file, chunk=chunk, **defaults)
             for chunk in chunks]
+
+
+def chunks_for_task(task: OutputTask, chunk_size: int = 0) -> list[FrameChunk]:
+    """Frame chunks for a task, refusing to split a sequential one.
+
+    ``chunk_size`` is **ignored** rather than honoured when ``task.sequential``
+    is set. A simulation's frame N depends on N-1, so handing chunks to
+    separate processes gives each one a cold start at its own boundary: the
+    cook does not fail, it writes a wrong result and exits 0.
+
+    Quietly doing the safe thing is the right trade here -- the alternative is
+    a flag that looks respected and corrupts caches. Callers that want to tell
+    the user their ``--chunk`` was dropped can read ``task.sequential``, which
+    is exactly what decided it.
+    """
+    if not task.use_frame_range:
+        return [FrameChunk(task.frame_start, 1, 1)]
+    return frame_chunks(task.frame_start, task.frame_end, task.frame_inc,
+                        0 if task.sequential else chunk_size)
+
+
+def jobs_for_task(manifest: SceneManifest, task: OutputTask, *,
+                  chunk_size: int = 0, **overrides) -> list[RenderJob]:
+    """Build one RenderJob per frame chunk for any cookable node.
+
+    The counterpart to :func:`jobs_for_rop` for work that is not a Solaris
+    render ROP. Every chunk carries the task's identity and dependencies, so
+    the queue can order them.
+
+    Non-render kinds are pinned to the hython engine: husk consumes USD and
+    cannot cook a SOP or advance a solver. Asking for it raises rather than
+    silently falling back, which is how the CLI already treats the other
+    husk-only options.
+    """
+    engine = overrides.get("engine") or DEFAULT_ENGINE
+    if task.kind != TASK_RENDER and engine != "hython":
+        raise ValueError(
+            f"{task.node_path} is a '{task.kind}' task and husk cannot cook it "
+            f"-- husk only consumes USD. Use engine='hython'."
+        )
+
+    defaults = {
+        "engine": engine,
+        "hip_file": manifest.hip_path,
+        "rop_path": task.node_path,
+        "task_id": task.node_path,
+        "depends_on": list(task.depends_on),
+        "expected_outputs": list(task.outputs),
+        "task_kind": task.kind,
+        "sequential": task.sequential,
+    }
+    if task.kind != TASK_RENDER:
+        # A renderer name is meaningless for a cache or a solver, and
+        # RenderJob defaults it to Karma.
+        defaults["renderer"] = ""
+    defaults.update({k: v for k, v in overrides.items() if v is not None})
+
+    return [RenderJob(chunk=chunk, **defaults)
+            for chunk in chunks_for_task(task, chunk_size)]
 
 
 # --------------------------------------------------------------------------

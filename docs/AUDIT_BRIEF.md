@@ -55,7 +55,7 @@ Do not spend the audit re-discovering these; they are logged:
 | `inspector.py` | 1201 | 3 mocked overlay-path tests; no live Houdini coverage | **high** |
 | `ui.py` | 1255 | **import-check only** | **high** |
 
-`tests/test_core.py` has 139 tests in 26 classes and must stay green without
+`tests/test_core.py` has 177 tests in 32 classes and must stay green without
 Houdini installed.
 
 ### The single biggest gap

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import bridge, farm, husk as husk_mod, preflight, presets, resources
-from .manifest import RenderRop, SceneManifest
+from .manifest import TASK_RENDER, RenderRop, SceneManifest
 from .runner import RenderQueue, State, Task
 
 MONO = "Menlo" if sys.platform == "darwin" else ("Consolas" if os.name == "nt" else "DejaVu Sans Mono")
@@ -643,9 +643,104 @@ class LauncherWindow(QMainWindow):
         self.log_view.setPlaceholderText("husk output appears here.")
         q_layout.addWidget(self.log_view, 1)
         self.tabs.addTab(queue_widget, "Queue & Logs")
+        self.tabs.addTab(self._build_tasks_panel(), "Caches & Sims")
 
         layout.addWidget(self.tabs, 1)
         return box
+
+    def _build_tasks_panel(self) -> QWidget:
+        """Everything in the scene that can be cooked but is not a render."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.task_list = QTableWidget(0, 5)
+        self.task_list.setHorizontalHeaderLabels(
+            ["Node", "Kind", "Frames", "Waits for", "Writes"])
+        self.task_list.verticalHeader().setVisible(False)
+        self.task_list.setSelectionBehavior(QTableWidget.SelectRows)
+        self.task_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.task_list.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        layout.addWidget(self.task_list, 1)
+
+        row = QHBoxLayout()
+        self.cook_btn = QPushButton("Cook Ticked")
+        self.cook_btn.setEnabled(False)
+        self.cook_btn.setToolTip(
+            "Cook the ticked caches and simulations. Dependencies come from "
+            "the scene, so order is handled for you."
+        )
+        self.cook_btn.clicked.connect(self.cook_selected)
+        self.cook_hint = QLabel("")
+        self.cook_hint.setWordWrap(True)
+        row.addWidget(self.cook_btn)
+        row.addWidget(self.cook_hint, 1)
+        layout.addLayout(row)
+        return widget
+
+    def _populate_tasks(self) -> None:
+        tasks = [t for t in (self.manifest.tasks if self.manifest else [])
+                 if t.kind != TASK_RENDER]
+        self.task_list.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
+            item = QTableWidgetItem(task.node_path)
+            item.setData(Qt.UserRole, task.node_path)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.task_list.setItem(row, 0, item)
+            self.task_list.setItem(row, 1, QTableWidgetItem(task.kind))
+
+            frames = (f"{task.frame_start}-{task.frame_end}"
+                      if task.use_frame_range else str(task.frame_start))
+            frame_item = QTableWidgetItem(frames)
+            if task.sequential:
+                frame_item.setToolTip(
+                    "Frame N depends on N-1, so this is cooked in one process "
+                    "in order. Chunk size does not apply."
+                )
+            self.task_list.setItem(row, 2, frame_item)
+            self.task_list.setItem(
+                row, 3, QTableWidgetItem(", ".join(task.depends_on) or "—"))
+            self.task_list.setItem(
+                row, 4, QTableWidgetItem(task.outputs[0] if task.outputs else "—"))
+
+        self.cook_btn.setEnabled(bool(tasks))
+        sequential = sum(1 for t in tasks if t.sequential)
+        if not tasks:
+            self.cook_hint.setText("No caches or simulations in this scene.")
+        elif sequential:
+            self.cook_hint.setText(
+                f"{sequential} of {len(tasks)} carry state between frames and "
+                f"are never split across processes."
+            )
+        else:
+            self.cook_hint.setText("")
+
+    @Slot()
+    def cook_selected(self) -> None:
+        if not self.manifest:
+            return
+        chosen = []
+        for row in range(self.task_list.rowCount()):
+            item = self.task_list.item(row, 0)
+            if item is not None and item.checkState() == Qt.Checked:
+                task = self.manifest.task(item.data(Qt.UserRole))
+                if task is not None:
+                    chosen.append(task)
+
+        if not chosen:
+            self._set_status("Tick at least one cache or simulation.", "error")
+            return
+
+        hython = self.hython_combo.currentData() or ""
+        jobs = []
+        for task in chosen:
+            jobs += husk_mod.jobs_for_task(
+                self.manifest, task,
+                chunk_size=self.chunk_spin.value(),
+                hython_exe=hython or None,
+            )
+        self._launch_queue(jobs, verb="Cooking")
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -885,6 +980,8 @@ class LauncherWindow(QMainWindow):
         for rop in manifest.rops:
             self.rop_combo.addItem(rop.node_path, rop.node_path)
         self.rop_combo.blockSignals(False)
+
+        self._populate_tasks()
 
         # Populate AOVs — display the (distinct) prim name, key by prim path.
         self.aov_list.blockSignals(True)
@@ -1354,7 +1451,7 @@ class LauncherWindow(QMainWindow):
         self._set_status("Preparing the USD failed.", "error")
         QMessageBox.critical(self, "Could not prepare the render", message[-4000:])
 
-    def _launch_queue(self, jobs: list) -> None:
+    def _launch_queue(self, jobs: list, verb: str = "Rendering") -> None:
         self.log_view.clear()
         self.overall_bar.setValue(0)
 
@@ -1365,14 +1462,25 @@ class LauncherWindow(QMainWindow):
         self.bridge.task_finished.connect(self.on_task_finished)
         self.bridge.queue_finished.connect(self.on_queue_finished)
 
-        self.queue = RenderQueue(jobs, max_parallel=self.parallel_spin.value(),
-                                 on_event=self.bridge.dispatch)
+        try:
+            self.queue = RenderQueue(jobs, max_parallel=self.parallel_spin.value(),
+                                     on_event=self.bridge.dispatch)
+        except ValueError as exc:
+            # A dependency cycle in the scene: nothing can ever be scheduled.
+            self.queue = None
+            self._set_status(str(exc), "error")
+            QMessageBox.critical(self, "Cannot build the queue", str(exc))
+            return
+
+        for warning in self.queue.warnings:
+            self.log_view.appendPlainText(f"warning: {warning}")
+
         self.tasks = self.queue.tasks
         self._populate_task_table()
 
         self.render_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self._set_status(f"Rendering {len(jobs)} chunk(s).")
+        self._set_status(f"{verb} {len(jobs)} chunk(s).")
         self.queue.start()
 
     @Slot()
@@ -1431,10 +1539,16 @@ class LauncherWindow(QMainWindow):
         self.render_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         failed = sum(1 for t in queue.tasks if t.state is State.FAILED)
+        # Skipped chunks never ran -- something they depend on did not finish.
+        # Reporting only "done" would claim a complete render that isn't one.
+        skipped = sum(1 for t in queue.tasks if t.state is State.SKIPPED)
         done = sum(1 for t in queue.tasks if t.state is State.DONE)
         self.overall_bar.setValue(100)
-        if failed:
-            self._set_status(f"{done} chunk(s) rendered, {failed} failed.", "error")
+        if failed or skipped:
+            trailer = f"{failed} failed" if failed else ""
+            if skipped:
+                trailer += f"{', ' if trailer else ''}{skipped} skipped"
+            self._set_status(f"{done} chunk(s) rendered, {trailer}.", "error")
         else:
             self._set_status(f"{done} chunk(s) rendered.")
 

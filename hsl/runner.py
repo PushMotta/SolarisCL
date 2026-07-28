@@ -28,6 +28,11 @@ class State(str, Enum):
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SKIPPED = "skipped"        # something it depended on did not finish
+
+
+# States a task can no longer leave.
+TERMINAL_STATES = (State.DONE, State.FAILED, State.CANCELLED, State.SKIPPED)
 
 
 @dataclass
@@ -73,10 +78,56 @@ class RenderQueue:
         self.on_event = on_event or (lambda *a, **k: None)
         self.keep_log_lines = keep_log_lines
         self.env = env
+        self.warnings: list[str] = []
         self._cancel = threading.Event()
         self._lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._slots = threading.Semaphore(self.max_parallel)
+        self._known_ids = {t.job.task_id for t in self.tasks if t.job.task_id}
+        self._validate_dependencies()
+
+    def _validate_dependencies(self) -> None:
+        """Reject cycles up front; note references this queue cannot resolve.
+
+        A cycle can never be scheduled, so it is a construction error rather
+        than something to discover halfway through a render.
+
+        An *unknown* dependency is a different thing and must not raise:
+        rendering one ROP out of a scene legitimately leaves its upstream out
+        of the queue. Those are treated as already satisfied and recorded in
+        ``warnings``, so the decision is visible rather than silent.
+        """
+        edges: dict[str, set] = {}
+        for task in self.tasks:
+            tid = task.job.task_id
+            if tid:
+                edges.setdefault(tid, set()).update(task.job.depends_on or ())
+
+        known = set(edges)
+        for tid in sorted(edges):
+            for dep in sorted(edges[tid] - known):
+                self.warnings.append(
+                    f"{tid} depends on {dep}, which is not in this queue -- "
+                    f"treating it as already finished."
+                )
+
+        # Kahn's algorithm: peel off everything with no outstanding
+        # dependency. Whatever will not peel is in a cycle.
+        remaining = {tid: set(deps) & known for tid, deps in edges.items()}
+        peeled = True
+        while peeled:
+            peeled = False
+            for tid in [t for t, deps in remaining.items() if not deps]:
+                del remaining[tid]
+                for deps in remaining.values():
+                    deps.discard(tid)
+                peeled = True
+        if remaining:
+            raise ValueError(
+                "dependency cycle between: " + ", ".join(sorted(remaining))
+                + " -- these tasks each wait on another in the group, so none "
+                  "of them can ever start."
+            )
 
     # -- lifecycle --------------------------------------------------------
 
@@ -98,8 +149,7 @@ class RenderQueue:
 
     @property
     def finished(self) -> bool:
-        return all(t.state in (State.DONE, State.FAILED, State.CANCELLED)
-                   for t in self.tasks)
+        return all(t.state in TERMINAL_STATES for t in self.tasks)
 
     @property
     def progress(self) -> int:
@@ -108,32 +158,114 @@ class RenderQueue:
             return 100
         total = 0
         for task in self.tasks:
-            if task.state in (State.DONE, State.CANCELLED):
-                total += 100
-            elif task.state is State.FAILED:
-                total += 100
-            else:
-                total += task.progress
+            # Every terminal state counts as finished work, however it ended:
+            # the bar tracks "how much of the queue is left", not success.
+            total += 100 if task.state in TERMINAL_STATES else task.progress
         return total // len(self.tasks)
 
     # -- internals --------------------------------------------------------
 
-    def _drive(self) -> None:
-        for task in self.tasks:
-            if self._cancel.is_set():
-                break
-            self._slots.acquire()
-            if self._cancel.is_set():
-                self._slots.release()
-                break
-            thread = threading.Thread(target=self._run_task, args=(task,),
-                                      name=f"hsl-{task.job.chunk}", daemon=True)
-            thread.start()
-            self._threads.append(thread)
+    def _group_status(self):
+        """(finished ok, will never finish) over task ids. Call under the lock.
 
-        for thread in self._threads:
-            thread.join()
-        self.on_event("queue_finished", self)
+        A task id covers every chunk of one OutputTask, so it counts as done
+        only when *all* of its chunks are -- half a cache is not an input its
+        dependants can use.
+        """
+        groups: dict[str, list] = {}
+        for task in self.tasks:
+            tid = task.job.task_id
+            if tid:
+                groups.setdefault(tid, []).append(task)
+
+        done, blocked = set(), set()
+        for tid, members in groups.items():
+            states = {m.state for m in members}
+            if states & {State.FAILED, State.CANCELLED, State.SKIPPED}:
+                blocked.add(tid)
+            elif states == {State.DONE}:
+                done.add(tid)
+        return done, blocked
+
+    def _classify(self):
+        """Sort pending tasks into (start now, skip, keep waiting).
+
+        Anything returned in the first list is already marked RUNNING, so a
+        second pass around the driver loop cannot start it twice.
+        """
+        launch, skipped, waiting = [], [], []
+        with self._lock:
+            done, blocked = self._group_status()
+            for task in self.tasks:
+                if task.state is not State.PENDING:
+                    continue
+                deps = task.job.depends_on or ()
+                if any(dep in blocked for dep in deps):
+                    task.state = State.SKIPPED
+                    task.finished_at = time.time()
+                    self._record(task, "Skipped: a task it depends on did not "
+                                       "finish successfully.")
+                    skipped.append(task)
+                elif all(dep in done or dep not in self._known_ids
+                         for dep in deps):
+                    task.state = State.RUNNING          # claim it
+                    launch.append(task)
+                else:
+                    waiting.append(task)
+        return launch, skipped, waiting
+
+    def _running_count(self) -> int:
+        with self._lock:
+            return sum(1 for t in self.tasks if t.state is State.RUNNING)
+
+    def _abandon(self, waiting) -> None:
+        """Nothing is running and nothing can start -- give up on the rest."""
+        with self._lock:
+            for task in waiting:
+                if task.state is State.PENDING:
+                    task.state = State.SKIPPED
+                    task.finished_at = time.time()
+                    self._record(task, "Skipped: its dependencies can never "
+                                       "be satisfied.")
+        for task in waiting:
+            self.on_event("task_finished", task)
+
+    def _drive(self) -> None:
+        try:
+            while not self._cancel.is_set():
+                launch, skipped, waiting = self._classify()
+
+                for task in skipped:
+                    self.on_event("task_finished", task)
+
+                for task in launch:
+                    if self._cancel.is_set():
+                        break
+                    self._slots.acquire()
+                    if self._cancel.is_set():
+                        self._slots.release()
+                        break
+                    thread = threading.Thread(
+                        target=self._run_task, args=(task,),
+                        name=f"hsl-{task.job.chunk}", daemon=True)
+                    thread.start()
+                    self._threads.append(thread)
+
+                if launch or skipped:
+                    continue                    # re-check: that may have freed more
+                if not waiting:
+                    break                       # nothing left to start
+                if self._running_count() == 0:
+                    # Nothing running and nothing runnable. Cycles are rejected
+                    # in the constructor, so this is a safety net rather than an
+                    # expected path -- but hanging forever would be worse.
+                    self._abandon(waiting)
+                    break
+                time.sleep(0.02)                # wait for a dependency to land
+        finally:
+            for thread in list(self._threads):
+                thread.join()
+            self.on_event("queue_finished", self)
 
     def _run_task(self, task: Task) -> None:
         try:

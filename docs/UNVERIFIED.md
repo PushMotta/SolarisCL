@@ -362,9 +362,29 @@ destinations are reported as a warning rather than silently overwriting.
 | F1 | hython/husk under `$HFS/bin` | 21.0.729, 22.0.368 | 2026-07-24 | |
 | F4 | hython bridge imports `hsl.inspector`, `describe_rop()` runs | 21.0.729, 22.0.368 | 2026-07-24 | |
 | F5 | `hou.hipFile.load` signature | 21.0.729, 22.0.368 | 2026-07-24 | |
+| K1 | non-Solaris ROP type names (`geometry`, `ifd`, `opengl`, `comp`, `dop`, `alembic`, `filmboxfbx`, `channel`, `baketexture`, `fetch`, `merge`, `rop_geometry`) all exist and expose `.render()` | 21.0.729, 22.0.368 | 2026-07-28 | both builds agreed exactly; `usdrender_rop`/`usd_rop` are **not** creatable in `/out` (LOP context only), which is why `find_render_rops` scans `/stage` |
+| K2 | output parms: `sopoutput` (geometry, rop_geometry), `vm_picture` (ifd), `picture` (opengl), `copoutput` (comp), `dopoutput` (dop), `filename` (alembic), `file` (filecache) | 21.0.729, 22.0.368 | 2026-07-28 | read via `_parm_raw` so `$F4` survives; evaluating instead would name every frame after frame 1 |
+| K3 | `filecache::2.0` has **no** `.render()`; it wraps a `render` child of type `rop_geometry` that does | 21.0.729, 22.0.368 | 2026-07-28 | driving the inner ROP with `frame_range=(5,6,1)` wrote exactly frames 5–6 |
+| K4 | pressing a File Cache SOP's `execute` ignores an externally set range | 21.0.729, 22.0.368 | 2026-07-28 | `f1`/`f2` default to `$FSTART`/`$FEND` **expressions**; `.set()` does not beat them without `deleteAllKeyframes()`. This is why hsl drives the inner ROP instead |
+| K5 | `cachesim` defaults to **1** on `filecache::2.0`; `trange` menu is only `('off','normal')` | 21.0.729, 22.0.368 | 2026-07-28 | so a stock File Cache SOP is treated as sequential and never chunked — conservative on purpose |
+| K6 | ROP dependencies readable from `inputs()`; `fetch` points via its `source` parm | 21.0.729, 22.0.368 | 2026-07-28 | `merge`/other non-task nodes are traversed through, not reported |
+| K-COOK | **end-to-end headless cook** | 22.0.368 | 2026-07-28 | throwaway scene: `find_output_tasks` found 4 tasks (2 geometry ROPs, 1 dop, 1 filecache in `/obj`), classified cache/cache/sim/cache, read `final_rop → cache_rop` off the input chain, and the queue wrote **6 real `.bgeo.sc` files**; sequential filecache stayed 1 chunk under `chunk_size=2` |
 
 ## Still unknown (do not guess)
 
+- **K7** — whether `--output` on a **File Cache SOP** cook actually repoints the
+  cache. `cook_task` sets the SOP's own `file` parm (the one an artist sees) and
+  falls back to the inner ROP's `sopoutput`, but whether the two are linked in
+  both directions was not probed. Overriding the output of a *ROP* task **is**
+  verified (K2). Check: cook a filecache with `--output` and see where the files
+  land.
+- **K8** — sim correctness itself. A DOP ROP is classified `sim` and cooked in
+  one ordered call, which is the *right shape*, but no real solver was run to
+  confirm the cache matches an in-session sim. Check: cook a pyro/RBD setup with
+  and without hsl and diff the frames.
+- **K9** — `initsim` as a sequential signal is read but was only observed at its
+  default (0). Whether enabling it on a Geometry ROP genuinely implies
+  frame-to-frame state was not tested.
 - **A3** — the `::`-versioned type-name split path.
 - **E8/E9** — accepted values for `--complexity` and `--purpose`.
 - **F2/F3** — Karma license behaviour and the Indie resolution cap.

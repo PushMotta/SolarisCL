@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import stat
 import struct
@@ -12,20 +13,24 @@ import unittest
 import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hsl import bridge, farm, husk as husk_mod, inspector, preflight, presets, resources
+from hsl import (
+    bridge, cli as cli_mod, farm, husk as husk_mod, inspector, preflight,
+    presets, resources,
+)
 from hsl.bridge import (
     find_hython, list_hython_installations, load_user_settings, save_user_setting,
 )
 from hsl.cli import (
-    _resolve_hython_choice, build_parser, cmd_render, parse_frames,
+    _resolve_hython_choice, build_parser, cmd_cook, cmd_render, parse_frames,
 )
 from hsl.husk import (
-    DEFAULT_ENGINE, FrameChunk, RenderJob, build_command, expand_frame_token,
-    format_command, frame_chunks, has_unexpanded_tokens, jobs_for_rop,
-    looks_like_error, parse_progress,
+    DEFAULT_ENGINE, FrameChunk, RenderJob, build_command, chunks_for_task,
+    expand_frame_token, format_command, frame_chunks, has_unexpanded_tokens,
+    jobs_for_rop, jobs_for_task, looks_like_error, parse_progress,
 )
 from hsl.manifest import (
-    Camera, LiveVolume, MissingAsset, RenderProduct, RenderRop, RenderSettings,
+    TASK_CACHE, TASK_RENDER, TASK_SIM, TASK_UNKNOWN, Camera, LiveVolume,
+    MissingAsset, OutputTask, RenderProduct, RenderRop, RenderSettings,
     RenderVar, SceneManifest,
 )
 from hsl.runner import RenderQueue, State
@@ -1243,6 +1248,425 @@ class TestAppIcon(unittest.TestCase):
         finally:
             resources.ASSET_DIR = original
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class TestOutputTask(unittest.TestCase):
+    """The generalised scheduling unit: any cookable node, not just Solaris."""
+
+    def test_frame_count_matches_the_range(self):
+        task = OutputTask(node_path="/out/cache", use_frame_range=True,
+                          frame_start=1, frame_end=100, frame_inc=2)
+        self.assertEqual(task.frame_count, 50)
+
+    def test_single_frame_task_counts_one(self):
+        self.assertEqual(OutputTask(node_path="/out/x").frame_count, 1)
+
+    def test_a_simulation_cannot_declare_itself_parallelisable(self):
+        """Frame N of a sim depends on N-1. A sim claiming otherwise is a bug,
+        so the manifest refuses to represent it rather than trusting it."""
+        task = OutputTask(node_path="/out/dop", kind=TASK_SIM, sequential=False)
+        self.assertTrue(task.sequential)
+
+    def test_other_kinds_keep_the_flag_they_were_given(self):
+        self.assertFalse(OutputTask(node_path="/out/c", kind=TASK_CACHE).sequential)
+        self.assertTrue(OutputTask(node_path="/out/c", kind=TASK_CACHE,
+                                   sequential=True).sequential)
+        self.assertEqual(OutputTask(node_path="/out/x").kind, TASK_UNKNOWN)
+
+    def test_tasks_survive_a_json_round_trip(self):
+        manifest = sample_manifest()
+        manifest.tasks = [
+            OutputTask(node_path="/out/cache", kind=TASK_CACHE,
+                       use_frame_range=True, frame_start=1, frame_end=10,
+                       outputs=["/jobs/cache/geo.$F4.bgeo.sc"]),
+            OutputTask(node_path="/out/dop", kind=TASK_SIM,
+                       depends_on=["/out/cache"]),
+        ]
+        back = SceneManifest.from_json(manifest.to_json())
+
+        self.assertEqual(len(back.tasks), 2)
+        self.assertIsInstance(back.tasks[0], OutputTask)
+        self.assertEqual(back.tasks[0].outputs, ["/jobs/cache/geo.$F4.bgeo.sc"])
+        self.assertEqual(back.tasks[1].depends_on, ["/out/cache"])
+        self.assertTrue(back.tasks[1].sequential)
+
+    def test_a_manifest_written_before_tasks_existed_still_loads(self):
+        """Schema 1 has no 'tasks' key. Old cached manifests live in %TEMP%
+        and must not become a crash on upgrade."""
+        old = json.dumps({
+            "schema_version": 1,
+            "hip_path": "/jobs/shot.hip",
+            "rops": [{"node_path": "/stage/r1", "node_type": "usdrender_rop"}],
+        })
+        manifest = SceneManifest.from_json(old)
+        self.assertEqual(manifest.tasks, [])
+        self.assertEqual(len(manifest.rops), 1)
+
+    def test_lookups(self):
+        manifest = SceneManifest(tasks=[
+            OutputTask(node_path="/out/a", kind=TASK_CACHE),
+            OutputTask(node_path="/out/b", kind=TASK_RENDER),
+        ])
+        self.assertEqual(manifest.task("/out/a").kind, TASK_CACHE)
+        self.assertIsNone(manifest.task("/out/nope"))
+        self.assertEqual([t.node_path for t in manifest.tasks_of_kind(TASK_RENDER)],
+                         ["/out/b"])
+
+
+class TestSequentialChunking(unittest.TestCase):
+    """Splitting a simulation across processes corrupts it silently, so the
+    chunker must refuse to do it."""
+
+    def _task(self, **kw):
+        base = dict(node_path="/out/task", use_frame_range=True,
+                    frame_start=1, frame_end=100, frame_inc=1)
+        base.update(kw)
+        return OutputTask(**base)
+
+    def test_independent_frames_chunk_normally(self):
+        chunks = chunks_for_task(self._task(kind=TASK_CACHE), chunk_size=10)
+        self.assertEqual(len(chunks), 10)
+        self.assertEqual(chunks[0].start, 1)
+        self.assertEqual(chunks[0].count, 10)
+
+    def test_a_simulation_is_never_split_however_it_is_asked(self):
+        chunks = chunks_for_task(self._task(kind=TASK_SIM), chunk_size=10)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].start, 1)
+        self.assertEqual(chunks[0].count, 100)
+
+    def test_sequential_flag_alone_is_enough(self):
+        """A cache reading from a solver carries state between frames too."""
+        task = self._task(kind=TASK_CACHE, sequential=True)
+        self.assertEqual(len(chunks_for_task(task, chunk_size=5)), 1)
+
+    def test_single_frame_task_gives_one_chunk(self):
+        chunks = chunks_for_task(self._task(use_frame_range=False), chunk_size=10)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].count, 1)
+
+    def test_jobs_carry_identity_and_dependencies_onto_every_chunk(self):
+        manifest = SceneManifest(hip_path="/jobs/shot.hip")
+        task = self._task(kind=TASK_CACHE, depends_on=["/out/upstream"],
+                          outputs=["/jobs/geo.$F4.bgeo.sc"])
+        jobs = jobs_for_task(manifest, task, chunk_size=25)
+
+        self.assertEqual(len(jobs), 4)
+        for job in jobs:
+            self.assertEqual(job.task_id, "/out/task")
+            self.assertEqual(job.depends_on, ["/out/upstream"])
+            self.assertEqual(job.expected_outputs, ["/jobs/geo.$F4.bgeo.sc"])
+            self.assertEqual(job.engine, "hython")
+            self.assertEqual(job.renderer, "")   # meaningless for a cache
+
+    def test_husk_is_refused_for_work_it_cannot_do(self):
+        """husk consumes USD; it cannot cook a SOP or advance a solver."""
+        manifest = SceneManifest(hip_path="/jobs/shot.hip")
+        with self.assertRaises(ValueError) as ctx:
+            jobs_for_task(manifest, self._task(kind=TASK_CACHE), engine="husk")
+        self.assertIn("husk", str(ctx.exception))
+
+    def test_husk_is_still_allowed_for_a_render_task(self):
+        manifest = SceneManifest(hip_path="/jobs/shot.hip")
+        jobs = jobs_for_task(manifest, self._task(kind=TASK_RENDER),
+                             engine="husk", chunk_size=50)
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(jobs[0].engine, "husk")
+
+
+class TestCookCli(unittest.TestCase):
+    """`hsl cook` selection and reporting. The queue itself is covered by
+    TestQueueDependencies; this is about picking the right work."""
+
+    def _manifest(self):
+        return SceneManifest(hip_path="/jobs/shot.hip", tasks=[
+            OutputTask(node_path="/out/cache", kind=TASK_CACHE,
+                       use_frame_range=True, frame_start=1, frame_end=10),
+            OutputTask(node_path="/out/sim", kind=TASK_SIM,
+                       use_frame_range=True, frame_start=1, frame_end=10,
+                       depends_on=["/out/cache"]),
+            OutputTask(node_path="/out/mantra", kind=TASK_RENDER),
+        ])
+
+    def _args(self, argv):
+        return build_parser().parse_args(argv)
+
+    def test_cook_defaults_leave_rendering_to_the_render_command(self):
+        tasks, missing = cli_mod._select_tasks(
+            self._manifest(), [], (TASK_CACHE, TASK_SIM))
+        self.assertEqual([t.node_path for t in tasks], ["/out/cache", "/out/sim"])
+        self.assertEqual(missing, [])
+
+    def test_explicit_task_paths_override_the_kind_filter(self):
+        tasks, missing = cli_mod._select_tasks(
+            self._manifest(), ["/out/mantra"], (TASK_CACHE,))
+        self.assertEqual([t.node_path for t in tasks], ["/out/mantra"])
+        self.assertEqual(missing, [])
+
+    def test_an_unknown_task_path_is_reported_not_ignored(self):
+        tasks, missing = cli_mod._select_tasks(
+            self._manifest(), ["/out/nope"], (TASK_CACHE,))
+        self.assertEqual(tasks, [])
+        self.assertEqual(missing, ["/out/nope"])
+
+    def test_the_plan_says_when_chunking_was_dropped(self):
+        """Silently ignoring --chunk would look like it was honoured."""
+        sequential = OutputTask(node_path="/out/sim", kind=TASK_SIM,
+                                use_frame_range=True, frame_start=1, frame_end=10)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cli_mod._describe_plan([sequential], 5)
+        text = out.getvalue()
+        self.assertIn("sequential", text)
+        self.assertIn("--chunk ignored", text)
+
+    def test_the_plan_shows_dependencies(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cli_mod._describe_plan(self._manifest().tasks[1:2], 0)
+        self.assertIn("after: /out/cache", out.getvalue())
+
+    def test_one_output_path_cannot_be_shared_by_many_tasks(self):
+        manifest = self._manifest()
+        original = bridge.inspect_hip
+        bridge.inspect_hip = lambda *a, **k: manifest
+        try:
+            args = self._args(["cook", "s.hip", "--output", "/tmp/one.bgeo.sc"])
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cmd_cook(args)
+        finally:
+            bridge.inspect_hip = original
+        self.assertEqual(code, 4)
+        self.assertIn("--task", err.getvalue())
+
+    def test_cook_parser_defaults(self):
+        args = self._args(["cook", "s.hip"])
+        self.assertEqual(args.chunk, 0)
+        self.assertEqual(args.parallel, 1)
+        self.assertEqual(args.kind, "")
+        self.assertEqual(args.task, [])
+        self.assertFalse(args.dry_run)
+
+
+class TestConsoleEncoding(unittest.TestCase):
+    """A fresh Windows console is cp1252. Printing a character it cannot map
+    raises UnicodeEncodeError half way through a report -- the user loses the
+    output and gets a traceback about a decoration."""
+
+    def test_cli_prints_nothing_a_cp1252_console_would_choke_on(self):
+        offenders = {}
+        for name in ("cli.py", "husk.py", "runner.py", "bridge.py",
+                     "preflight.py", "inspector.py"):
+            path = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "hsl", name)
+            with io.open(path, encoding="utf-8") as fh:
+                for number, line in enumerate(fh, 1):
+                    for char in line:
+                        if ord(char) < 128:
+                            continue
+                        try:
+                            char.encode("cp1252")
+                        except UnicodeEncodeError:
+                            offenders.setdefault(
+                                f"{name}:{number}", set()).add(hex(ord(char)))
+        self.assertEqual(offenders, {},
+                         "these would crash `hsl inspect` on a default "
+                         "Windows console; use an ASCII equivalent")
+
+    def test_making_the_console_safe_never_raises(self):
+        """Called on every run, including when stdout is a pipe or a StringIO."""
+        original = sys.stdout
+        try:
+            sys.stdout = io.StringIO()
+            cli_mod._make_console_safe()
+        finally:
+            sys.stdout = original
+
+
+class TestCookCommands(unittest.TestCase):
+    """Cooking a cache is not rendering: it goes to a different inspector
+    entry point and must not carry render-only flags."""
+
+    def _task(self, **kw):
+        base = dict(node_path="/obj/geo1/filecache1", use_frame_range=True,
+                    frame_start=1, frame_end=10, frame_inc=1, kind=TASK_CACHE)
+        base.update(kw)
+        return OutputTask(**base)
+
+    def _cmd(self, task, **over):
+        manifest = SceneManifest(hip_path="/jobs/shot.hip")
+        jobs = jobs_for_task(manifest, task, hython_exe="hython", **over)
+        return build_command(jobs[0]), jobs[0]
+
+    def test_a_cache_job_uses_the_cook_entry_point(self):
+        cmd, _ = self._cmd(self._task())
+        self.assertIn("--cook", cmd)
+        self.assertNotIn("--render-direct", cmd)
+        self.assertIn("--rop", cmd)
+        self.assertEqual(cmd[cmd.index("--rop") + 1], "/obj/geo1/filecache1")
+
+    def test_a_render_job_is_unchanged(self):
+        cmd, _ = self._cmd(self._task(kind=TASK_RENDER))
+        self.assertIn("--render-direct", cmd)
+        self.assertNotIn("--cook", cmd)
+
+    def test_a_simulation_asks_for_an_ordered_single_call(self):
+        cmd, job = self._cmd(self._task(kind=TASK_SIM))
+        self.assertTrue(job.sequential)
+        self.assertIn("--sequential", cmd)
+        # ...and the whole range went into one chunk.
+        self.assertEqual(cmd[cmd.index("--frame-count") + 1], "10")
+
+    def test_a_plain_cache_is_not_marked_sequential(self):
+        cmd, _ = self._cmd(self._task(kind=TASK_CACHE))
+        self.assertNotIn("--sequential", cmd)
+
+    def test_render_only_flags_are_left_off_a_cook(self):
+        """A renderer or resolution on a geometry cache is meaningless, and a
+        stray --output would repoint the cache."""
+        cmd, _ = self._cmd(self._task(), renderer="BRAY_HdKarma",
+                           camera="/cameras/cam1", resolution=(960, 540))
+        for flag in ("--renderer", "--camera", "--res", "--settings"):
+            self.assertNotIn(flag, cmd)
+
+    def test_an_explicit_output_still_reaches_the_cook(self):
+        cmd, _ = self._cmd(self._task(), output="/jobs/out/geo.$F4.bgeo.sc")
+        self.assertIn("--output", cmd)
+        self.assertEqual(cmd[cmd.index("--output") + 1], "/jobs/out/geo.$F4.bgeo.sc")
+
+    def test_frame_tokens_survive_into_expected_outputs(self):
+        """The template must stay a template -- evaluating it at scan time
+        would claim every frame writes to frame 1's file."""
+        _, job = self._cmd(self._task(outputs=["/jobs/geo.$F4.bgeo.sc"]))
+        self.assertEqual(job.expected_outputs, ["/jobs/geo.$F4.bgeo.sc"])
+        self.assertTrue(has_unexpanded_tokens(job.expected_outputs[0]))
+
+
+class TestQueueDependencies(unittest.TestCase):
+    """Dependency ordering, skipping and cycle rejection, against a fake binary.
+
+    Every assertion here is on scheduling *decisions* rather than wall-clock
+    overlap, so none of it depends on how fast the machine spawns processes.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        script = os.path.join(self.dir, "fake_rop.py")
+        with open(script, "w") as fh:
+            fh.write(
+                "import sys, time\n"
+                "time.sleep(0.03)\n"
+                "print('ALF_PROGRESS 100%', flush=True)\n"
+                "sys.exit(7 if '--make-it-fail' in sys.argv else 0)\n"
+            )
+        if os.name == "nt":
+            self.exe = os.path.join(self.dir, "fake_rop.bat")
+            with open(self.exe, "w") as fh:
+                fh.write(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        else:
+            os.chmod(script, os.stat(script).st_mode | stat.S_IEXEC)
+            self.exe = script
+
+    def job(self, task_id, depends_on=(), fail=False, start=1):
+        return RenderJob(
+            usd_file=os.path.join(self.dir, "shot.usd"),
+            engine="husk",                  # the fake binary stands in for husk
+            husk_exe=self.exe,
+            chunk=FrameChunk(start, 1, 1),
+            task_id=task_id,
+            depends_on=list(depends_on),
+            extra_args=["--make-it-fail"] if fail else [],
+        )
+
+    def _run(self, jobs, **kwargs):
+        events = []
+        queue = RenderQueue(jobs, on_event=lambda *a: events.append(a), **kwargs)
+        queue.start(block=True)
+        seq = [(name, payload[0].job.task_id) for name, *payload in events
+               if name in ("task_started", "task_finished")]
+        return queue, seq
+
+    def test_a_dependant_starts_only_after_its_prerequisite_finishes(self):
+        # The dependant is listed *first*, so an in-order scheduler fails this.
+        queue, seq = self._run([
+            self.job("/out/sim", depends_on=["/out/cache"]),
+            self.job("/out/cache"),
+        ], max_parallel=4)
+
+        self.assertTrue(all(t.state is State.DONE for t in queue.tasks))
+        self.assertLess(seq.index(("task_finished", "/out/cache")),
+                        seq.index(("task_started", "/out/sim")))
+
+    def test_a_dependant_waits_for_every_chunk_of_its_prerequisite(self):
+        """Half a cache is not an input anything downstream can use."""
+        queue, seq = self._run([
+            self.job("/out/cache", start=1),
+            self.job("/out/cache", start=2),
+            self.job("/out/cache", start=3),
+            self.job("/out/sim", depends_on=["/out/cache"]),
+        ], max_parallel=4)
+
+        self.assertTrue(all(t.state is State.DONE for t in queue.tasks))
+        last_chunk = max(i for i, entry in enumerate(seq)
+                         if entry == ("task_finished", "/out/cache"))
+        self.assertLess(last_chunk, seq.index(("task_started", "/out/sim")))
+
+    def test_diamond_dependencies_resolve(self):
+        queue, seq = self._run([
+            self.job("/out/d", depends_on=["/out/b", "/out/c"]),
+            self.job("/out/b", depends_on=["/out/a"]),
+            self.job("/out/c", depends_on=["/out/a"]),
+            self.job("/out/a"),
+        ], max_parallel=4)
+
+        self.assertTrue(all(t.state is State.DONE for t in queue.tasks))
+        start_d = seq.index(("task_started", "/out/d"))
+        for upstream in ("/out/a", "/out/b", "/out/c"):
+            self.assertLess(seq.index(("task_finished", upstream)), start_d)
+
+    def test_dependants_are_skipped_when_a_prerequisite_fails(self):
+        queue, _ = self._run([
+            self.job("/out/cache", fail=True),
+            self.job("/out/sim", depends_on=["/out/cache"]),
+        ])
+        states = {t.job.task_id: t.state for t in queue.tasks}
+        self.assertIs(states["/out/cache"], State.FAILED)
+        self.assertIs(states["/out/sim"], State.SKIPPED)
+        self.assertTrue(queue.finished)
+        skipped = next(t for t in queue.tasks if t.state is State.SKIPPED)
+        self.assertTrue(any("depends on" in line for line in skipped.log))
+
+    def test_a_skipped_task_does_not_strand_the_queue(self):
+        """A skip is terminal, so the bar reaches 100 and the queue ends."""
+        queue, _ = self._run([
+            self.job("/out/a", fail=True),
+            self.job("/out/b", depends_on=["/out/a"]),
+        ])
+        self.assertEqual(queue.progress, 100)
+
+    def test_a_dependency_cycle_is_refused_before_anything_runs(self):
+        with self.assertRaises(ValueError) as ctx:
+            RenderQueue([self.job("/out/a", depends_on=["/out/b"]),
+                         self.job("/out/b", depends_on=["/out/a"])])
+        message = str(ctx.exception)
+        self.assertIn("cycle", message)
+        self.assertIn("/out/a", message)
+
+    def test_an_unknown_dependency_runs_anyway_and_says_so(self):
+        """Rendering one ROP out of a scene legitimately leaves its upstream
+        out of the queue -- that must not deadlock, but must not be silent."""
+        queue, _ = self._run([self.job("/out/sim", depends_on=["/out/absent"])])
+        self.assertIs(queue.tasks[0].state, State.DONE)
+        self.assertTrue(any("not in this queue" in w for w in queue.warnings))
+
+    def test_jobs_without_task_ids_behave_exactly_as_before(self):
+        """The Solaris path sets neither field; order must be untouched."""
+        jobs = [RenderJob(usd_file=os.path.join(self.dir, "shot.usd"),
+                          engine="husk", husk_exe=self.exe,
+                          chunk=FrameChunk(n, 1, 1)) for n in (1, 2, 3)]
+        queue, seq = self._run(jobs, max_parallel=1)
+        self.assertTrue(all(t.state is State.DONE for t in queue.tasks))
+        self.assertEqual([name for name, _ in seq].count("task_started"), 3)
+        self.assertEqual(queue.warnings, [])
 
 
 if __name__ == "__main__":

@@ -94,6 +94,33 @@ python -m hsl.cli render shot.hip --frames 1050 --res 960 540 \
 python -m hsl.cli ui shot.hip
 ```
 
+## Caches and simulations
+
+`hsl` is not only a render launcher: it cooks the rest of a `.hip` headless
+too — File Cache SOPs, Geometry/Alembic/DOP ROPs and the other `/out`
+contexts. `hsl inspect` lists them; `hsl cook` runs them.
+
+```bash
+python -m hsl.cli inspect shot.hip                 # lists cookable tasks too
+python -m hsl.cli cook shot.hip                    # every cache and sim
+python -m hsl.cli cook shot.hip --task /obj/geo1/filecache1
+python -m hsl.cli cook shot.hip --kind sim --dry-run
+```
+
+Dependencies are read from the scene — a ROP wired downstream of another, or a
+`fetch` node pointing at one — so tasks run in the right order without being
+sequenced by hand. A task whose dependency fails is reported as **skipped**
+rather than run against a missing input.
+
+**Simulations are never chunked.** Frame N of a sim depends on N-1, so
+splitting one across processes would give each a cold start at its boundary and
+write a silently wrong cache. `--chunk` is ignored for anything sequential —
+which includes File Cache SOPs, whose `cachesim` parameter defaults to on — and
+`hsl cook` says so rather than letting the flag look respected.
+
+This runs entirely under `hython`; husk is not involved and cannot be, since it
+only consumes USD.
+
 As a library:
 
 ```python
@@ -180,7 +207,7 @@ On Indie, husk is capped at 1920×1080.
 ## Verified vs. not
 
 The manifest, chunking, command construction, progress parsing and the process
-queue are covered by 139 tests, including a fake husk that exercises the full
+queue are covered by 177 tests, including a fake husk that exercises the full
 run/cancel/failure path:
 
 ```bash
