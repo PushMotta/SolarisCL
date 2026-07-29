@@ -642,8 +642,10 @@ class LauncherWindow(QMainWindow):
         self.log_view.setMaximumBlockCount(5000)
         self.log_view.setPlaceholderText("husk output appears here.")
         q_layout.addWidget(self.log_view, 1)
-        self.tabs.addTab(queue_widget, "Queue & Logs")
-        self.tabs.addTab(self._build_tasks_panel(), "Caches & Sims")
+        # "&&" is a literal ampersand -- a single "&" is a mnemonic marker, so
+        # these rendered as "Queue _Logs" and "Caches _Sims".
+        self.tabs.addTab(queue_widget, "Queue && Logs")
+        self.tabs.addTab(self._build_tasks_panel(), "Caches && Sims")
 
         layout.addWidget(self.tabs, 1)
         return box
