@@ -11,8 +11,9 @@ renders **and**, as of this session, caches and simulations. GUI + CLI +
 library. The plain-Python half stays testable with no Houdini installed.
 
 - **Repo:** github.com/PushMotta/SolarisCL (private, `main`).
-  Local `main` = `2da5054`; `origin/main` = `0cfabc8`. **One commit is
-  unpushed** (the UI mode restructure).
+  Do not trust this file for push state — run
+  `git log --oneline origin/main..main`. At rewrite time the UI mode
+  restructure and this rewrite itself had not been pushed.
 - **Green:** 186 tests in 33 classes, boundary lint, 55 drift checks,
   ui-imports, whitespace. `python -m unittest discover -s tests` needs no
   Houdini.
