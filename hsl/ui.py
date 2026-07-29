@@ -166,6 +166,8 @@ class QueueBridge(QObject):
 # `palette(mid)` for its whole life, so the messages that matter most — missing
 # textures, volumes that will bake tens of GB on export — were drawn in the same
 # dim grey as the idle placeholder, and were unreadable on a dark theme.
+_DETAIL_PLACEHOLDER = "Read a scene to see its render settings, camera and AOVs."
+
 _STATUS_STYLES = {
     "muted": "color: palette(mid);",
     "info": "color: palette(text);",
@@ -327,18 +329,28 @@ class LauncherWindow(QMainWindow):
     def _build_rop_panel(self) -> QWidget:
         # "&&" because Qt reads a single & as a keyboard accelerator and eats it,
         # which is why these titles used to render with the word missing.
-        box = QGroupBox("Render ROPs && AOV Manager")
+        box = QGroupBox("Scene")
         layout = QVBoxLayout(box)
+
+        # Shown instead of nothing when a scene has no render ROPs. This used
+        # to be a line of grey monospace below an empty AOV list -- the single
+        # most important thing on screen, rendered as the least visible.
+        self.empty_hint = QLabel()
+        self.empty_hint.setWordWrap(True)
+        self.empty_hint.setStyleSheet(_STATUS_STYLES["warning"])
+        self.empty_hint.setVisible(False)
+        layout.addWidget(self.empty_hint)
 
         self.rop_combo = QComboBox()
         layout.addWidget(self.rop_combo)
 
-        # AOV Manager section
-        aov_box = QGroupBox("AOV Manager (Check to include)")
-        aov_layout = QVBoxLayout(aov_box)
+        self.aov_box = QGroupBox("AOVs to render")
+        self.aov_box.setToolTip("Ticked AOVs are kept; the rest are dropped from "
+                           "the exported USD (husk engine only).")
+        aov_layout = QVBoxLayout(self.aov_box)
 
         self.aov_list = QListWidget()
-        self.aov_list.setMaximumHeight(130)
+        self.aov_list.setMinimumHeight(96)
         aov_layout.addWidget(self.aov_list)
 
         aov_btn_row = QHBoxLayout()
@@ -350,14 +362,12 @@ class LauncherWindow(QMainWindow):
         aov_btn_row.addWidget(self.aov_none_btn)
         aov_layout.addLayout(aov_btn_row)
 
-        layout.addWidget(aov_box)
+        layout.addWidget(self.aov_box)
 
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
         self.detail.setFont(QFont(MONO, 9))
-        self.detail.setPlaceholderText(
-            "Read a scene to see its render settings, camera and AOVs."
-        )
+        self.detail.setPlaceholderText(_DETAIL_PLACEHOLDER)
         layout.addWidget(self.detail, 1)
         return box
 
@@ -477,7 +487,7 @@ class LauncherWindow(QMainWindow):
         self.refresh_command()
 
     def _build_override_panel(self) -> QWidget:
-        box = QGroupBox("Overrides && Quality Presets")
+        box = QGroupBox("Render options")
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
 
@@ -485,7 +495,7 @@ class LauncherWindow(QMainWindow):
         self.preset_combo.addItem("Custom Configuration", "")
         for p_name in presets.get_default_presets().keys():
             self.preset_combo.addItem(p_name, p_name)
-        form.addRow("Render Profile", self.preset_combo)
+        form.addRow("Preset", self.preset_combo)
 
         # Hython first: it is the default engine. It renders the ROP directly,
         # so it needs no USD export -- which on a volume-heavy scene would bake
@@ -494,14 +504,14 @@ class LauncherWindow(QMainWindow):
         self.engine_combo = QComboBox()
         self.engine_combo.addItem("Hython (direct ROP, no USD export)", "hython")
         self.engine_combo.addItem("Husk (USD export — needed for AOV filter, relink, farm)", "husk")
-        form.addRow("Render engine", self.engine_combo)
+        form.addRow("Engine", self.engine_combo)
 
         self.renderer_combo = QComboBox()
         self.renderer_combo.setEditable(True)
-        form.addRow("Renderer", self.renderer_combo)
+        form.addRow("Render delegate", self.renderer_combo)
 
         self.settings_combo = QComboBox()
-        form.addRow("Render settings", self.settings_combo)
+        form.addRow("Settings prim", self.settings_combo)
 
         self.camera_combo = QComboBox()
         self.camera_combo.setEditable(True)
@@ -588,7 +598,7 @@ class LauncherWindow(QMainWindow):
         return box
 
     def _build_run_panel(self) -> QWidget:
-        box = QGroupBox("Render && Diagnostics")
+        box = QGroupBox("Run")
         layout = QVBoxLayout(box)
 
         self.preflight_label = QLabel("Preflight: Ready.")
@@ -598,7 +608,7 @@ class LauncherWindow(QMainWindow):
         self.command_view = QPlainTextEdit()
         self.command_view.setReadOnly(True)
         self.command_view.setFont(QFont(MONO, 9))
-        self.command_view.setMaximumHeight(80)
+        self.command_view.setMinimumHeight(56)
         self.command_view.setPlaceholderText("The husk command appears here.")
         layout.addWidget(self.command_view)
 
@@ -614,12 +624,19 @@ class LauncherWindow(QMainWindow):
         self.farm_btn = QPushButton("Submit to Farm…")
         self.overall_bar = QProgressBar()
         self.overall_bar.setRange(0, 100)
+        self.overall_bar.setFormat("%p%")
+        # Idle, an empty progress bar reads as a text field someone forgot to
+        # fill in. It appears when there is progress to report.
+        self.overall_bar.setVisible(False)
         button_row.addWidget(self.render_btn)
         button_row.addWidget(self.cancel_btn)
         button_row.addWidget(self.copy_btn)
         button_row.addWidget(self.relink_btn)
         button_row.addWidget(self.farm_btn)
-        button_row.addWidget(self.overall_bar, 1)
+        # Takes the slack while the bar is hidden, so the buttons keep their
+        # natural width instead of stretching across the window.
+        button_row.addStretch(1)
+        button_row.addWidget(self.overall_bar, 2)
         layout.addLayout(button_row)
 
         self.tabs = QTabWidget()
@@ -633,7 +650,7 @@ class LauncherWindow(QMainWindow):
         self.task_table.verticalHeader().setVisible(False)
         self.task_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.task_table.setMaximumHeight(140)
+        self.task_table.setMinimumHeight(120)
         q_layout.addWidget(self.task_table)
 
         self.log_view = QPlainTextEdit()
@@ -1064,15 +1081,36 @@ class LauncherWindow(QMainWindow):
             found += f" — {len(manifest.warnings)} warning(s)"
         self._set_status(found, level)
 
+        cookable = [t for t in manifest.tasks if t.kind != TASK_RENDER]
+        if manifest.rops:
+            self.empty_hint.setVisible(False)
+        else:
+            # Say what to do next, and point at the tab that can still help --
+            # a scene with no render ROP often still has caches worth cooking.
+            message = ("This scene has no USD Render ROP, so there is nothing "
+                       "to render. Add one at the end of the LOP network, save, "
+                       "and read the scene again.")
+            if cookable:
+                message += (f"\n\nIt does have {len(cookable)} cache/simulation "
+                            f"task(s) — see the “Caches & Sims” tab below.")
+            self.empty_hint.setText(message)
+            self.empty_hint.setVisible(True)
+
         self._set_scene_loaded(bool(manifest.rops))
         if manifest.rops:
+            self.detail.setPlaceholderText(_DETAIL_PLACEHOLDER)
             self.on_rop_changed(0)
         else:
-            self.detail.setPlainText(
-                "No USD Render ROPs in /stage or /out.\n\n"
-                "Add a USD Render ROP at the end of the LOP network, save, "
-                "and read the scene again."
-            )
+            # empty_hint already says this, prominently -- repeating it here in
+            # grey monospace made the panel look full of nothing. The box stays
+            # (it carries the layout's stretch) but loses its placeholder,
+            # which otherwise tells someone who just read a scene to read one.
+            self.detail.clear()
+            self.detail.setPlaceholderText("")
+
+        # An empty AOV list is a large box saying nothing; it earns its space
+        # only once the scene actually declares some.
+        self.aov_box.setVisible(bool(manifest.vars))
 
     @Slot(str)
     def on_scene_failed(self, message: str) -> None:
@@ -1494,6 +1532,7 @@ class LauncherWindow(QMainWindow):
     def _launch_queue(self, jobs: list, verb: str = "Rendering") -> None:
         self.log_view.clear()
         self.overall_bar.setValue(0)
+        self.overall_bar.setVisible(True)
 
         self.bridge = QueueBridge()
         self.bridge.task_started.connect(self.on_task_started)
