@@ -51,6 +51,7 @@ and pass the result through the manifest.
 | `hsl/bridge.py` | plain Python | no | partially |
 | `hsl/husk.py` | plain Python | no | yes |
 | `hsl/runner.py` | plain Python | no | yes (fake husk) |
+| `hsl/progress.py` | plain Python | no | yes |
 | `hsl/ui.py` | plain Python + Qt | no | import-check only |
 | `hsl/cli.py` | plain Python | no | yes |
 

@@ -93,15 +93,118 @@ missing `lopoutput` would export to the wrong path with no warning.
 | D2 | Solaris authors typed `UsdRender.Product` / `UsdRender.Var` prims, not untyped overs | `OK` (22, real scene) — a real Karma shot authored 4 typed `UsdRender.Var` prims; `IsA(UsdRender.Var)` matched them all |
 | D3 | Stage metadata key is `renderSettingsPrimPath` | `OK` (21, 22) |
 | D4 | Karma knobs are attributes on the settings prim in the `karma:` namespace | `OK` (22, real scene) — ~90 `karma:*` / `husk:*` attrs read off the settings prim |
-| D5 | `hou.LopNode.stage()` returns the composed stage at the current time | `OK` (21, 22) |
+| D5 | `hou.LopNode.stage()` returns the composed stage at the current time | `OK` (21, 22) — and the "current time" limitation is now **addressed**, see D9–D11 |
+| D9 | There is **no** `LopNode.stageAtFrame()`; the frame is a keyword on `stage()` | `OK` (21, 22) |
+| D10 | `stage(frame=N)` recomposes per frame and **beats** `hou.setFrame()` | `OK` (21, 22) |
+| D11 | A Solaris network authors **no** stage time code range until a Configure Layer LOP sets `starttime` / `endtime` | `OK` (21, 22) |
+
+### Cooking a LOP at a chosen frame  ·  `OK` (21.0.729, 22.0.368)
+
+`docs/TASKS.md` T5 was written as "uses `stageAtFrame()` when given one".
+**That method does not exist** on either build — a plausible name, recalled
+rather than checked, and exactly the failure this register is for. The complete
+list of stage-ish methods on `hou.LopNode` is identical on 21 and 22:
+
+    editableStage · isMostRecentStageLock · stage · stagePrimStats · uneditableStage
+
+The real mechanism is a keyword argument on `stage()` itself:
+
+```
+stage(self, output_index = -1, apply_viewport_overrides = False,
+      ignore_errors = False, use_last_cook_context_options = True,
+      apply_post_layers = True, frame = None, context_options = {}) -> pxr.Usd.Stage
+```
+
+> *"A frame number can be provided to return the result of cooking the LOP node
+> at a particular frame."*
+
+Probe: `scripts/_probe_frame_cook.py` (self-contained — builds its own network,
+needs no `.hip`). It stands up two `rendersettings` LOPs behind a `switch` whose
+`input` parm is the expression `$F > 5`, so the **set** of `UsdRender.Settings`
+prim paths genuinely differs across the range, and then checks:
+
+| # | Assumption | Status | Evidence |
+|---|---|---|---|
+| D9 | no `LopNode.stageAtFrame()` | `OK` (21, 22) | absent from `dir(hou.LopNode)` on both |
+| D10a | `stage(frame=N)` recomposes | `OK` (21, 22) | frame 1 → `/Render/rendersettings_EARLY`, frame 10 → `…_LATE` |
+| D10b | it is stable when frames are revisited | `OK` (21, 22) | 1, 10, 1, 10 returned the same answer each time — a cook cached at another frame is **not** handed back |
+| D10c | the flip lands where `$F > 5` says | `OK` (21, 22) | frame 5 EARLY, frame 6 LATE |
+| D10d | the explicit frame **beats** `hou.setFrame()` | `OK` (21, 22) | `setFrame(1)` + `stage(frame=10)` → LATE; `setFrame(10)` + `stage(frame=1)` → EARLY |
+| D10e | `hou.setFrame()` + `stage()` also works | `OK` (21, 22) | the fallback for a build with no such keyword |
+
+D10d is the load-bearing one. If the keyword were merely a hint that the global
+frame overrode, `--frame` would silently describe whichever moment the `.hip`
+was saved on — a wrong manifest that looks entirely reasonable. `inspect()`
+still calls `hou.setFrame()` **as well**, because node *parameters* evaluate at
+the global frame and the manifest reads plenty of those (the task scan, `f1`/
+`f2`); the keyword is what makes the stage itself unambiguous. Same
+belt-and-braces idea as `render_direct()` setting `f1`/`f2` *and* passing an
+explicit `frame_range`.
+
+A build without the keyword raises `TypeError`; `_stage_at()` then falls back to
+moving the global frame and **says so in `manifest.warnings`** rather than
+quietly describing the wrong moment. That fallback has never been exercised on a
+real build, because both installs here have the keyword.
+
+### Stage time codes are usually **not** authored  ·  `OK` (21, 22)
+
+The T5 cross-range check needs a range to compare over, and the obvious source
+is the stage's own `GetStartTimeCode()` / `GetEndTimeCode()`. Probed: a
+`rendersettings → switch → usdrender_rop` network reports **`0.0 / 0.0`** with
+`HasAuthoredTimeCodeRange() == False`, with the playbar sitting on 1–10. The
+playbar range does **not** reach the stage.
+
+They appear once a **Configure Layer** LOP sets them — and the parms are
+`setstarttime` / `starttime` / `setendtime` / `endtime`. There is no
+`starttimecode` / `endtimecode` parm on that node (checked, both builds); that
+was the spelling worth guessing wrong.
+
+So `_cross_range_frames()` prefers the stage time code range and **falls back to
+the ROP's own authored frame range** when the stage declares none. Without the
+fallback the check would silently never fire on an ordinary scene, which is the
+under-reporting T5 exists to fix. Demonstrated both ways — see the table below.
+
+**Confirmed on a real production shot**, which is what settles it:
+`SHOT_Train_Aerial_DUDA_v05.hiplc` (167 MB, Karma, Houdini 22.0.368) authors
+**no** stage time code range either — `0.0 / 0.0`,
+`HasAuthoredTimeCodeRange() == False` on all three of its render ROPs, while
+`/stage/usdrender_rop1` carries a perfectly ordinary authored range of
+**1046–1075**. A stage-time-code-only trigger would have skipped the check
+entirely on that shot. The fallback is load-bearing, not a convenience.
+
+That shot also **opens on frame 1074**, not 1 — which is precisely why
+`manifest.inspected_frame` has to be recorded rather than assumed. A consumer
+that guessed "frame 1" would be wrong by 1073 frames.
+
+### What the cross-range check costs  ·  measured (22.0.368)
+
+Measured on that same shot, timing `stage_for()` per frame:
+
+| ROP | first (cold) cook | extra cook at range start | at range end | check ran? |
+|---|---|---|---|---|
+| `/stage/usdrender_rop1` (1046–1075) | 94.9 s | 10.1 s (f1046) | 12.4 s (f1075) | yes — same settings both ends, **no warning** |
+| `/stage/componentoutput1/thumbnail_render` | 0.2 s | — | — | no: single-frame ROP |
+| `/stage/Train_asset/thumbnail_render` | 248.3 s | — | — | no: single-frame ROP |
+
+So on the one ROP that actually renders a range, the check added **~22.5 s on
+top of a 94.9 s cook** — a warm re-cook at another frame is roughly an eighth of
+the cold one, not a repeat of it. A ROP with `trange = 0` (one frame) has no
+range to compare and costs **nothing extra**, which is why the two thumbnail
+ROPs — including the 248 s one — were untouched.
+
+The check also produced **no false positive** on a real scene: both endpoints
+resolved to `/Render/rendersettings` and no warning was emitted.
+
+Where the inspected frame is already one of the endpoints the walk is reused, so
+the usual bill is *one* extra cook, not two.
 
 **D2 is resolved on a real scene.** `/hip-check` on a production Karma shot
 (`SHOT_SandBurst_ROCHA_v14`, Houdini 22.0.368) returned 4 typed `UsdRender.Var`
 prims — `beauty` (LPE `C.*[LO]`), `CryptoObject`, `CryptoPrimitives`, `depth` —
 all matched by `IsA(UsdRender.Var)`. The empty-AOV failure mode did not occur;
 the typed-prim assumption holds for Karma. The bare-probe SKIP stays as the
-honest answer when a scene authors no vars. `D5` still carries the known
-single-frame-cook limitation — see `docs/TASKS.md` T5.
+honest answer when a scene authors no vars. `D5`'s single-frame-cook limitation
+is addressed by D9–D11 and `inspect(frame=…)`.
 
 **Real-scene note:** in that shot the `UsdRenderProduct.productName` attribute
 was empty on the products the settings prim references, so `outputs_for()`
@@ -347,7 +450,13 @@ destinations are reported as a warning rather than silently overwriting.
 | D2 | typed `UsdRender.Var` prims on a real Karma scene | 22.0.368 | 2026-07-24 | SHOT_SandBurst_ROCHA_v14; 4 AOVs incl. LPE beauty + cryptomatte |
 | D3 | stage metadata `renderSettingsPrimPath` | 21.0.729, 22.0.368 | 2026-07-24 | |
 | D4 | `karma:*` / `husk:*` attrs on the settings prim | 22.0.368 | 2026-07-24 | ~90 knobs read from the same scene |
-| D5 | `LopNode.stage()` returns composed stage | 21.0.729, 22.0.368 | 2026-07-24 | current-frame cook limitation stands (T5) |
+| D5 | `LopNode.stage()` returns composed stage | 21.0.729, 22.0.368 | 2026-07-24 | current-frame cook limitation lifted by D9–D11 |
+| D9 | **no** `LopNode.stageAtFrame()` — the frame is a `stage()` keyword | 21.0.729, 22.0.368 | 2026-07-29 | TASKS.md T5 named a method that does not exist; `scripts/_probe_frame_cook.py` |
+| D10 | `stage(frame=N)` recomposes per frame, is stable across revisits, and **beats** `hou.setFrame()` | 21.0.729, 22.0.368 | 2026-07-29 | switch LOP on `$F > 5`: frames 1/5 → `…_EARLY`, 6/10 → `…_LATE`; `setFrame(1)` + `stage(frame=10)` still gave LATE |
+| D11 | stage time codes come from a Configure Layer LOP's `starttime`/`endtime` — a bare network authors none (`0.0/0.0`, `HasAuthoredTimeCodeRange()` False) | 21.0.729, 22.0.368 | 2026-07-29 | there is no `starttimecode` parm; this is why the cross-range check falls back to the ROP's frame range |
+| D11-REAL | a **real** Karma shot authors no stage time code range either | 22.0.368 | 2026-07-29 | `SHOT_Train_Aerial_DUDA_v05`: 3 ROPs, all `0.0/0.0`, while `usdrender_rop1` has an authored range of 1046–1075. Scene opens on frame **1074**, not 1 |
+| T5-COST | the cross-range check costs one warm re-cook per endpoint | 22.0.368 | 2026-07-29 | same shot: +10.1 s / +12.4 s against a 94.9 s cold cook; single-frame ROPs (incl. a 248 s one) cost nothing extra; no false positive |
+| T5-END2END | `--frame` + the cross-range settings-drift warning | 22.0.368 | 2026-07-29 | 4 scenes: drift+timecodes, drift without timecodes, static+timecodes, static without. `--frame 1` → EARLY, `--frame 10` → LATE, each with the right `inspected_frame`, warning on **both** drifting scenes and on **neither** static one |
 | D-ASSET | missing-texture scan (`Sdf.AssetPath.resolvedPath == ""`) + overlay relink | 22.0.368 | 2026-07-25 | verified scalar + array assets, recursive search; re-scan of relinked overlay = 0 missing |
 | D6 | `IsA(UsdVol.OpenVDBAsset)` matches SOP-imported fields | 22.0.368 | 2026-07-26 | SandBurst: 8 field prims |
 | D7 | empty `filePath` ⇒ live volume; set ⇒ cached | 22.0.368 | 2026-07-26 | 0/8 on the real shot; synthetic stage flagged only the live volume |
@@ -386,6 +495,13 @@ destinations are reported as a warning rather than silently overwriting.
   and without hsl and diff the frames. Forcing `sequential=False` on the task
   and confirming the chunked result differs is the quickest way to see the
   guard earning its keep.
+- **D12** — the `TypeError` fallback in `_stage_at()`, for a build whose
+  `LopNode.stage()` takes no `frame` keyword. Both installs here have it, so
+  the fallback path has never actually run against a real Houdini. It moves the
+  global frame with `hou.setFrame()` and warns; the *fallback mechanism itself*
+  is verified (D10e), only the trigger is not. Check: on a pre-20 build, run
+  `hython -m hsl.inspector scene.hip --frame 5` and confirm the warning appears
+  and the description is still frame 5's.
 - **A3** — the `::`-versioned type-name split path.
 - **E8/E9** — accepted values for `--complexity` and `--purpose`.
 - **F2/F3** — Karma license behaviour and the Indie resolution cap.

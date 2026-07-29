@@ -142,3 +142,96 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
             ))
 
     return warnings
+
+
+def run_cook_preflight_checks(jobs, manifest: Optional[SceneManifest] = None) -> list[PreflightWarning]:
+    """Preflight for a cook plan (``hsl cook``).
+
+    Differs from the render preflight deliberately:
+
+      * It judges the **first chunk of every task**, not only ``jobs[0]`` -- a
+        cook plan mixes unrelated nodes writing to unrelated places, so one
+        job says nothing about the rest.
+      * With no ``--output`` override, destinations come from the job's
+        ``expected_outputs`` -- what the node itself says it writes.
+      * A missing asset is a **warning**, not an error. A geometry cache or a
+        sim does not necessarily read the textures a render does, and blocking
+        the cook on them would refuse work that may be fine. Still reported,
+        so nothing fails silently later.
+      * No resolution or volume-bake checks: a cook renders nothing and never
+        exports USD.
+    """
+    warnings: list[PreflightWarning] = []
+    seen_tasks: set = set()
+    seen_dirs: set = set()
+
+    for job in jobs:
+        task_id = getattr(job, "task_id", "") or job.rop_path
+        if task_id in seen_tasks:
+            continue
+        seen_tasks.add(task_id)
+
+        if job.chunk.start < 0 or job.chunk.count <= 0 or job.chunk.inc <= 0:
+            warnings.append(PreflightWarning(
+                level="error",
+                category="frame_range",
+                message=(f"{task_id}: invalid frame range configuration: "
+                         f"start={job.chunk.start}, count={job.chunk.count}, "
+                         f"inc={job.chunk.inc}")))
+
+        # An explicit override with no frame token collapses a sequence onto
+        # one file. Node-declared outputs keep their own tokens, so only the
+        # override needs this check.
+        if job.output and job.chunk.count > 1 and not has_frame_token(job.output):
+            warnings.append(PreflightWarning(
+                level="warning",
+                category="output_path",
+                message=(f"{job.output} has no frame token ($F4, %04d, <F4>, ...) "
+                         f"but {job.chunk.count} frames are being cooked -- every "
+                         f"frame would overwrite the same file.")))
+
+        paths = [job.output] if job.output else list(job.expected_outputs or [])
+        for raw in paths:
+            out_dir = os.path.dirname(os.path.abspath(raw))
+            if not out_dir or out_dir in seen_dirs:
+                continue
+            seen_dirs.add(out_dir)
+            if not os.path.exists(out_dir):
+                warnings.append(PreflightWarning(
+                    level="warning",
+                    category="output_path",
+                    message=(f"Output directory does not exist yet: {out_dir}. "
+                             f"It will be created if write permissions allow.")))
+                continue
+            if not os.access(out_dir, os.W_OK):
+                warnings.append(PreflightWarning(
+                    level="error",
+                    category="output_path",
+                    message=f"No write permission for output directory: {out_dir}"))
+            try:
+                usage = shutil.disk_usage(out_dir)
+                free_gb = usage.free / (1024 ** 3)
+                if free_gb < 1.0:
+                    warnings.append(PreflightWarning(
+                        level="warning",
+                        category="disk_space",
+                        message=(f"Low disk space on output drive "
+                                 f"({free_gb:.2f} GB remaining) for {out_dir}.")))
+            except OSError:
+                pass
+
+    if manifest and manifest.missing_assets:
+        for asset in manifest.missing_assets:
+            warnings.append(PreflightWarning(
+                level="warning",
+                category="missing_asset",
+                message=(f"Unresolved {asset.kind}: {asset.asset_path}  "
+                         f"(at {asset.attr_path}) -- may not affect a cook; "
+                         f"a render would refuse to start on this.")))
+
+    if manifest and manifest.warnings:
+        for msg in manifest.warnings:
+            warnings.append(PreflightWarning(
+                level="info", category="scene", message=msg))
+
+    return warnings

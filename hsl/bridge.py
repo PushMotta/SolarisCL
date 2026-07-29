@@ -137,6 +137,7 @@ def _package_root() -> str:
 def inspect_hip(hip_path: str, *, hython: str = "", export_usd: bool = True,
                 usd_dir: str = "", flatten: bool = False, rop: str = "",
                 allow_volume_bake: bool = True, export_frames=None,
+                frame: Optional[float] = None,
                 timeout: float = 1800.0,
                 env: Optional[dict] = None) -> SceneManifest:
     """Run the inspector under hython and return the parsed manifest.
@@ -179,6 +180,11 @@ def inspect_hip(hip_path: str, *, hython: str = "", export_usd: bool = True,
         # Narrow the export to the frames being rendered; without this the ROP's
         # whole authored range is written, which is most of the export cost.
         cmd += ["--export-frames"] + [str(int(v)) for v in export_frames]
+    if frame is not None:
+        # Describe the stage at this frame. A stage whose structure changes
+        # over time looks different at another moment (TASKS.md T5); the
+        # manifest records the frame used in ``inspected_frame``.
+        cmd += ["--frame", str(frame)]
 
     run_env = dict(env or os.environ)
     existing = run_env.get("PYTHONPATH", "")

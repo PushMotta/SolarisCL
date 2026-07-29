@@ -56,12 +56,16 @@ def _pick_rop(manifest: SceneManifest, requested: str) -> Optional[RenderRop]:
 def cmd_inspect(args) -> int:
     manifest = bridge.inspect_hip(args.hip, hython=args.hython,
                                   export_usd=args.export_usd,
-                                  usd_dir=args.usd_dir, flatten=args.flatten)
+                                  usd_dir=args.usd_dir, flatten=args.flatten,
+                                  frame=args.frame)
     if args.json:
         print(manifest.to_json())
         return 0
 
     print(f"{manifest.hip_path}   Houdini {manifest.houdini_version}   {manifest.fps} fps")
+    if manifest.inspected_frame is not None:
+        print(f"  described at frame {manifest.inspected_frame:g} "
+              f"(a stage can differ at another frame; --frame to pick one)")
     for rop in manifest.rops:
         settings = manifest.resolve_settings(rop)
         print(f"\n  {rop.node_path}  [{rop.node_type}]")
@@ -161,7 +165,22 @@ def cmd_cook(args) -> int:
     produce. Dependencies come from the scene, so tasks run in the right order
     without the caller sequencing them.
     """
-    manifest = bridge.inspect_hip(args.hip, hython=args.hython, export_usd=False)
+    # Reuse a cached read of an unchanged .hip — a cook never exports USD, so
+    # the reuse is always safe (render must re-read when it exports).
+    manifest = None
+    if not args.no_cache:
+        manifest = bridge.load_cached(args.hip)
+        if manifest is not None:
+            sys.stderr.write(f"Using the cached scene read "
+                             f"({bridge.cache_path_for(args.hip)}); "
+                             f"--no-cache to read the scene again.\n")
+    if manifest is None:
+        manifest = bridge.inspect_hip(args.hip, hython=args.hython,
+                                      export_usd=False)
+        try:
+            bridge.save_cached(manifest)
+        except OSError:
+            pass                       # a cache we cannot write is not an error
 
     # Rendering has its own command, so plain `hsl cook` means the other work.
     kinds = (args.kind,) if args.kind else (TASK_CACHE, TASK_SIM)
@@ -201,6 +220,18 @@ def cmd_cook(args) -> int:
         )
 
     _describe_plan(tasks, args.chunk)
+
+    # Preflight — render has had this at the CLI for a while; a cook can fill
+    # a disk or write somewhere unwritable just as easily.
+    checks = preflight.run_cook_preflight_checks(jobs, manifest)
+    for check in checks:
+        sys.stderr.write(f"[preflight {check.level}] {check.message}\n")
+    errors = [c for c in checks if c.level == "error"]
+    if errors and not args.dry_run and not args.skip_preflight:
+        sys.stderr.write(
+            f"\n{len(errors)} preflight error(s) — nothing cooked. Fix them, or "
+            f"re-run with --skip-preflight to cook anyway.\n")
+        return 5
 
     if args.dry_run:
         print()
@@ -616,6 +647,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect = sub.add_parser("inspect", parents=[common],
                                help="Describe the scene without rendering")
     p_inspect.add_argument("--json", action="store_true", help="Emit raw JSON")
+    p_inspect.add_argument("--frame", type=float, default=None,
+                           help="Describe the stage at this frame instead of "
+                                "the scene's current one")
     p_inspect.add_argument("--export-usd", action="store_true",
                            help="Also write the USD to disk")
     p_inspect.set_defaults(func=cmd_inspect)
@@ -689,6 +723,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Concurrent processes")
     p_cook.add_argument("--output", default="",
                         help="Override the output path (one task only)")
+    p_cook.add_argument("--no-cache", action="store_true",
+                        help="Always re-read the scene instead of reusing a "
+                             "cached read of an unchanged .hip")
+    p_cook.add_argument("--skip-preflight", action="store_true",
+                        help="Cook even if preflight reports errors (unwritable "
+                             "output path, bad frame range, ...)")
     p_cook.add_argument("--dry-run", action="store_true",
                         help="Print the commands without running them")
     p_cook.set_defaults(func=cmd_cook)

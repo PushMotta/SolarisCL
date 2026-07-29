@@ -14,9 +14,8 @@ library. The plain-Python half stays testable with no Houdini installed.
   Do not trust this file for push state — run
   `git log --oneline origin/main..main`. At rewrite time the UI mode
   restructure and this rewrite itself had not been pushed.
-- **Green:** 186 tests in 33 classes, boundary lint, 55 drift checks,
-  ui-imports, whitespace. `python -m unittest discover -s tests` needs no
-  Houdini.
+- **Green:** 227 tests, boundary lint, 55 drift checks, ui-imports,
+  whitespace. `python -m unittest discover -s tests` needs no Houdini.
 - **Project root:** `F:\Nexus Projects\SolarisCL` — the working dir **is** the
   git root. `_archive\` is the original delivery, gitignored and disposable.
 - **Note:** commits landed from outside the agent session twice (`6db1da0`,
@@ -35,9 +34,12 @@ library. The plain-Python half stays testable with no Houdini installed.
   parse stdout.
 - **C: is ~94% full.** Never export a volume-heavy stage to it. The volume
   guard prevents this by default.
-- **Real test scene:** `V:\Pushvfx Dropbox\…\SHOT_SandBurst_ROCHA_v14_Motta.hiplc`
-  (textures in `…\3D\HOUDINI\tex`). `V:` is Dropbox — **never write outputs
-  there.**
+- **Real test scene:** `V:\Pushvfx Dropbox\…\SHOT_Train_Aerial_DUDA_v05.hiplc`
+  — 3 Solaris ROPs, **opens on frame 1074**, `usdrender_rop1` range 1046–1075,
+  cold cook ~95 s (one thumbnail ROP cooks ~250 s). The previous pointer,
+  `SHOT_SandBurst_ROCHA_v14_Motta.hiplc`, **no longer exists on V:**, and its
+  successor (`…SandBurst_ROCHA_v13`) has no Solaris render ROPs at all. `V:` is
+  Dropbox — **never write outputs there.**
 - Throwaway probe scenes built this session live in the session scratchpad and
   are gone; `scripts/` has the reusable probes.
 
@@ -72,6 +74,29 @@ lists them; the GUI has a **Caches & Sims** mode.
   `-serialsubtasks 1`); **Deadline refuses** dependent work rather than writing
   a job that races.
 
+### Newer still: frame-aware inspection, cook parity, UI progress
+
+- **T5 is done** (`docs/TASKS.md`). `hsl inspect --frame` /
+  `inspect_hip(frame=)` describe the stage at a chosen moment;
+  `manifest.inspected_frame` always records which moment (real shots open on
+  arbitrary frames — 1074, not 1). A warning fires when the RenderSettings
+  prim set differs across the range. **`stageAtFrame()` does not exist** — the
+  verified mechanism is `LopNode.stage(frame=)` (which beats the global frame)
+  plus `hou.setFrame()` for parameter evaluation. See UNVERIFIED D9–D12.
+- **`hsl cook` reached parity with `render`:** cached scene reads
+  (`--no-cache` to bypass — always safe for cook, which never exports USD) and
+  a cook preflight (`run_cook_preflight_checks`: per-task checks,
+  `expected_outputs` fallback, missing assets deliberately downgraded to
+  warnings; blocks with exit 5 unless `--skip-preflight`).
+- **The GUI submits cooks to the farm** through the same "Submit to Farm…"
+  button, mode-aware, via `jobs_for_task` (never hand-built). Deadline's
+  refusal of dependent work surfaces as a message box pointing at Tractor.
+- **Progress displays are honest and testable:** frame counter + observed-rate
+  ETA (never invented; omitted until a chunk finishes), intra-frame percent
+  for single-frame chunks, `running…` when no data has arrived. The pure logic
+  lives in **`hsl/progress.py`** (stdlib-only, unit-tested); `ui.py` keeps
+  thin Qt wrappers. The empty-state blank detail box is gone.
+
 ## Proven vs not — read before trusting anything
 
 `docs/UNVERIFIED.md` is the register. Newly **verified on 21.0.729 + 22.0.368**
@@ -95,6 +120,12 @@ mid-cook left no orphan hython.
   exists here to accept it.
 - **No Solaris frame has ever been rendered** by this tool, and the GUI has
   never been clicked in a live session (it is driven offscreen).
+- **D12** — the `TypeError` fallback in `_stage_at()` (for a hython whose
+  `stage()` lacks the `frame=` keyword) has never triggered; both installs
+  here have the keyword.
+- **No real Deadline or Tractor has accepted** the exported job files (K10),
+  and no real husk run has shown how often `ALF_PROGRESS` actually arrives
+  within a frame — the intra-frame display consumes whatever cadence exists.
 - A3, E8/E9, F2/F3 — versioned type-name split, `--complexity`/`--purpose`
   values, Karma licence and the Indie cap.
 
@@ -126,20 +157,32 @@ mid-cook left no orphan hython.
   Use the editor tools.
 - **`hash()` on a string is randomised per process** — was the manifest cache
   key; now SHA-1.
+- **QMessageBox text is the *inverse* of the `&` trap.** Tab labels and group
+  titles eat a single `&` (write `&&`), but message-box body text has no
+  mnemonic handling — `&&` there *displays* doubled. One escape per widget
+  kind, checked by looking, not by habit.
+- **`Task.duration` treats `started_at == 0.0` as "never started"** and
+  returns 0 regardless of `finished_at`. A test fixture using 0.0 as a start
+  time silently kills every rate/ETA computation built on it.
+- **Do not trust a task description's API names** — TASKS.md T5 said
+  `stageAtFrame()`; no such method exists on either install. Probe first even
+  when the doc sounds specific.
+- **Uncommitted work is fragile while agents run.** A subagent ran
+  `git checkout -- hsl/cli.py` mid-session and discarded the working diff of
+  that file; it was reconstructed, verified hunk-for-hunk, and the suite
+  re-proven. Commit landed work before fanning out agents, and diff-check
+  after any agent that touches git.
 
 ## Open work
 
-- **Push `2da5054`** (or decide not to).
-- **K8 / K10** as above.
-- **Cook has no preflight** and no manifest-cache reuse, both of which `render`
-  has. The GUI cannot submit a cook to the farm, though the export supports it.
-- **`ui.py` has no layout tests.** All UI work is verified by rendering
-  offscreen and looking — gross breakage is caught, judgement is not.
-- **UI, still open:** the large blank detail box under the empty-state message
-  (it carries the layout's stretch); a frame counter / ETA rather than a bare
-  percentage; per-frame progress detail for a single frame.
-- **TASKS.md T5** — `inspect()` cooks at one frame, so a stage whose structure
-  changes over time is described from a single moment.
+- **K8 / K10** as above — K8 (diff a real solver cache) is the user's, with
+  their own `.hip`.
+- **`ui.py` has no layout tests.** Layout is still verified by rendering
+  offscreen and looking. The progress/ETA *logic* is now unit-tested in
+  `hsl/progress.py`, so only visual judgement remains uncovered.
+- **The hython engine emits no per-frame progress** (`ALF_PROGRESS` is husk's).
+  The UI honestly shows `running…`; parsing hython ROP output for progress is
+  possible future work, not started.
 - **`resolutionx`/`resolutiony`** on `usdrender_rop` still unconfirmed;
   `_apply_override` warns loudly rather than silently ignoring them.
 - Concurrent-render check for the PID-scoped overlays was never run with real
@@ -148,7 +191,7 @@ mid-cook left no orphan hython.
 ## How to run / verify
 
 ```bash
-python -m unittest discover -s tests           # 186 tests, no Houdini needed
+python -m unittest discover -s tests           # 227 tests, no Houdini needed
 python .claude/hooks/boundary_guard.py --check-tree .
 python scripts/check_drift.py
 python scripts/check_ui_imports.py

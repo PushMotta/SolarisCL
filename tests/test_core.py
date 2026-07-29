@@ -21,7 +21,8 @@ from hsl.bridge import (
     find_hython, list_hython_installations, load_user_settings, save_user_setting,
 )
 from hsl.cli import (
-    _resolve_hython_choice, build_parser, cmd_cook, cmd_render, parse_frames,
+    _resolve_hython_choice, build_parser, cmd_cook, cmd_inspect, cmd_render,
+    parse_frames,
 )
 from hsl.husk import (
     DEFAULT_ENGINE, FrameChunk, RenderJob, build_command, chunks_for_task,
@@ -33,7 +34,10 @@ from hsl.manifest import (
     MissingAsset, OutputTask, RenderProduct, RenderRop, RenderSettings,
     RenderVar, SceneManifest,
 )
-from hsl.runner import RenderQueue, State
+from hsl.progress import (
+    eta_seconds, format_eta, queue_progress_summary, task_progress_text,
+)
+from hsl.runner import RenderQueue, State, Task
 
 
 def sample_manifest() -> SceneManifest:
@@ -1542,6 +1546,301 @@ class TestCookCli(unittest.TestCase):
         self.assertEqual(args.kind, "")
         self.assertEqual(args.task, [])
         self.assertFalse(args.dry_run)
+        self.assertFalse(args.no_cache)
+        self.assertFalse(args.skip_preflight)
+
+
+class TestCookCache(unittest.TestCase):
+    """`hsl cook` never exports USD, so it can always reuse a cached scene
+    read -- the reuse render only gets when it is not exporting."""
+
+    def _manifest(self):
+        return SceneManifest(hip_path="/jobs/shot.hip", tasks=[
+            OutputTask(node_path="/out/cache", kind=TASK_CACHE,
+                       use_frame_range=True, frame_start=1, frame_end=10)])
+
+    def _patch(self, name, value):
+        original = getattr(bridge, name)
+        setattr(bridge, name, value)
+        self.addCleanup(setattr, bridge, name, original)
+
+    def _cook(self, extra):
+        args = build_parser().parse_args(["cook", "s.hip", "--dry-run"] + extra)
+        with contextlib.redirect_stderr(io.StringIO()) as err, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = cmd_cook(args)
+        return code, err.getvalue()
+
+    def test_a_cached_read_skips_the_houdini_launch(self):
+        self._patch("load_cached", lambda hip: self._manifest())
+        self._patch("inspect_hip",
+                    lambda *a, **k: self.fail("inspect_hip must not run"))
+        code, message = self._cook([])
+        self.assertEqual(code, 0)
+        self.assertIn("Using the cached scene read", message)
+
+    def test_no_cache_forces_a_fresh_read(self):
+        self._patch("load_cached",
+                    lambda hip: self.fail("--no-cache must not read the cache"))
+        self._patch("inspect_hip", lambda *a, **k: self._manifest())
+        self._patch("save_cached", lambda m: "")
+        code, message = self._cook(["--no-cache"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("cached", message)
+
+    def test_a_fresh_read_is_saved_for_next_time(self):
+        saved = []
+        self._patch("load_cached", lambda hip: None)
+        self._patch("inspect_hip", lambda *a, **k: self._manifest())
+        self._patch("save_cached", saved.append)
+        self._cook([])
+        self.assertEqual(len(saved), 1)
+
+    def test_a_cache_that_cannot_be_written_is_not_an_error(self):
+        def boom(manifest):
+            raise OSError("read-only temp dir")
+        self._patch("load_cached", lambda hip: None)
+        self._patch("inspect_hip", lambda *a, **k: self._manifest())
+        self._patch("save_cached", boom)
+        code, _ = self._cook([])
+        self.assertEqual(code, 0)
+
+
+class TestCookPreflight(unittest.TestCase):
+    """A cook can fill a disk or write nowhere just as easily as a render;
+    until now only render had preflight at the CLI."""
+
+    def test_invalid_frame_range_is_an_error_named_after_its_task(self):
+        job = RenderJob(chunk=FrameChunk(1, 0, 1), task_id="/out/cache")
+        hits = preflight.run_cook_preflight_checks([job])
+        self.assertEqual([w.level for w in hits], ["error"])
+        self.assertIn("/out/cache", hits[0].message)
+
+    def test_each_task_is_judged_once_not_per_chunk(self):
+        jobs = [RenderJob(chunk=FrameChunk(1, 0, 1), task_id="/out/cache"),
+                RenderJob(chunk=FrameChunk(6, 0, 1), task_id="/out/cache")]
+        hits = preflight.run_cook_preflight_checks(jobs)
+        self.assertEqual(len([w for w in hits if w.category == "frame_range"]), 1)
+
+    def test_expected_outputs_stand_in_for_a_missing_override(self):
+        missing_dir = os.path.join(tempfile.gettempdir(), "hsl_nope_xyz", "geo")
+        job = RenderJob(chunk=FrameChunk(1, 5, 1), task_id="/out/cache",
+                        expected_outputs=[os.path.join(missing_dir, "c.$F4.bgeo.sc")])
+        hits = [w for w in preflight.run_cook_preflight_checks([job])
+                if w.category == "output_path"]
+        self.assertTrue(hits)
+        self.assertIn("does not exist", hits[0].message)
+
+    def test_an_override_without_a_frame_token_is_flagged(self):
+        job = RenderJob(chunk=FrameChunk(1, 5, 1), task_id="/out/cache",
+                        output="/tmp/one.bgeo.sc")
+        hits = [w for w in preflight.run_cook_preflight_checks([job])
+                if "overwrite" in w.message]
+        self.assertEqual(len(hits), 1)
+
+    def test_node_declared_outputs_are_not_second_guessed_for_a_frame_token(self):
+        # Only an explicit --output override is checked for a missing frame
+        # token (docstring: "Node-declared outputs keep their own tokens").
+        # A cache/sim's own outputs are not re-validated here, so a task with
+        # no --output override must never trip the "overwrite" warning even
+        # when its own declared output has no token.
+        job = RenderJob(chunk=FrameChunk(1, 5, 1), task_id="/out/cache",
+                        expected_outputs=["/tmp/no_token_here.bgeo.sc"])
+        hits = [w for w in preflight.run_cook_preflight_checks([job])
+                if "overwrite" in w.message]
+        self.assertEqual(hits, [])
+
+    def test_output_checks_are_shared_by_tasks_writing_to_the_same_directory(self):
+        # Two unrelated tasks pointed at one directory must not double the
+        # same directory-level warning -- seen_dirs is keyed by directory,
+        # not by task, deliberately (a cook plan often fans out several
+        # tasks into one output folder).
+        missing_dir = os.path.join(tempfile.gettempdir(), "hsl_shared_xyz", "geo")
+        jobs = [
+            RenderJob(chunk=FrameChunk(1, 1, 1), task_id="/out/cache_a",
+                      output=os.path.join(missing_dir, "a.bgeo.sc")),
+            RenderJob(chunk=FrameChunk(1, 1, 1), task_id="/out/cache_b",
+                      output=os.path.join(missing_dir, "b.bgeo.sc")),
+        ]
+        hits = [w for w in preflight.run_cook_preflight_checks(jobs)
+                if w.category == "output_path" and "does not exist" in w.message]
+        self.assertEqual(len(hits), 1)
+
+    def test_low_disk_space_is_flagged_per_directory(self):
+        job = RenderJob(chunk=FrameChunk(1, 1, 1), task_id="/out/cache",
+                        output=os.path.join(tempfile.gettempdir(), "c.bgeo.sc"))
+        fake_usage = type("Usage", (), {"free": 100 * 1024 ** 2})()  # ~0.1 GB
+        original = preflight.shutil.disk_usage
+        preflight.shutil.disk_usage = lambda path: fake_usage
+        self.addCleanup(setattr, preflight.shutil, "disk_usage", original)
+
+        hits = [w for w in preflight.run_cook_preflight_checks([job])
+                if w.category == "disk_space"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("GB remaining", hits[0].message)
+
+    def test_missing_assets_warn_but_do_not_block_a_cook(self):
+        # The render preflight makes these errors; a cache or sim does not
+        # necessarily read the textures a render does.
+        m = SceneManifest(missing_assets=[
+            MissingAsset(attr_path="/mat/tex.inputs:file",
+                         asset_path="/tex/wood.exr")])
+        job = RenderJob(chunk=FrameChunk(1, 1, 1), task_id="/out/cache")
+        hits = [w for w in preflight.run_cook_preflight_checks([job], m)
+                if w.category == "missing_asset"]
+        self.assertEqual([w.level for w in hits], ["warning"])
+        self.assertIn("wood.exr", hits[0].message)
+
+    def test_scene_warnings_are_carried_through_as_info(self):
+        m = SceneManifest(warnings=["could not read /out/odd"])
+        hits = preflight.run_cook_preflight_checks(
+            [RenderJob(chunk=FrameChunk(1, 1, 1), task_id="/out/c")], m)
+        self.assertIn(("info", "could not read /out/odd"),
+                      [(w.level, w.message) for w in hits])
+
+    # -- CLI wiring -------------------------------------------------------
+
+    def _cook(self, extra, checks):
+        original = cli_mod.preflight.run_cook_preflight_checks
+        cli_mod.preflight.run_cook_preflight_checks = lambda jobs, m=None: checks
+        self.addCleanup(setattr, cli_mod.preflight,
+                        "run_cook_preflight_checks", original)
+        original_inspect = bridge.inspect_hip
+        bridge.inspect_hip = lambda *a, **k: SceneManifest(
+            hip_path="/jobs/shot.hip",
+            tasks=[OutputTask(node_path="/out/cache", kind=TASK_CACHE)])
+        self.addCleanup(setattr, bridge, "inspect_hip", original_inspect)
+        original_save = bridge.save_cached
+        bridge.save_cached = lambda m: ""
+        self.addCleanup(setattr, bridge, "save_cached", original_save)
+        args = build_parser().parse_args(["cook", "s.hip", "--no-cache"] + extra)
+        with contextlib.redirect_stderr(io.StringIO()) as err, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = cmd_cook(args)
+        return code, err.getvalue()
+
+    def test_a_preflight_error_blocks_the_cook(self):
+        checks = [preflight.PreflightWarning("error", "output_path", "boom")]
+        code, message = self._cook([], checks)
+        self.assertEqual(code, 5)
+        self.assertIn("preflight error", message)
+        self.assertIn("boom", message)
+
+    def test_skip_preflight_overrides_the_block(self):
+        checks = [preflight.PreflightWarning("error", "output_path", "boom")]
+        code, _ = self._cook(["--skip-preflight", "--dry-run"], checks)
+        self.assertEqual(code, 0)
+
+    def test_dry_run_reports_but_does_not_block(self):
+        checks = [preflight.PreflightWarning("error", "output_path", "boom")]
+        code, message = self._cook(["--dry-run"], checks)
+        self.assertEqual(code, 0)
+        self.assertIn("boom", message)
+
+
+class TestInspectedFrame(unittest.TestCase):
+    """T5: the manifest records the frame its description was taken at, and
+    --frame reaches the inspector argv."""
+
+    def test_inspected_frame_round_trips_through_json(self):
+        m = sample_manifest()
+        m.inspected_frame = 1012.0
+        self.assertEqual(SceneManifest.from_json(m.to_json()).inspected_frame,
+                         1012.0)
+
+    def test_an_old_manifest_without_the_field_still_loads(self):
+        data = json.loads(sample_manifest().to_json())
+        data.pop("inspected_frame", None)
+        again = SceneManifest.from_json(json.dumps(data))
+        self.assertIsNone(again.inspected_frame)
+
+    def _inspect_capturing_argv(self, **kwargs):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        hip = os.path.join(d, "s.hip")
+        with open(hip, "w") as fh:
+            fh.write("x")
+        captured = {}
+
+        def fake_run(cmd, **run_kwargs):
+            captured["cmd"] = list(cmd)
+            json_path = cmd[cmd.index("--json") + 1]
+            with open(json_path, "w") as fh:
+                fh.write(SceneManifest(hip_path=hip,
+                                       inspected_frame=kwargs.get("frame")).to_json())
+
+            class Result:
+                returncode, stdout, stderr = 0, "", ""
+            return Result()
+
+        original_run = bridge.subprocess.run
+        original_find = bridge.find_hython
+        bridge.subprocess.run = fake_run
+        bridge.find_hython = lambda *a, **k: "hython-stand-in"
+        try:
+            manifest = bridge.inspect_hip(hip, export_usd=False, **kwargs)
+        finally:
+            bridge.subprocess.run = original_run
+            bridge.find_hython = original_find
+        return captured["cmd"], manifest
+
+    def test_frame_reaches_the_inspector_argv(self):
+        cmd, manifest = self._inspect_capturing_argv(frame=1012.0)
+        self.assertIn("--frame", cmd)
+        self.assertEqual(cmd[cmd.index("--frame") + 1], "1012.0")
+        self.assertEqual(manifest.inspected_frame, 1012.0)
+
+    def test_no_frame_means_no_flag(self):
+        cmd, _ = self._inspect_capturing_argv()
+        self.assertNotIn("--frame", cmd)
+
+    def test_inspect_parser_takes_a_frame(self):
+        args = build_parser().parse_args(["inspect", "s.hip", "--frame", "1012"])
+        self.assertEqual(args.frame, 1012.0)
+        self.assertIsNone(build_parser().parse_args(["inspect", "s.hip"]).frame)
+
+
+class TestInspectCliFrame(unittest.TestCase):
+    """cmd_inspect itself must forward --frame to bridge.inspect_hip and
+    report back what it got -- TestInspectedFrame above only proves the
+    bridge and the parser each work in isolation, not that cmd_inspect wires
+    the one into the other."""
+
+    def _inspect(self, extra, manifest):
+        captured = {}
+        original = bridge.inspect_hip
+
+        def fake(*args, **kwargs):
+            captured.update(kwargs)
+            return manifest
+
+        bridge.inspect_hip = fake
+        self.addCleanup(setattr, bridge, "inspect_hip", original)
+        args = build_parser().parse_args(["inspect", "s.hip"] + extra)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = cmd_inspect(args)
+        return code, out.getvalue(), captured
+
+    def test_frame_argument_reaches_the_inspector_call(self):
+        _, _, kwargs = self._inspect(["--frame", "1012"], sample_manifest())
+        self.assertEqual(kwargs.get("frame"), 1012.0)
+
+    def test_no_frame_argument_passes_none_through(self):
+        _, _, kwargs = self._inspect([], sample_manifest())
+        self.assertIsNone(kwargs.get("frame"))
+
+    def test_report_names_the_frame_it_was_described_at(self):
+        m = sample_manifest()
+        m.inspected_frame = 1012.0
+        _, out, _ = self._inspect(["--frame", "1012"], m)
+        self.assertIn("described at frame 1012", out)
+
+    def test_report_says_nothing_about_a_frame_when_none_was_used(self):
+        m = sample_manifest()
+        m.inspected_frame = None
+        _, out, _ = self._inspect([], m)
+        self.assertNotIn("described at frame", out)
 
 
 class TestConsoleEncoding(unittest.TestCase):
@@ -1803,6 +2102,147 @@ class TestQueueDependencies(unittest.TestCase):
         self.assertTrue(all(t.state is State.DONE for t in queue.tasks))
         self.assertEqual([name for name, _ in seq].count("task_started"), 3)
         self.assertEqual(queue.warnings, [])
+
+
+class TestProgressText(unittest.TestCase):
+    """hsl.progress -- the queue-table/progress-bar text, extracted out of
+    ui.py so it can be tested without Qt installed (AGENTS.md non-negotiable
+    #5). Fabricated Task/RenderJob/FrameChunk objects, no subprocess, no
+    RenderQueue -- these functions only ever read task.state/.progress/
+    .job.chunk/.duration.
+    """
+
+    def task(self, start, count, state, progress=0, started_at=0.0,
+            finished_at=0.0, inc=1):
+        return Task(
+            job=RenderJob(chunk=FrameChunk(start, count, inc)),
+            state=state, progress=progress,
+            started_at=started_at, finished_at=finished_at,
+        )
+
+    # -- format_eta ---------------------------------------------------
+
+    def test_format_eta_under_a_minute(self):
+        self.assertEqual(format_eta(9), "0:09")
+
+    def test_format_eta_minutes_and_seconds(self):
+        self.assertEqual(format_eta(65), "1:05")
+
+    def test_format_eta_rolls_over_to_hours(self):
+        self.assertEqual(format_eta(3725), "1:02:05")
+
+    # -- eta_seconds ----------------------------------------------------
+
+    def test_eta_is_none_until_a_chunk_has_finished(self):
+        """Nothing has completed yet, so there is no observed rate to use --
+        the render might just be starting, or ten hours in; guessing which
+        would be exactly the invented number this module refuses to show."""
+        tasks = [
+            self.task(1, 5, State.RUNNING, progress=40, started_at=100.0),
+            self.task(6, 5, State.PENDING),
+        ]
+        self.assertIsNone(eta_seconds(tasks, done_frames=0, total_frames=10))
+
+    def test_eta_derived_from_a_finished_chunk_s_observed_rate(self):
+        """One chunk of 5 frames took exactly 50s -- 10s/frame -- with 5
+        frames left, that is a concrete, checkable 50s, not a guess."""
+        tasks = [
+            self.task(1, 5, State.DONE, progress=100,
+                     started_at=1000.0, finished_at=1050.0),
+            self.task(6, 5, State.PENDING),
+        ]
+        seconds = eta_seconds(tasks, done_frames=5, total_frames=10)
+        self.assertEqual(seconds, 50.0)
+        self.assertEqual(format_eta(seconds), "0:50")
+
+    def test_eta_ignores_a_still_running_chunk_s_partial_time(self):
+        """A chunk that has not finished has no wall-clock duration to trust
+        yet -- only a finished chunk's start-to-finish time counts."""
+        tasks = [
+            self.task(1, 5, State.DONE, progress=100,
+                     started_at=500.0, finished_at=550.0),
+            self.task(6, 5, State.RUNNING, progress=90, started_at=9999.0),
+        ]
+        seconds = eta_seconds(tasks, done_frames=5, total_frames=10)
+        self.assertEqual(seconds, 50.0)      # unaffected by the running task
+
+    # -- task_progress_text ----------------------------------------------
+
+    def test_pending_task_shows_a_dash(self):
+        t = self.task(1, 1, State.PENDING)
+        self.assertEqual(task_progress_text(t, progress_seen=set()), "-")
+
+    def test_no_progress_data_shows_running_not_a_fake_percentage(self):
+        """hython never emits ALF_PROGRESS at all, and husk may just not have
+        printed its first line yet -- either way, 0% would be a percentage
+        that never actually arrived."""
+        t = self.task(1, 1, State.RUNNING, progress=0)
+        self.assertEqual(task_progress_text(t, progress_seen=set()), "running…")
+
+    def test_single_frame_chunk_shows_its_own_intra_frame_percent(self):
+        """A chunk of exactly one frame *is* the frame husk is on, so its
+        percentage is that frame's own progress -- worth naming the frame."""
+        t = self.task(101, 1, State.RUNNING, progress=47)
+        self.assertEqual(
+            task_progress_text(t, progress_seen={id(t)}), "frame 101: 47%")
+
+    def test_multi_frame_chunk_labels_the_chunk_not_a_specific_frame(self):
+        """husk does not say which of a chunk's several frames it is on, so
+        this must not claim to know -- the percentage is the chunk's own."""
+        t = self.task(6, 5, State.RUNNING, progress=63)
+        self.assertEqual(
+            task_progress_text(t, progress_seen={id(t)}), "63% of 5 frames")
+
+    def test_finished_task_shows_its_final_percent(self):
+        t = self.task(1, 5, State.DONE, progress=100)
+        self.assertEqual(task_progress_text(t, progress_seen=set()), "100%")
+
+    # -- queue_progress_summary -------------------------------------------
+
+    def test_frame_count_only_credits_fully_finished_chunks(self):
+        """One chunk of 5 frames finished; a second chunk of 5 is running at
+        60%. The frame count must read 5 of 10, not 8 of 10 -- crediting a
+        fraction of the running chunk would claim to know which of its
+        frames are actually done, which husk never says."""
+        tasks = [
+            self.task(1, 5, State.DONE, progress=100,
+                     started_at=0.0, finished_at=10.0),
+            self.task(6, 5, State.RUNNING, progress=60, started_at=9999.0),
+        ]
+        summary = queue_progress_summary(tasks, percent=55, progress_seen={id(tasks[1])})
+        self.assertIn("Frame 5 of 10", summary)
+        self.assertNotIn("Frame 8", summary)
+
+    def test_eta_is_omitted_until_something_has_finished(self):
+        tasks = [self.task(1, 5, State.RUNNING, progress=10, started_at=1.0)]
+        summary = queue_progress_summary(tasks, percent=2, progress_seen={id(tasks[0])})
+        self.assertNotIn("ETA", summary)
+
+    def test_summary_includes_eta_from_an_observed_rate(self):
+        tasks = [
+            self.task(1, 5, State.DONE, progress=100,
+                     started_at=1000.0, finished_at=1050.0),
+            self.task(6, 5, State.PENDING),
+        ]
+        summary = queue_progress_summary(tasks, percent=50, progress_seen=set())
+        self.assertEqual(summary, "50% - Frame 5 of 10 - ETA 0:50")
+
+    def test_summary_names_the_running_chunk_not_a_frame_when_it_has_several(self):
+        tasks = [
+            self.task(1, 5, State.DONE, progress=100,
+                     started_at=0.0, finished_at=10.0),
+            self.task(6, 5, State.RUNNING, progress=63, started_at=9999.0),
+        ]
+        summary = queue_progress_summary(tasks, percent=68, progress_seen={id(tasks[1])})
+        self.assertIn("chunk 6-10: 63%", summary)
+
+    def test_summary_says_nothing_extra_when_no_progress_has_arrived(self):
+        """A running task the queue has not heard from yet (hython, or husk
+        before its first line) adds no parenthetical detail -- there is
+        nothing real to report."""
+        tasks = [self.task(1, 5, State.RUNNING, progress=0, started_at=1.0)]
+        summary = queue_progress_summary(tasks, percent=0, progress_seen=set())
+        self.assertEqual(summary, "0% - Frame 0 of 5")
 
 
 if __name__ == "__main__":

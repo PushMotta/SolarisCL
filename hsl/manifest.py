@@ -19,7 +19,8 @@ from typing import Any, Optional
 # 2 added ``SceneManifest.tasks``. The change is additive: a v1 manifest still
 # loads (``tasks`` defaults to empty) and nothing gates behaviour on this
 # number, so it is here to describe the shape, not to reject anything.
-SCHEMA_VERSION = 2
+# 3 added ``SceneManifest.inspected_frame`` -- additive likewise.
+SCHEMA_VERSION = 3
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +226,10 @@ class SceneManifest:
     fps: float = 24.0
     stage_start_time_code: Optional[float] = None
     stage_end_time_code: Optional[float] = None
+    # The frame the stage was cooked at when this description was taken. A
+    # stage whose structure changes over time looks different at another frame
+    # (TASKS.md T5) -- consumers can tell *which* moment they are looking at.
+    inspected_frame: Optional[float] = None
     default_settings_prim: str = ""     # stage metadata 'renderSettingsPrimPath'
     rops: list[RenderRop] = field(default_factory=list)
     # Every cookable node, render or otherwise. ``rops`` stays the USD-specific

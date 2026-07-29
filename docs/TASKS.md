@@ -37,14 +37,24 @@ Deleted. `export_usd()` creates its own temporary `usd_rop` rather than hunting
 for one in the scene, so a list of candidate export-ROP type names had nothing
 to match against. A comment in its place says so, to stop it being re-added.
 
-## T5 — Single-frame introspection under-reports  ·  medium
+## ~~T5 — Single-frame introspection under-reports~~  ·  **DONE 2026-07-29**
 
-`.stage()` cooks at the current frame. A stage whose structure changes over
-time is described from one moment. See `docs/UNVERIFIED.md` D5.
+`inspect()` takes an optional frame (`hsl inspect --frame`,
+`inspect_hip(frame=)`), the manifest records the moment its description was
+taken at (`inspected_frame`), and a warning fires when the RenderSettings prim
+set differs between the first and last frame of the range. Demonstrated on
+21.0.729 and 22.0.368 against probe scenes whose settings set genuinely drifts,
+and clean on a real production shot (`docs/UNVERIFIED.md` D9–D11).
 
-**Done when:** `inspect()` takes an optional frame, uses `stageAtFrame()` when
-given one, and warns if the settings prim set differs between the first and
-last frame of the range.
+Two corrections the probe forced on the criterion as written:
+
+- `stageAtFrame()` **does not exist** on either build. The mechanism is the
+  `frame=` keyword on `LopNode.stage()` — which beats the global frame, verified
+  — plus `hou.setFrame()` so node *parameters* evaluate at the same moment.
+- Stage time codes are routinely unauthored (0/0) on real shots, so the
+  cross-range check falls back to the ROP's authored frame range instead of
+  silently never firing. Cost: about one extra warm cook per ranged ROP
+  (~10–12 s on a shot whose cold cook is ~95 s); single-frame ROPs pay nothing.
 
 ## ~~T6 — No per-chunk output verification~~  ·  **DONE 2026-07-26**
 

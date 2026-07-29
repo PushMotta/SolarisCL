@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from . import bridge, farm, husk as husk_mod, preflight, presets, resources
+from . import bridge, farm, husk as husk_mod, preflight, presets, progress, resources
 from .manifest import TASK_RENDER, RenderRop, SceneManifest
 from .runner import RenderQueue, State, Task
 
@@ -194,6 +194,12 @@ class LauncherWindow(QMainWindow):
         self.tasks: list[Task] = []
         self._has_tasks = False
         self._running = False
+        # id(task) for every task that has actually reported an ALF_PROGRESS
+        # percentage -- husk's own signal, never invented. Distinguishes "0%,
+        # nothing received yet" (hython, which reports none) from "0%, husk
+        # just said so", so the progress display never shows a number that
+        # never arrived.
+        self._progress_seen: set = set()
         self._thread: Optional[QThread] = None
         self._worker: Optional[InspectWorker] = None
         # ROP node path -> relinked overlay USD, once assets have been repathed.
@@ -388,6 +394,10 @@ class LauncherWindow(QMainWindow):
         self.detail.setReadOnly(True)
         self.detail.setFont(QFont(MONO, 9))
         self.detail.setPlaceholderText(_DETAIL_PLACEHOLDER)
+        # Hidden until a ROP is actually described -- it carries the layout's
+        # stretch, so left visible-but-empty it was a large blank box under
+        # the empty-state message above.
+        self.detail.setVisible(False)
         layout.addWidget(self.detail, 1)
         return box
 
@@ -704,6 +714,9 @@ class LauncherWindow(QMainWindow):
         self.task_table.verticalHeader().setVisible(False)
         self.task_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        # Wide enough for "frame 1234: 100%" / "chunk 1-100: 100%" without
+        # truncating -- the plain "42%" this replaced fit in half the space.
+        self.task_table.setColumnWidth(2, 170)
         self.task_table.setMinimumHeight(120)
         q_layout.addWidget(self.task_table)
 
@@ -801,10 +814,10 @@ class LauncherWindow(QMainWindow):
                     queue.append(upstream)
         return needed
 
-    @Slot()
-    def cook_selected(self) -> None:
+    def _ticked_cook_tasks(self) -> list:
+        """The OutputTasks whose checkbox is ticked in Caches & Sims."""
         if not self.manifest:
-            return
+            return []
         chosen = []
         for row in range(self.task_list.rowCount()):
             item = self.task_list.item(row, 0)
@@ -812,36 +825,61 @@ class LauncherWindow(QMainWindow):
                 task = self.manifest.task(item.data(Qt.UserRole))
                 if task is not None:
                     chosen.append(task)
+        return chosen
 
-        if not chosen:
-            self._set_status("Tick at least one cache or simulation.", "error")
-            return
+    def _resolve_cook_dependencies(self, chosen: list, verb: str) -> Optional[list]:
+        """Ask about ticked work's un-ticked dependencies; used by both cooking
+        and farm export, so the question reads the same either way.
 
+        Returns the (possibly extended) task list, or ``None`` if the user
+        cancelled -- callers must stop rather than act on a stale ``chosen``.
+        """
         extra = self._unticked_dependencies(chosen)
-        if extra:
-            names = "\n".join(f"    {t.node_path}" for t in extra)
-            answer = QMessageBox.question(
-                self, "Include what this depends on?",
-                f"The ticked work depends on {len(extra)} task(s) that are "
-                f"not ticked:\n\n{names}\n\nCooking without them reuses "
-                f"whatever is already on disk, which may be stale or missing.",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.Yes,
-            )
-            if answer == QMessageBox.Cancel:
-                return
-            if answer == QMessageBox.Yes:
-                chosen = extra + chosen
+        if not extra:
+            return chosen
+        names = "\n".join(f"    {t.node_path}" for t in extra)
+        answer = QMessageBox.question(
+            self, "Include what this depends on?",
+            f"The ticked work depends on {len(extra)} task(s) that are "
+            f"not ticked:\n\n{names}\n\n{verb} without them reuses "
+            f"whatever is already on disk, which may be stale or missing.",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Cancel:
+            return None
+        if answer == QMessageBox.Yes:
+            return extra + chosen
+        return chosen
 
+    def _jobs_for_cook_tasks(self, tasks: list) -> list:
+        """RenderJobs for a list of OutputTasks, via jobs_for_task -- never
+        rebuilt by hand, which is how a job previously lost its renderer,
+        camera and settings prim and rendered wrong while exiting 0."""
         hython = self.hython_combo.currentData() or ""
         jobs = []
-        for task in chosen:
+        for task in tasks:
             jobs += husk_mod.jobs_for_task(
                 self.manifest, task,
                 chunk_size=self.chunk_spin.value(),
                 hython_exe=hython or None,
             )
-        self._launch_queue(jobs, verb="Cooking")
+        return jobs
+
+    @Slot()
+    def cook_selected(self) -> None:
+        if not self.manifest:
+            return
+        chosen = self._ticked_cook_tasks()
+        if not chosen:
+            self._set_status("Tick at least one cache or simulation.", "error")
+            return
+
+        chosen = self._resolve_cook_dependencies(chosen, "Cooking")
+        if chosen is None:
+            return
+
+        self._launch_queue(self._jobs_for_cook_tasks(chosen), verb="Cooking")
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -912,11 +950,16 @@ class LauncherWindow(QMainWindow):
                 "Cook the ticked caches and simulations. Order comes from the "
                 "scene, so dependencies are handled for you.")
             ready = self._has_tasks
+            self.farm_btn.setToolTip(
+                "Export the ticked caches and simulations as a farm "
+                "submission file, in dependency order.")
         else:
             self.render_btn.setText("Render")
             self.render_btn.setToolTip(
                 "Render the selected ROP with the options on the right.")
             ready = bool(self.manifest and self.manifest.rops)
+            self.farm_btn.setToolTip(
+                "Export this render as a farm submission file.")
         self.render_btn.setEnabled(ready and not self._running)
 
     @Slot()
@@ -1024,12 +1067,42 @@ class LauncherWindow(QMainWindow):
         self.aov_list.blockSignals(False)
         self.refresh_command()
 
+    def _cook_jobs_for_farm(self) -> Optional[list]:
+        """RenderJobs for whatever is ticked in Caches & Sims, for farm export.
+
+        Mirrors cook_selected's own selection and dependency prompt so an
+        exported job matches what "Cook Ticked" would actually run. Returns
+        None (having already told the user why) when there is nothing to
+        export or they cancelled the dependency prompt.
+        """
+        if not self.manifest:
+            QMessageBox.warning(self, "Nothing to export", "Read a scene first.")
+            return None
+        chosen = self._ticked_cook_tasks()
+        if not chosen:
+            QMessageBox.warning(
+                self, "Nothing to export",
+                # A single & here: QMessageBox text has no mnemonic handling,
+                # so && would display doubled (unlike the tab label above).
+                "Tick at least one cache or simulation in the Caches & Sims "
+                "tab first.")
+            return None
+        chosen = self._resolve_cook_dependencies(chosen, "Exporting")
+        if chosen is None:
+            return None
+        return self._jobs_for_cook_tasks(chosen)
+
     @Slot()
     def export_farm_job(self) -> None:
-        jobs = self.build_jobs()
-        if not jobs:
-            QMessageBox.warning(self, "No Render Job", "Read a scene and select a valid ROP first.")
-            return
+        if self._cooking():
+            jobs = self._cook_jobs_for_farm()
+            if not jobs:
+                return          # already told the user why, or they cancelled
+        else:
+            jobs = self.build_jobs()
+            if not jobs:
+                QMessageBox.warning(self, "No Render Job", "Read a scene and select a valid ROP first.")
+                return
 
         choice, ok = QFileDialog.getSaveFileName(
             self, "Export Farm Submission File",
@@ -1039,13 +1112,22 @@ class LauncherWindow(QMainWindow):
         if not ok or not choice:
             return
 
-        if choice.endswith(".alf"):
-            farm.export_tractor_job(jobs, choice)
-            QMessageBox.information(self, "Tractor Job Exported", f"Exported Tractor job script:\n{choice}")
-        else:
-            out_dir = os.path.dirname(choice) or os.getcwd()
-            j_path, p_path = farm.export_deadline_job(jobs, out_dir)
-            QMessageBox.information(self, "Deadline Job Exported", f"Exported Deadline job files:\n{j_path}\n{p_path}")
+        try:
+            if choice.endswith(".alf"):
+                farm.export_tractor_job(jobs, choice)
+                QMessageBox.information(self, "Tractor Job Exported", f"Exported Tractor job script:\n{choice}")
+            else:
+                out_dir = os.path.dirname(choice) or os.getcwd()
+                j_path, p_path = farm.export_deadline_job(jobs, out_dir)
+                QMessageBox.information(self, "Deadline Job Exported", f"Exported Deadline job files:\n{j_path}\n{p_path}")
+        except ValueError as exc:
+            # Deadline can't express a dependency between whole jobs, or one
+            # job spanning several tasks -- it refuses rather than writing
+            # something that races. Say so; the message already names what and
+            # points at Tractor, which encodes the dependency as a DAG.
+            QMessageBox.critical(self, "Cannot export this job", str(exc))
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not write the farm submission", str(exc))
 
     # -- scene reading ----------------------------------------------------
 
@@ -1175,11 +1257,11 @@ class LauncherWindow(QMainWindow):
             self.on_rop_changed(0)
         else:
             # empty_hint already says this, prominently -- repeating it here in
-            # grey monospace made the panel look full of nothing. The box stays
-            # (it carries the layout's stretch) but loses its placeholder,
-            # which otherwise tells someone who just read a scene to read one.
+            # grey monospace made the panel look full of nothing. Hide the box
+            # rather than leave it empty; it reappears once a ROP is described.
             self.detail.clear()
             self.detail.setPlaceholderText("")
+            self.detail.setVisible(False)
 
         # An empty AOV list is a large box saying nothing; it earns its space
         # only once the scene actually declares some.
@@ -1222,6 +1304,7 @@ class LauncherWindow(QMainWindow):
             self.res_y.setValue(settings.resolution[1])
 
         self.detail.setPlainText(self._describe(rop, settings))
+        self.detail.setVisible(True)
         self.refresh_command()
 
     def _describe(self, rop: RenderRop, settings) -> str:
@@ -1607,6 +1690,7 @@ class LauncherWindow(QMainWindow):
         self.log_view.clear()
         self.overall_bar.setValue(0)
         self.overall_bar.setVisible(True)
+        self._progress_seen = set()
 
         self.bridge = QueueBridge()
         self.bridge.task_started.connect(self.on_task_started)
@@ -1630,6 +1714,7 @@ class LauncherWindow(QMainWindow):
 
         self.tasks = self.queue.tasks
         self._populate_task_table()
+        self._set_progress_bar_text(self._progress_summary())
 
         self._running = True
         self._refresh_primary_action()
@@ -1648,7 +1733,7 @@ class LauncherWindow(QMainWindow):
         for row, task in enumerate(self.tasks):
             self.task_table.setItem(row, 0, QTableWidgetItem(str(task.job.chunk)))
             self.task_table.setItem(row, 1, QTableWidgetItem(task.state.value))
-            self.task_table.setItem(row, 2, QTableWidgetItem("0%"))
+            self.task_table.setItem(row, 2, QTableWidgetItem(self._task_progress_text(task)))
             self.task_table.setItem(row, 3, QTableWidgetItem("—"))
 
     def _row_for(self, task: Task) -> int:
@@ -1657,15 +1742,39 @@ class LauncherWindow(QMainWindow):
         except ValueError:
             return -1
 
+    def _task_progress_text(self, task: Task) -> str:
+        """What the Progress column says for one chunk.
+
+        Gathers this window's own bookkeeping (which tasks have actually
+        reported a percentage) and hands off to hsl.progress -- plain stdlib
+        logic kept out of this Qt-only, import-check-only module so it can
+        have a test.
+        """
+        return progress.task_progress_text(task, self._progress_seen)
+
+    def _progress_summary(self) -> str:
+        """"Frame N of M" across the whole queue, plus an ETA. See
+        hsl.progress.queue_progress_summary for how -- kept there rather than
+        here so it can be tested without Qt installed.
+        """
+        percent = self.queue.progress if self.queue else 0
+        return progress.queue_progress_summary(self.tasks, percent, self._progress_seen)
+
+    def _set_progress_bar_text(self, text: str) -> None:
+        """QProgressBar only treats %p/%v/%m as tokens -- a lone '%' (what our
+        own percentages produce) displays as itself, so nothing needs escaping."""
+        self.overall_bar.setFormat(text or "%p%")
+
     def _update_row(self, task: Task) -> None:
         row = self._row_for(task)
         if row < 0:
             return
         self.task_table.item(row, 1).setText(task.state.value)
-        self.task_table.item(row, 2).setText(f"{task.progress}%")
+        self.task_table.item(row, 2).setText(self._task_progress_text(task))
         self.task_table.item(row, 3).setText(f"{task.duration:.0f}s")
         if self.queue:
             self.overall_bar.setValue(self.queue.progress)
+            self._set_progress_bar_text(self._progress_summary())
 
     @Slot(object)
     def on_task_started(self, task: Task) -> None:
@@ -1678,6 +1787,7 @@ class LauncherWindow(QMainWindow):
 
     @Slot(object, int)
     def on_task_progress(self, task: Task, _percent: int) -> None:
+        self._progress_seen.add(id(task))
         self._update_row(task)
 
     @Slot(object)
@@ -1699,6 +1809,7 @@ class LauncherWindow(QMainWindow):
         skipped = sum(1 for t in queue.tasks if t.state is State.SKIPPED)
         done = sum(1 for t in queue.tasks if t.state is State.DONE)
         self.overall_bar.setValue(100)
+        self._set_progress_bar_text(self._progress_summary())
         if failed or skipped:
             trailer = f"{failed} failed" if failed else ""
             if skipped:

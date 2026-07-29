@@ -639,20 +639,179 @@ def describe_rop(node, warnings: list[str]) -> RenderRop:
     return rop
 
 
-def stage_for(node, warnings: list[str]):
-    """Cook a LOP (or a ROP's input LOP) and return its composed stage."""
+# Set once if this build's LopNode.stage() refuses a `frame` keyword, so the
+# fallback is reported to the caller exactly once instead of per ROP.
+_FRAME_KWARG_MISSING = False
+
+
+def _stage_at(lop, frame: Optional[float], warnings: list):
+    """The LOP's composed stage, cooked at ``frame`` when one is given.
+
+    **There is no ``LopNode.stageAtFrame()``.** That is an easy name to
+    half-remember and it does not exist on either build here -- probed on
+    21.0.729 and 22.0.368, whose only stage-ish methods are ``stage``,
+    ``editableStage``, ``uneditableStage``, ``stagePrimStats`` and
+    ``isMostRecentStageLock``. The real mechanism is a keyword on ``stage()``
+    itself::
+
+        stage(self, output_index=-1, apply_viewport_overrides=False,
+              ignore_errors=False, use_last_cook_context_options=True,
+              apply_post_layers=True, frame=None, context_options={})
+
+    documented as "A frame number can be provided to return the result of
+    cooking the LOP node at a particular frame", and confirmed by cooking a
+    switch LOP driven by ``$F > 5``: frames 1 and 5 composed one branch, 6 and
+    10 the other, and repeating the calls in either order returned the same
+    answer each time -- a cached cook is not reused across frames.
+
+    The explicit argument also **beats** ``hou.setFrame()``: with the playbar
+    parked on frame 1, ``stage(frame=10)`` still returned frame 10's
+    composition (and vice versa). ``hou.setFrame()`` is still used alongside it
+    by :func:`inspect`, because node *parameters* evaluate at the global frame
+    and the manifest reads plenty of those; the keyword is what makes the stage
+    itself unambiguous.
+
+    On an older build with no such keyword the call raises ``TypeError``; that
+    degrades to moving the global frame instead, and says so, rather than
+    silently describing the wrong moment.
+    """
+    if frame is None:
+        return lop.stage()
+    try:
+        return lop.stage(frame=float(frame))
+    except TypeError:
+        global _FRAME_KWARG_MISSING
+        if not _FRAME_KWARG_MISSING:
+            _FRAME_KWARG_MISSING = True
+            warnings.append(
+                "This Houdini build's LopNode.stage() takes no 'frame' keyword "
+                "(it is present on 21.0.729 and 22.0.368), so the per-frame "
+                "cook falls back to setting the global frame first. That is "
+                "usually equivalent but cannot be guaranteed on a build hsl "
+                "has never seen."
+            )
+        hou.setFrame(float(frame))
+        return lop.stage()
+
+
+def stage_for(node, warnings: list[str], frame: Optional[float] = None):
+    """Cook a LOP (or a ROP's input LOP) and return its composed stage.
+
+    ``frame`` cooks at that moment instead of the current one -- a stage whose
+    structure changes over time is a different stage at a different frame, and
+    describing it from one arbitrary moment is TASKS.md T5.
+    """
     candidates = [node] + [n for n in node.inputs() if n is not None]
     for candidate in candidates:
         if not isinstance(candidate, hou.LopNode):
             continue
         try:
-            stage = candidate.stage()
+            stage = _stage_at(candidate, frame, warnings)
         except hou.Error as exc:
-            warnings.append(f"{candidate.path()}: cook failed -- {exc}")
+            at = "" if frame is None else f" at frame {frame:g}"
+            warnings.append(f"{candidate.path()}: cook failed{at} -- {exc}")
             continue
         if stage is not None:
             return stage, candidate
     return None, None
+
+
+def _settings_prim_paths(stage) -> set:
+    """The set of UsdRenderSettings prim paths on a composed stage."""
+    return {str(p.GetPath()) for p in stage.Traverse()
+            if p.IsA(UsdRender.Settings)}
+
+
+def _cross_range_frames(stage, rop) -> Optional[tuple]:
+    """The two frames the cross-range check compares, and where they came from.
+
+    First choice is the stage's own authored time code range -- the stage
+    saying how long it lasts. But a Solaris network authors **none** by
+    default: a ``rendersettings -> switch -> usdrender_rop`` network probed on
+    22.0.368 reported ``GetStartTimeCode() == GetEndTimeCode() == 0.0`` and
+    ``HasAuthoredTimeCodeRange() == False``, with the playbar on 1-10, until a
+    Configure Layer LOP set its ``starttime`` / ``endtime`` parms (that is the
+    real parm spelling -- there is no ``starttimecode`` on that node).
+
+    So a stage-only trigger would skip the check on most scenes, which is
+    exactly the under-reporting T5 is about. The ROP's own authored frame range
+    is the fallback: it is the range actually being rendered, so it is the
+    range over which a structural change would matter.
+    """
+    start = stage.GetStartTimeCode()
+    end = stage.GetEndTimeCode()
+    if start is not None and end is not None and start != end:
+        return float(start), float(end), "the stage's time code range"
+    if rop.use_frame_range and rop.frame_start != rop.frame_end:
+        return (float(rop.frame_start), float(rop.frame_end),
+                "the ROP's frame range (the stage authors no time code range)")
+    return None
+
+
+def _check_settings_drift(node, rop, stage, inspected_frame: Optional[float],
+                          inspected_paths: set, warnings: list) -> None:
+    """Warn when the RenderSettings prim *set* differs across the frame range.
+
+    This is the whole point of T5: a manifest describes one moment, and a
+    switch, a prune or a stage variant driven by ``$F`` can make another moment
+    a different scene entirely. Rather than silently describing the first
+    moment, compare the range's endpoints and say so.
+
+    **Cost:** one extra LOP cook per endpoint that is not the frame already
+    inspected -- so usually *one*, since inspecting frame 1 of a 1-100 range
+    reuses that walk for the start. Measured on a real 167 MB Karma shot
+    (22.0.368), a warm re-cook at another frame ran 10-12 s against a 94.9 s
+    cold first cook: roughly an eighth, not a repeat. A ROP with ``trange = 0``
+    has no range to compare and pays nothing -- on that shot two single-frame
+    thumbnail ROPs, one of them a 248 s cook, were skipped entirely.
+
+    It is paid unconditionally where it does apply. The alternative is a
+    manifest that is confidently wrong about which scene is being rendered.
+
+    The global frame is restored afterwards: the fallback path inside
+    :func:`_stage_at` moves it, and every parameter read after this point would
+    otherwise evaluate somewhere the caller did not ask for.
+    """
+    window = _cross_range_frames(stage, rop)
+    if window is None:
+        return
+    start, end, source = window
+
+    restore = hou.frame()
+    try:
+        by_frame: dict = {}
+        for frame in (start, end):
+            if inspected_frame is not None and frame == float(inspected_frame):
+                by_frame[frame] = inspected_paths
+                continue
+            other, _lop = stage_for(node, warnings, frame=frame)
+            if other is None:
+                warnings.append(
+                    f"{node.path()}: could not cook a stage at frame {frame:g}, "
+                    f"so hsl cannot tell whether the render settings change "
+                    f"over {source}."
+                )
+                return
+            by_frame[frame] = _settings_prim_paths(other)
+    finally:
+        if hou.frame() != restore:
+            hou.setFrame(restore)
+
+    first, last = by_frame[start], by_frame[end]
+    if first == last:
+        return
+
+    def _show(paths) -> str:
+        return ", ".join(sorted(paths)) if paths else "(none)"
+
+    at = ("" if inspected_frame is None
+          else f" This manifest describes frame {inspected_frame:g}.")
+    warnings.append(
+        f"{node.path()}: the RenderSettings prims are not the same across "
+        f"{source} -- at frame {start:g} the stage has {_show(first)}, at frame "
+        f"{end:g} it has {_show(last)}. A single-frame description cannot cover "
+        f"both.{at} Re-inspect with --frame to read another moment."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1192,7 +1351,8 @@ def relink_assets(usd_in: str, usd_out: str, search_dirs) -> dict:
 def inspect(hip_path: str, export: bool = False,
             usd_dir: str = "", flatten: bool = False,
             rop_filter: str = "", allow_volume_bake: bool = True,
-            export_frames: Optional[tuple] = None) -> SceneManifest:
+            export_frames: Optional[tuple] = None,
+            frame: Optional[float] = None) -> SceneManifest:
     """Load a .hip and describe every render ROP in it.
 
     When ``export`` is requested and a ROP's stage contains live volumes (see
@@ -1205,6 +1365,13 @@ def inspect(hip_path: str, export: bool = False,
     frames actually being rendered. Without it the export covers the ROP's whole
     authored range, which on a heavy scene is most of the cost -- exporting 1-240
     to render frame 12.
+
+    ``frame`` describes the scene as it is **at that frame** rather than at
+    whatever frame the .hip happens to open on. It moves the global frame (so
+    parameter expressions on ``$F`` evaluate there, which the task scan and the
+    ROP frame parms depend on) *and* is passed to each stage cook, so the two
+    cannot disagree. Either way ``manifest.inspected_frame`` records the moment
+    the description was taken at -- a consumer should never have to guess.
     """
     if hou is None:
         raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
@@ -1214,10 +1381,17 @@ def inspect(hip_path: str, export: bool = False,
     hou.hipFile.load(hip_path, suppress_save_prompt=True,
                      ignore_load_warnings=True)
 
+    # Before anything is read: parameters evaluate at the global frame, so this
+    # has to happen ahead of describe_rop()/scan_tasks(), not just the cooks.
+    if frame is not None:
+        hou.setFrame(float(frame))
+    inspected_frame = float(frame) if frame is not None else float(hou.frame())
+
     manifest = SceneManifest(
         hip_path=os.path.abspath(hip_path),
         houdini_version=".".join(str(v) for v in hou.applicationVersion()),
         fps=hou.fps(),
+        inspected_frame=inspected_frame,
     )
 
     rop_nodes = find_render_rops()
@@ -1242,7 +1416,7 @@ def inspect(hip_path: str, export: bool = False,
         rop = describe_rop(node, warnings)
 
         stage_volumes: list[LiveVolume] = []
-        stage, lop = stage_for(node, warnings)
+        stage, lop = stage_for(node, warnings, frame=frame)
         if stage is not None:
             if not rop.input_lop and lop is not None:
                 rop.input_lop = lop.path()
@@ -1270,6 +1444,11 @@ def inspect(hip_path: str, export: bool = False,
             stage_volumes = scan_live_volumes(stage)
             for volume in stage_volumes:
                 seen_volumes.setdefault(volume.prim_path, volume)
+
+            # Everything above describes one moment. Say so out loud when
+            # another moment would have looked different (TASKS.md T5).
+            _check_settings_drift(node, rop, stage, inspected_frame,
+                                  {s.prim_path for s in settings}, warnings)
         else:
             warnings.append(f"{node.path()}: could not obtain a USD stage.")
 
@@ -1585,6 +1764,10 @@ def main(argv=None) -> int:
                         help="Flatten the stage on export (portable, larger)")
     parser.add_argument("--rop", default="",
                         help="Only inspect this ROP path")
+    parser.add_argument("--frame", type=float, default=None,
+                        help="Describe the scene as it is at this frame "
+                             "(default: the frame the .hip opens on). The "
+                             "manifest always records which frame it used.")
     parser.add_argument("--export-frames", nargs=3, type=int, default=None,
                         metavar=("START", "END", "INC"),
                         help="Export only this range instead of the ROP's full "
@@ -1695,7 +1878,8 @@ def main(argv=None) -> int:
                            rop_filter=args.rop,
                            allow_volume_bake=args.allow_volume_bake,
                            export_frames=(tuple(args.export_frames)
-                                          if args.export_frames else None))
+                                          if args.export_frames else None),
+                           frame=args.frame)
     except Exception:
         # The launcher parses stdout as JSON, so failures must be structured.
         error = {"schema_version": 0, "error": traceback.format_exc()}
