@@ -192,6 +192,8 @@ class LauncherWindow(QMainWindow):
         self.manifest: Optional[SceneManifest] = None
         self.queue: Optional[RenderQueue] = None
         self.tasks: list[Task] = []
+        self._has_tasks = False
+        self._running = False
         self._thread: Optional[QThread] = None
         self._worker: Optional[InspectWorker] = None
         # ROP node path -> relinked overlay USD, once assets have been repathed.
@@ -209,6 +211,8 @@ class LauncherWindow(QMainWindow):
         self._set_scene_loaded(False)
 
     # -- construction -----------------------------------------------------
+
+    MODE_RENDER, MODE_COOK = 0, 1
 
     def _engine(self) -> str:
         """The selected render engine token — "hython" (default) or "husk"."""
@@ -230,8 +234,12 @@ class LauncherWindow(QMainWindow):
         self.hython_combo.clear()
         installs = bridge.list_hython_installations()
         for label, path in installs:
-            self.hython_combo.addItem(f"{label}: {path}", path)
-        self.hython_combo.addItem("Custom path...", "")
+            # The version is what anyone picks by; the full path made the row
+            # unreadable and was repeated in the field beside it anyway.
+            self.hython_combo.addItem(label, path)
+            self.hython_combo.setItemData(self.hython_combo.count() - 1,
+                                          path, Qt.ToolTipRole)
+        self.hython_combo.addItem("Custom path…", "")
 
         saved = bridge.load_user_settings().get("hython_path", "")
         active = bridge.find_hython(saved)
@@ -277,9 +285,14 @@ class LauncherWindow(QMainWindow):
             "a new Houdini or connecting a drive, without restarting the app.")
         hython_row.addWidget(QLabel("Hython"))
         hython_row.addWidget(self.hython_combo, 1)
-        hython_row.addWidget(self.hython_edit, 2)
+        # Still the authoritative path (and what "Custom path…" edits), but it
+        # showed the same string as the combo beside it, across half the row.
+        # Kept in the layout, out of sight, so every reader of it still works.
+        self.hython_edit.setVisible(False)
+        hython_row.addWidget(self.hython_edit)
         hython_row.addWidget(self.hython_rescan_btn)
         hython_row.addWidget(self.hython_browse_btn)
+        hython_row.addStretch(1)
         outer.addLayout(hython_row)
 
         opts_row = QHBoxLayout()
@@ -306,21 +319,28 @@ class LauncherWindow(QMainWindow):
         # --- middle splitter ---
         splitter = QSplitter(Qt.Vertical)
 
-        top = QWidget()
-        top_layout = QHBoxLayout(top)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.addWidget(self._build_rop_panel(), 1)
+        render_page = QWidget()
+        render_layout = QHBoxLayout(render_page)
+        render_layout.setContentsMargins(0, 0, 0, 0)
+        render_layout.addWidget(self._build_rop_panel(), 1)
 
         # Tabbed so the render-settings editor has room without pushing the
         # window taller — and so it is visible rather than buried in a form.
         right = QTabWidget()
         right.addTab(self._build_override_panel(), "Overrides")
         right.addTab(self._build_settings_panel(), "Render settings")
-        top_layout.addWidget(right, 1)
-        splitter.addWidget(top)
+        render_layout.addWidget(right, 1)
+
+        # One mode at a time. Rendering and cooking share almost none of their
+        # controls, and showing both at once was most of what made this a wall
+        # of widgets. The Run panel below is shared: both end up in the queue.
+        self.mode_tabs = QTabWidget()
+        self.mode_tabs.addTab(render_page, "Render")
+        self.mode_tabs.addTab(self._build_tasks_panel(), "Caches && Sims")
+        splitter.addWidget(self.mode_tabs)
 
         splitter.addWidget(self._build_run_panel())
-        splitter.setSizes([420, 380])
+        splitter.setSizes([440, 360])
         outer.addWidget(splitter, 1)
 
         self.setCentralWidget(central)
@@ -561,22 +581,33 @@ class LauncherWindow(QMainWindow):
         output_row.addWidget(self.output_folder_btn)
         form.addRow("Output", output_row)
 
+        # Everything below is a tuning knob with a sane default. Folded away by
+        # default so the panel shows the handful of things a render actually
+        # needs; tick the box to open it.
+        self.advanced_box = QGroupBox("Advanced")
+        self.advanced_box.setCheckable(True)
+        self.advanced_box.setChecked(False)
+        self.advanced_box.setToolTip(
+            "Chunking, concurrency and husk verbosity. The defaults are fine "
+            "for a single-machine render.")
+        advanced = QFormLayout(self.advanced_box)
+
         self.chunk_spin = QSpinBox()
         self.chunk_spin.setRange(0, 10000)
         self.chunk_spin.setSpecialValueText("all in one")
         self.chunk_spin.setToolTip("Frames per husk process.")
-        form.addRow("Chunk size", self.chunk_spin)
+        advanced.addRow("Chunk size", self.chunk_spin)
 
         self.parallel_spin = QSpinBox()
         self.parallel_spin.setRange(1, 64)
         self.parallel_spin.setValue(1)
         self.parallel_spin.setToolTip("How many husk processes run at once.")
-        form.addRow("Concurrent renders", self.parallel_spin)
+        advanced.addRow("Concurrent renders", self.parallel_spin)
 
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(0, 512)
         self.threads_spin.setSpecialValueText("all cores")
-        form.addRow("Threads per render", self.threads_spin)
+        advanced.addRow("Threads per render", self.threads_spin)
 
         self.snapshot_spin = QSpinBox()
         self.snapshot_spin.setRange(0, 3600)
@@ -585,17 +616,36 @@ class LauncherWindow(QMainWindow):
         self.snapshot_spin.setToolTip(
             "Flush a partial image this often so you can check progress."
         )
-        form.addRow("Snapshot every", self.snapshot_spin)
+        advanced.addRow("Snapshot every", self.snapshot_spin)
 
         self.verbosity_edit = QLineEdit("3")
         self.verbosity_edit.setToolTip("husk verbosity level. 'a' is appended for progress.")
-        form.addRow("Verbosity", self.verbosity_edit)
+        advanced.addRow("Verbosity", self.verbosity_edit)
 
         self.extra_edit = QLineEdit()
         self.extra_edit.setPlaceholderText("--disable-motionblur --complexity high")
-        form.addRow("Extra flags", self.extra_edit)
+        advanced.addRow("Extra flags", self.extra_edit)
+
+        # A checkable QGroupBox disables its children rather than hiding them,
+        # which would grey out live settings. Hide them instead, so unticking
+        # is purely visual and the values still reach the command.
+        self.advanced_box.toggled.connect(self._set_advanced_visible)
+        form.addRow(self.advanced_box)          # spans both columns
+        self._set_advanced_visible(False)
 
         return box
+
+    def _set_advanced_visible(self, shown: bool) -> None:
+        for child in self.advanced_box.findChildren(QWidget):
+            child.setVisible(shown)
+        self.advanced_box.setFlat(not shown)
+        # Hiding the children leaves the frame's own margins behind as an empty
+        # strip, so collapse the box to its title row as well.
+        if shown:
+            self.advanced_box.setMaximumHeight(16777215)
+        else:
+            self.advanced_box.setMaximumHeight(
+                self.advanced_box.fontMetrics().height() + 8)
 
     def _build_run_panel(self) -> QWidget:
         box = QGroupBox("Run")
@@ -613,7 +663,14 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.command_view)
 
         button_row = QHBoxLayout()
-        self.render_btn = QPushButton("Start render")
+        self.render_btn = QPushButton("Render")
+        # The app's whole purpose; it used to be the same size and weight as
+        # "Copy command", fifth in a row of six.
+        primary_font = QFont()
+        primary_font.setBold(True)
+        self.render_btn.setFont(primary_font)
+        self.render_btn.setMinimumHeight(30)
+        self.render_btn.setMinimumWidth(150)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.copy_btn = QPushButton("Copy command")
@@ -639,9 +696,6 @@ class LauncherWindow(QMainWindow):
         button_row.addWidget(self.overall_bar, 2)
         layout.addLayout(button_row)
 
-        self.tabs = QTabWidget()
-
-        # Tab 1: Queue & Logs
         queue_widget = QWidget()
         q_layout = QVBoxLayout(queue_widget)
         q_layout.setContentsMargins(0, 0, 0, 0)
@@ -659,12 +713,7 @@ class LauncherWindow(QMainWindow):
         self.log_view.setMaximumBlockCount(5000)
         self.log_view.setPlaceholderText("husk output appears here.")
         q_layout.addWidget(self.log_view, 1)
-        # "&&" is a literal ampersand -- a single "&" is a mnemonic marker, so
-        # these rendered as "Queue _Logs" and "Caches _Sims".
-        self.tabs.addTab(queue_widget, "Queue && Logs")
-        self.tabs.addTab(self._build_tasks_panel(), "Caches && Sims")
-
-        layout.addWidget(self.tabs, 1)
+        layout.addWidget(queue_widget, 1)
         return box
 
     def _build_tasks_panel(self) -> QWidget:
@@ -682,19 +731,13 @@ class LauncherWindow(QMainWindow):
         self.task_list.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         layout.addWidget(self.task_list, 1)
 
-        row = QHBoxLayout()
-        self.cook_btn = QPushButton("Cook Ticked")
-        self.cook_btn.setEnabled(False)
-        self.cook_btn.setToolTip(
-            "Cook the ticked caches and simulations. Dependencies come from "
-            "the scene, so order is handled for you."
-        )
-        self.cook_btn.clicked.connect(self.cook_selected)
+        # No button here: cooking is started by the one primary action in the
+        # Run panel, which follows the selected mode. Two "go" buttons in two
+        # different places was half the confusion.
         self.cook_hint = QLabel("")
         self.cook_hint.setWordWrap(True)
-        row.addWidget(self.cook_btn)
-        row.addWidget(self.cook_hint, 1)
-        layout.addLayout(row)
+        self.cook_hint.setStyleSheet(_STATUS_STYLES["muted"])
+        layout.addWidget(self.cook_hint)
         return widget
 
     def _populate_tasks(self) -> None:
@@ -723,7 +766,8 @@ class LauncherWindow(QMainWindow):
             self.task_list.setItem(
                 row, 4, QTableWidgetItem(task.outputs[0] if task.outputs else "—"))
 
-        self.cook_btn.setEnabled(bool(tasks))
+        self._has_tasks = bool(tasks)
+        self._refresh_primary_action()
         sequential = sum(1 for t in tasks if t.sequential)
         if not tasks:
             self.cook_hint.setText("No caches or simulations in this scene.")
@@ -835,7 +879,8 @@ class LauncherWindow(QMainWindow):
         self.setting_clear_btn.clicked.connect(self.clear_setting_overrides)
         self.settings_table.itemChanged.connect(lambda *_: self.refresh_command())
         self.farm_btn.clicked.connect(self.export_farm_job)
-        self.render_btn.clicked.connect(self.start_render)
+        self.render_btn.clicked.connect(self._primary_action)
+        self.mode_tabs.currentChanged.connect(lambda *_: self._refresh_primary_action())
         self.cancel_btn.clicked.connect(self.cancel_render)
 
         self.engine_combo.currentIndexChanged.connect(self.refresh_command)
@@ -850,8 +895,36 @@ class LauncherWindow(QMainWindow):
         self.res_check.toggled.connect(self.refresh_command)
 
     def _set_scene_loaded(self, loaded: bool) -> None:
-        for widget in (self.rop_combo, self.render_btn, self.copy_btn):
+        for widget in (self.rop_combo, self.copy_btn):
             widget.setEnabled(loaded)
+        # The primary button depends on the mode as well as the scene, so it
+        # is owned by one place rather than set from several.
+        self._refresh_primary_action()
+
+    def _cooking(self) -> bool:
+        return self.mode_tabs.currentIndex() == self.MODE_COOK
+
+    def _refresh_primary_action(self) -> None:
+        """One button, labelled and enabled for whichever mode is showing."""
+        if self._cooking():
+            self.render_btn.setText("Cook Ticked")
+            self.render_btn.setToolTip(
+                "Cook the ticked caches and simulations. Order comes from the "
+                "scene, so dependencies are handled for you.")
+            ready = self._has_tasks
+        else:
+            self.render_btn.setText("Render")
+            self.render_btn.setToolTip(
+                "Render the selected ROP with the options on the right.")
+            ready = bool(self.manifest and self.manifest.rops)
+        self.render_btn.setEnabled(ready and not self._running)
+
+    @Slot()
+    def _primary_action(self) -> None:
+        if self._cooking():
+            self.cook_selected()
+        else:
+            self.start_render()
 
     # -- hython slots -----------------------------------------------------
 
@@ -1092,7 +1165,7 @@ class LauncherWindow(QMainWindow):
                        "and read the scene again.")
             if cookable:
                 message += (f"\n\nIt does have {len(cookable)} cache/simulation "
-                            f"task(s) — see the “Caches & Sims” tab below.")
+                            f"task(s) — see the “Caches & Sims” tab.")
             self.empty_hint.setText(message)
             self.empty_hint.setVisible(True)
 
@@ -1525,7 +1598,8 @@ class LauncherWindow(QMainWindow):
 
     @Slot(str)
     def _on_prepare_failed(self, message: str) -> None:
-        self.render_btn.setEnabled(True)
+        self._running = False
+        self._refresh_primary_action()
         self._set_status("Preparing the USD failed.", "error")
         QMessageBox.critical(self, "Could not prepare the render", message[-4000:])
 
@@ -1557,7 +1631,8 @@ class LauncherWindow(QMainWindow):
         self.tasks = self.queue.tasks
         self._populate_task_table()
 
-        self.render_btn.setEnabled(False)
+        self._running = True
+        self._refresh_primary_action()
         self.cancel_btn.setEnabled(True)
         self._set_status(f"{verb} {len(jobs)} chunk(s).")
         self.queue.start()
@@ -1615,7 +1690,8 @@ class LauncherWindow(QMainWindow):
 
     @Slot(object)
     def on_queue_finished(self, queue: RenderQueue) -> None:
-        self.render_btn.setEnabled(True)
+        self._running = False
+        self._refresh_primary_action()
         self.cancel_btn.setEnabled(False)
         failed = sum(1 for t in queue.tasks if t.state is State.FAILED)
         # Skipped chunks never ran -- something they depend on did not finish.
