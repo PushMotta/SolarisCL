@@ -90,6 +90,16 @@ python -m hsl.cli render shot.hip --engine husk \
 python -m hsl.cli render shot.hip --frames 1050 --res 960 540 \
     --renderer BRAY_HdKarmaXPU
 
+# Several ROPs in one run — queued in the order given, and strictly one
+# after another at --parallel 1 (the default)
+python -m hsl.cli render shot.hip \
+    --rop /stage/usdrender_rop1 --rop /stage/usdrender_rop2
+python -m hsl.cli render shot.hip --all-rops
+
+# Several scenes back to back. Every scene is read before anything renders,
+# so a typo in the third .hip surfaces before the first spends hours.
+python -m hsl.cli batch shotA.hip shotB.hip shotC.hip --frames 1001-1100
+
 # GUI
 python -m hsl.cli ui shot.hip
 ```

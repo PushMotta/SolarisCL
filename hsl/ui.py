@@ -368,7 +368,38 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.empty_hint)
 
         self.rop_combo = QComboBox()
+        self.rop_combo.setToolTip(
+            "Which ROP the panels on the right describe and edit. On a scene "
+            "with several ROPs, tick which ones render below -- this combo "
+            "only chooses which one's overrides you are looking at.")
         layout.addWidget(self.rop_combo)
+
+        # Only a scene with more than one render ROP ever shows this -- a
+        # single-ROP scene has nothing to tick, so it looks exactly as it did
+        # before this table existed. Ticking several queues them into one run,
+        # in the order listed; the combo above still targets one of them for
+        # the override panels on the right, since AOVs, resolution, camera and
+        # the rest are inherently one ROP's settings.
+        self.rop_queue_hint = QLabel("")
+        self.rop_queue_hint.setWordWrap(True)
+        self.rop_queue_hint.setStyleSheet(_STATUS_STYLES["muted"])
+        self.rop_queue_hint.setVisible(False)
+        layout.addWidget(self.rop_queue_hint)
+
+        self.rop_table = QTableWidget(0, 2)
+        self.rop_table.setHorizontalHeaderLabels(["ROP", "Frames"])
+        self.rop_table.verticalHeader().setVisible(False)
+        self.rop_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.rop_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        # Tall enough for ~2-3 rows before it scrolls -- most scenes have a
+        # handful of render ROPs. minimumHeight is a floor the layout cannot
+        # violate; without it a tight window squeezes this below its header
+        # plus one row before it touches the AOV list and detail box below,
+        # which need the rest of the panel's height.
+        self.rop_table.setMinimumHeight(90)
+        self.rop_table.setMaximumHeight(140)
+        self.rop_table.setVisible(False)
+        layout.addWidget(self.rop_table)
 
         self.aov_box = QGroupBox("AOVs to render")
         self.aov_box.setToolTip("Ticked AOVs are kept; the rest are dropped from "
@@ -901,6 +932,7 @@ class LauncherWindow(QMainWindow):
         self.hython_browse_btn.clicked.connect(self.choose_hython)
         self.hython_rescan_btn.clicked.connect(self.rescan_hython)
         self.rop_combo.currentIndexChanged.connect(self.on_rop_changed)
+        self.rop_table.itemChanged.connect(lambda *_: self._on_rop_ticked())
         self.preset_combo.currentIndexChanged.connect(self.on_preset_changed)
         self.aov_all_btn.clicked.connect(self.select_all_aovs)
         self.aov_beauty_btn.clicked.connect(self.select_beauty_aovs)
@@ -955,11 +987,19 @@ class LauncherWindow(QMainWindow):
                 "submission file, in dependency order.")
         else:
             self.render_btn.setText("Render")
-            self.render_btn.setToolTip(
-                "Render the selected ROP with the options on the right.")
-            ready = bool(self.manifest and self.manifest.rops)
-            self.farm_btn.setToolTip(
-                "Export this render as a farm submission file.")
+            ticked = self._ticked_render_rops()
+            if self._multi_rop_scene() and len(ticked) > 1:
+                self.render_btn.setToolTip(
+                    f"Render the {len(ticked)} ticked ROPs, in order. The options "
+                    f"on the right apply only to the one shown above the list.")
+                self.farm_btn.setToolTip(
+                    "Export the ticked ROPs as a farm submission file.")
+            else:
+                self.render_btn.setToolTip(
+                    "Render the selected ROP with the options on the right.")
+                self.farm_btn.setToolTip(
+                    "Export this render as a farm submission file.")
+            ready = bool(ticked)
         self.render_btn.setEnabled(ready and not self._running)
 
     @Slot()
@@ -1099,7 +1139,7 @@ class LauncherWindow(QMainWindow):
             if not jobs:
                 return          # already told the user why, or they cancelled
         else:
-            jobs = self.build_jobs()
+            jobs = self.build_render_jobs()
             if not jobs:
                 QMessageBox.warning(self, "No Render Job", "Read a scene and select a valid ROP first.")
                 return
@@ -1192,6 +1232,8 @@ class LauncherWindow(QMainWindow):
         for rop in manifest.rops:
             self.rop_combo.addItem(rop.node_path, rop.node_path)
         self.rop_combo.blockSignals(False)
+        self._populate_rop_queue()
+        self._refresh_output_override_state()
 
         self._populate_tasks()
 
@@ -1305,7 +1347,181 @@ class LauncherWindow(QMainWindow):
 
         self.detail.setPlainText(self._describe(rop, settings))
         self.detail.setVisible(True)
+        self._update_rop_queue_hint()
         self.refresh_command()
+
+    # -- multi-ROP queue (render mode) -------------------------------------
+    #
+    # A scene with one render ROP behaves exactly as it always did: the combo
+    # above picks it, the panels on the right edit it, "Render" renders it.
+    # A scene with several gets one more control -- a ticked list of which
+    # ROPs run together in this pass -- and nothing else changes shape. The
+    # combo keeps its old job (which ROP the override panels describe); the
+    # table adds a new one (which ROPs are actually queued).
+
+    def _multi_rop_scene(self) -> bool:
+        return bool(self.manifest and len(self.manifest.rops) > 1)
+
+    def _update_rop_queue_hint(self) -> None:
+        if not self._multi_rop_scene():
+            return
+        rop = self.current_rop()
+        name = rop.node_path if rop else "the selected ROP"
+        self.rop_queue_hint.setText(
+            f"Tick the ROPs to render in this run — they render in the order "
+            f"listed. The panel on the right (AOVs, render settings, camera, "
+            f"resolution, output…) edits {name} only; any other ticked ROP "
+            f"renders with its own settings from the scene.")
+
+    def _populate_rop_queue(self) -> None:
+        """(Re)build the ticked-ROP table from the manifest. Hidden and empty
+        for zero or one ROPs, so a single-ROP scene shows no new chrome."""
+        rops = self.manifest.rops if self.manifest else []
+        multi = len(rops) > 1
+        self.rop_table.setVisible(multi)
+        self.rop_queue_hint.setVisible(multi)
+        if not multi:
+            self.rop_table.setRowCount(0)
+            return
+
+        self.rop_table.blockSignals(True)
+        self.rop_table.setRowCount(len(rops))
+        for row, rop in enumerate(rops):
+            item = QTableWidgetItem(rop.node_path)
+            item.setData(Qt.UserRole, rop.node_path)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            # Only the ROP the combo opens on (row 0, the first found) starts
+            # ticked -- a render started without touching this table renders
+            # exactly what it always rendered: that one ROP, nothing else.
+            item.setCheckState(Qt.Checked if row == 0 else Qt.Unchecked)
+            self.rop_table.setItem(row, 0, item)
+            frames = (f"{rop.frame_start}-{rop.frame_end}" if rop.use_frame_range
+                      else str(rop.frame_start))
+            self.rop_table.setItem(row, 1, QTableWidgetItem(frames))
+        self.rop_table.blockSignals(False)
+        self._update_rop_queue_hint()
+
+    def _ticked_render_rops(self) -> list:
+        """RenderRops queued for this run, in display (submission) order.
+
+        A single- (or zero-) ROP scene never shows the table -- there is only
+        ever one ROP to render, so this returns it unconditionally rather than
+        reading state from a hidden, empty widget. That is what keeps a
+        single-ROP scene's behaviour identical to before this feature existed.
+        """
+        if not self.manifest:
+            return []
+        if not self._multi_rop_scene():
+            rop = self.current_rop()
+            return [rop] if rop else []
+        chosen = []
+        for row in range(self.rop_table.rowCount()):
+            item = self.rop_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.Checked:
+                rop = self.manifest.rop(item.data(Qt.UserRole))
+                if rop is not None:
+                    chosen.append(rop)
+        return chosen
+
+    @Slot()
+    def _on_rop_ticked(self) -> None:
+        self._refresh_output_override_state()
+        self._refresh_primary_action()
+        self.refresh_command()
+
+    def _refresh_output_override_state(self) -> None:
+        """Disable the Output override once several ROPs are queued.
+
+        One path shared by several ROPs would have each overwrite the others'
+        frames -- the exact reason ``hsl render --output`` refuses to run with
+        more than one ``--rop``. The GUI cannot silently ignore it the way a
+        stray CLI flag might go unnoticed either, so the field is disabled
+        with a reason on hover, and build_render_jobs() ignores it outright
+        rather than trusting a value the user can no longer see is live.
+        """
+        multiple = len(self._ticked_render_rops()) > 1
+        for widget in (self.output_edit, self.output_browse_btn, self.output_folder_btn):
+            widget.setEnabled(not multiple)
+        if multiple:
+            reason = ("Disabled: several ROPs are ticked to render together, and "
+                       "one output path shared by all of them would have each "
+                       "overwrite the others' frames -- the same reason "
+                       "`hsl render --output` refuses this with more than one "
+                       "--rop. Tick a single ROP to set an explicit output, or "
+                       "leave outputs to the scene.")
+            self.output_edit.setToolTip(reason)
+            self.output_browse_btn.setToolTip(reason)
+            self.output_folder_btn.setToolTip(reason)
+        else:
+            self.output_edit.setToolTip("")
+            self.output_browse_btn.setToolTip(
+                "Choose an output file. The first render product takes this exact "
+                "path; any others are written alongside it under their own names.")
+            self.output_folder_btn.setToolTip(
+                "Choose an output folder. Every render product keeps its own "
+                "filename and is written into this folder.")
+
+    def _native_jobs_for_rop(self, rop: RenderRop) -> list:
+        """RenderJobs for a ticked ROP other than the one being edited.
+
+        Uses the ROP's own renderer, camera, settings prim, frame range,
+        resolution, AOVs and output exactly as the scene declares them --
+        build_jobs() (for the ROP the combo targets) is the only place the
+        override panel's edits take effect, so a second ticked ROP must not
+        silently inherit whatever happens to be sitting in those fields for a
+        different node. Advanced tuning (chunk size, threads, snapshot
+        interval, verbosity, extra flags) is shared across every ticked ROP,
+        for the same reason ``--chunk``/``--threads``/``--snapshot``/``--extra``
+        apply uniformly across ``--all-rops`` on the CLI -- those are process
+        tuning, not scene content. Never hand-built: this still goes through
+        ``jobs_for_rop``, same as build_jobs().
+        """
+        engine = self._engine()
+        usd_file = self._base_usd(rop)
+        if engine == "husk" and not usd_file:
+            return []
+        overrides = {
+            "engine": engine,
+            "threads": self.threads_spin.value(),
+            "snapshot_interval": self.snapshot_spin.value(),
+            "verbosity": self.verbosity_edit.text().strip() or "3",
+            "extra_args": self.extra_edit.text().split(),
+            "relink_dirs": (list(self._relink_dirs.get(rop.node_path, []))
+                            if engine == "hython" else []),
+        }
+        return husk_mod.jobs_for_rop(
+            self.manifest, rop, usd_file,
+            chunk_size=self.chunk_spin.value(), **overrides,
+        )
+
+    def build_render_jobs(self, current_usd_override: Optional[str] = None) -> list:
+        """RenderJobs for every ticked ROP, in display order.
+
+        A single-ROP scene has nothing to tick, so this always renders that
+        one ROP -- exactly what build_jobs() alone used to do. ``task_id`` is
+        only set when more than one ROP is ticked, matching the CLI
+        (``_render_jobs_for_rop``'s ``tag_task``): a single-ROP render keeps
+        today's untagged jobs.
+        """
+        if not self.manifest:
+            return []
+        ticked = self._ticked_render_rops()
+        if not ticked:
+            return []
+        current = self.current_rop()
+        tag_task = len(ticked) > 1
+        jobs: list = []
+        for rop in ticked:
+            if current is not None and rop.node_path == current.node_path:
+                rop_jobs = self.build_jobs(usd_override=current_usd_override,
+                                          allow_output=not tag_task)
+            else:
+                rop_jobs = self._native_jobs_for_rop(rop)
+            if tag_task:
+                for job in rop_jobs:
+                    job.task_id = rop.node_path
+            jobs += rop_jobs
+        return jobs
 
     def _describe(self, rop: RenderRop, settings) -> str:
         m = self.manifest
@@ -1375,7 +1591,14 @@ class LauncherWindow(QMainWindow):
             return None
         return checked
 
-    def build_jobs(self, usd_override: Optional[str] = None) -> list:
+    def build_jobs(self, usd_override: Optional[str] = None,
+                   allow_output: bool = True) -> list:
+        """RenderJobs for the ROP the combo currently targets, with every
+        override on the right applied. ``allow_output`` is False when several
+        ROPs are ticked to render together -- see build_render_jobs() and
+        _refresh_output_override_state() for why one output path cannot be
+        shared between them.
+        """
         rop = self.current_rop()
         if not rop or not self.manifest:
             return []
@@ -1394,7 +1617,7 @@ class LauncherWindow(QMainWindow):
             "renderer": self.renderer_combo.currentText().strip(),
             "settings_prim": settings_prim or "",
             "camera": self.camera_combo.currentText().strip(),
-            "output": self.output_edit.text().strip(),
+            "output": self.output_edit.text().strip() if allow_output else "",
             "threads": self.threads_spin.value(),
             "snapshot_interval": self.snapshot_spin.value(),
             "verbosity": self.verbosity_edit.text().strip() or "3",
@@ -1427,11 +1650,22 @@ class LauncherWindow(QMainWindow):
 
     @Slot()
     def refresh_command(self) -> None:
-        jobs = self.build_jobs()
-        if not jobs:
-            rop = self.current_rop()
+        ticked = self._ticked_render_rops()
+        current = self.current_rop()
+        multi = len(ticked) > 1
+
+        per_rop = []
+        for rop in ticked:
+            if current is not None and rop.node_path == current.node_path:
+                rop_jobs = self.build_jobs(allow_output=not multi)
+            else:
+                rop_jobs = self._native_jobs_for_rop(rop)
+            per_rop.append((rop, rop_jobs))
+
+        all_jobs = [job for _, job_list in per_rop for job in job_list]
+        if not all_jobs:
             engine = self._engine()
-            if rop and engine == "husk" and not rop.usd_path:
+            if current and engine == "husk" and not current.usd_path:
                 self.command_view.setPlainText(
                     "No USD on disk for this ROP. Turn on “Write USD while "
                     "reading” and read the scene again, or switch to Hython engine."
@@ -1442,50 +1676,91 @@ class LauncherWindow(QMainWindow):
             self.preflight_label.setText("Preflight: No active job.")
             return
 
-        preview = husk_mod.format_command(husk_mod.build_command(jobs[0]))
-        if len(jobs) > 1:
-            preview += f"\n\n… and {len(jobs) - 1} more chunk(s) with different --frame values."
         engine = self._engine()
+        first_rop, first_jobs = next((rj for rj in per_rop if rj[1]), (current, []))
+        target = current.node_path if current else first_rop.node_path
+        lines = []
+        if multi:
+            lines.append(f"# --- {first_rop.node_path} ---")
+        lines.append(husk_mod.format_command(husk_mod.build_command(first_jobs[0])))
+        remaining = len(all_jobs) - 1
+        if multi:
+            lines.append(f"\n… and {remaining} more chunk(s) across "
+                         f"{len(ticked)} ticked ROP(s).")
+            no_usd = [r.node_path for r, j in per_rop if not j]
+            if no_usd:
+                lines.append(f"# No USD on disk yet for: {', '.join(no_usd)} "
+                             f"— nothing will be rendered for them.")
+            lines.append(f"\n# The AOV, render-settings, camera, resolution and output "
+                         f"overrides above apply to {target} only; other ticked ROPs "
+                         f"render with their own settings from the scene.")
+        elif remaining:
+            lines.append(f"\n… and {remaining} more chunk(s) with different --frame values.")
         if engine == "husk" and self._selected_aov_paths() is not None:
-            preview += ("\n\n# AOVs will be filtered to your selection via a USD "
-                        "overlay authored in hython at render start.")
-        if engine == "hython" and jobs[0].relink_dirs:
-            preview += ("\n\n# Missing textures will be repathed from the folder(s) "
-                        "above and composed into the LOP network at render start.")
+            lines.append("\n# AOVs will be filtered to your selection via a USD "
+                         "overlay authored in hython at render start.")
+        if engine == "hython" and first_jobs[0].relink_dirs:
+            lines.append("\n# Missing textures will be repathed from the folder(s) "
+                         "above and composed into the LOP network at render start.")
         if engine == "husk" and self._setting_overrides():
             listed = ", ".join(f"{k}={v}" for k, v in self._setting_overrides().items())
-            preview += (f"\n\n# Render settings ({listed}) will be authored into a "
-                        f"USD overlay at render start — husk has no flag for them.")
+            lines.append(f"\n# Render settings ({listed}) will be authored into a "
+                         f"USD overlay at render start — husk has no flag for them.")
+        if multi and self.output_edit.text().strip():
+            lines.append("\n# Output override is disabled while several ROPs are "
+                         "ticked (see the Output field's tooltip) — each ROP writes "
+                         "wherever the scene says.")
 
         # Resolved filenames, so the output path can be checked before starting
         # a render rather than after it lands somewhere unexpected.
-        rop = self.current_rop()
-        frames = [f for job in jobs
-                  for f in (job.chunk.start + i * job.chunk.inc
-                            for i in range(job.chunk.count))]
-        planned = husk_mod.planned_outputs(
-            self.manifest, rop, output=self.output_edit.text().strip(), frames=frames)
-        if planned:
-            lines = ["", "# Files this render will write:"]
-            for entry in planned:
-                if entry["unresolved"]:
-                    lines.append(f"#   {entry['template']}   "
-                                 f"(unexpandable token — cannot preview)")
-                elif entry["files"]:
-                    lines.append(f"#   {entry['files'][0]}")
-                    if len(entry["files"]) > 1:
-                        lines.append(f"#   … {len(entry['files'])} files, "
-                                     f"last {entry['files'][-1]}")
-                else:
-                    lines.append(f"#   {entry['template']}   "
-                                 f"(filename decided by husk / the ROP)")
-            preview += "\n" + "\n".join(lines)
-        else:
-            preview += ("\n\n# No output path declared in the scene — husk or the "
-                        "ROP decides it. Set Output above to choose.")
-        self.command_view.setPlainText(preview)
+        for rop, rop_jobs in per_rop:
+            if not rop_jobs:
+                continue
+            frames = [f for job in rop_jobs
+                      for f in (job.chunk.start + i * job.chunk.inc
+                                for i in range(job.chunk.count))]
+            output_for_preview = "" if multi else self.output_edit.text().strip()
+            planned = husk_mod.planned_outputs(
+                self.manifest, rop, output=output_for_preview, frames=frames)
+            if multi:
+                lines.append(f"\n# --- {rop.node_path} ---")
+                header = "# Files this render will write:"
+            else:
+                header = "\n# Files this render will write:"
+            if planned:
+                lines.append(header)
+                for entry in planned:
+                    if entry["unresolved"]:
+                        lines.append(f"#   {entry['template']}   "
+                                     f"(unexpandable token — cannot preview)")
+                    elif entry["files"]:
+                        lines.append(f"#   {entry['files'][0]}")
+                        if len(entry["files"]) > 1:
+                            lines.append(f"#   … {len(entry['files'])} files, "
+                                         f"last {entry['files'][-1]}")
+                    else:
+                        lines.append(f"#   {entry['template']}   "
+                                     f"(filename decided by husk / the ROP)")
+            else:
+                prefix = "" if multi else "\n"
+                lines.append(f"{prefix}# No output path declared in the scene — husk "
+                             "or the ROP decides it." + ("" if multi else " Set Output above to choose."))
+        self.command_view.setPlainText("\n".join(lines))
 
-        pf_warnings = preflight.run_preflight_checks(jobs[0], self.manifest)
+        # Preflight — judged on each ticked ROP's first chunk, with messages
+        # deduplicated so several ROPs do not repeat the same finding once per
+        # ROP. Mirrors the CLI's own multi-ROP preflight (cmd_render).
+        seen_checks: set = set()
+        pf_warnings = []
+        for _, rop_jobs in per_rop:
+            if not rop_jobs:
+                continue
+            for check in preflight.run_preflight_checks(rop_jobs[0], self.manifest):
+                key = (check.level, check.message)
+                if key not in seen_checks:
+                    seen_checks.add(key)
+                    pf_warnings.append(check)
+
         if pf_warnings:
             errs = [w for w in pf_warnings if w.level == "error"]
             warns = [w for w in pf_warnings if w.level == "warning"]
@@ -1621,18 +1896,35 @@ class LauncherWindow(QMainWindow):
 
     @Slot()
     def start_render(self) -> None:
-        jobs = self.build_jobs()
-        if not jobs:
-            # Only the husk engine needs a USD on disk; saying so unconditionally
-            # would send a hython user chasing an export they do not need.
-            detail = ("Read a scene with “Write USD while reading” enabled first — "
-                      "the husk engine renders an exported USD."
-                      if self._engine() == "husk"
+        ticked = self._ticked_render_rops()
+        if not ticked:
+            detail = ("Tick at least one ROP to render."
+                      if self._multi_rop_scene()
                       else "Read a scene and choose a render ROP first.")
             QMessageBox.information(self, "Nothing to render", detail)
             return
 
         engine = self._engine()
+        if engine == "husk":
+            no_usd = [r.node_path for r in ticked if not self._base_usd(r)]
+            if no_usd:
+                # Only the husk engine needs a USD on disk; saying so
+                # unconditionally would send a hython user chasing an export
+                # they do not need. Naming which ROP(s) matters once there is
+                # more than one to tell apart.
+                detail = ("Read a scene with “Write USD while reading” enabled "
+                          "first — the husk engine renders an exported USD.")
+                if len(ticked) > 1:
+                    detail += "\n\nNo USD on disk for:\n" + "\n".join(no_usd)
+                QMessageBox.information(self, "Nothing to render", detail)
+                return
+
+        jobs = self.build_render_jobs()
+        if not jobs:
+            QMessageBox.information(self, "Nothing to render",
+                                    "Read a scene and choose a render ROP first.")
+            return
+
         if engine == "husk" and not husk_mod.find_husk():
             QMessageBox.warning(
                 self, "husk not found",
@@ -1642,11 +1934,17 @@ class LauncherWindow(QMainWindow):
             return
 
         # AOV selection and render-setting overrides are USD edits, not husk
-        # flags. On husk they are authored in a worker thread first and the queue
-        # runs against the result — never freeze the UI on a hython subprocess.
-        # hython needs neither: it carries both on its command line.
-        keep = self._selected_aov_paths() if engine == "husk" else None
-        overrides = self._setting_overrides() if engine == "husk" else {}
+        # flags, and apply only to the ROP the combo targets (see build_jobs).
+        # On husk they are authored in a worker thread first and the queue runs
+        # against the result — never freeze the UI on a hython subprocess.
+        # hython needs neither: it carries both on its command line. If the
+        # ROP they would apply to is not even ticked to render, there is
+        # nothing to prepare -- skip straight to launching the ticked ones.
+        current = self.current_rop()
+        current_is_ticked = current is not None and any(
+            r.node_path == current.node_path for r in ticked)
+        keep = self._selected_aov_paths() if engine == "husk" and current_is_ticked else None
+        overrides = self._setting_overrides() if engine == "husk" and current_is_ticked else {}
         if keep is not None or overrides:
             self.render_btn.setEnabled(False)
             what = "render settings" if overrides and keep is None else (
@@ -1673,7 +1971,7 @@ class LauncherWindow(QMainWindow):
 
     @Slot(str)
     def _on_prepared(self, prepared_usd: str) -> None:
-        jobs = self.build_jobs(usd_override=prepared_usd)
+        jobs = self.build_render_jobs(current_usd_override=prepared_usd)
         if not jobs:
             self._on_prepare_failed("The prepared USD produced no render jobs.")
             return

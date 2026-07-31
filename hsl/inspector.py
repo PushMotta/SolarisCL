@@ -13,6 +13,7 @@ node parameters are treated as hints for pre-filling the UI.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -131,6 +132,43 @@ def _set_parm(node, name, value) -> bool:
         return True
     except Exception:
         return False
+
+
+def _force_parm(node, name, value) -> bool:
+    """Set a parameter that may carry a **default expression**, and check it took.
+
+    Houdini ships ``usd_rop``'s ``f1`` / ``f2`` as the expressions ``$FSTART`` /
+    ``$FEND``. ``parm.set()`` does not beat an expression: the raw value stays
+    ``$FSTART``, the parm keeps evaluating to the playbar -- and nothing raises,
+    so :func:`_set_parm` reports ``True``. The miss is invisible on both channels
+    this module watches, which is how ``export_usd(frame_range=...)`` came to
+    cover the whole playbar however narrow a range was asked for (UNVERIFIED.md
+    C8; the same defect as K4 on the File Cache SOP).
+
+    ``deleteAllKeyframes()`` removes the expression -- verified on 22.0.368 for
+    ``f1``/``f2``/``f3``, and harmless on the parms that carry none. The set is
+    then *read back*, so a build where this stops working reports ``False`` and
+    the caller's warning fires instead of exporting the wrong frames in silence.
+    """
+    parm = node.parm(name)
+    if parm is None:
+        return False
+    try:
+        parm.deleteAllKeyframes()
+    except Exception:
+        pass                      # no expression to clear, or no such method
+    if not _set_parm(node, name, value):
+        return False
+    try:
+        actual = parm.eval()
+    except Exception:
+        return True               # cannot read it back; the set did not raise
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return True
+    try:
+        return abs(float(actual) - float(value)) < 1e-6
+    except (TypeError, ValueError):
+        return True
 
 
 def _apply_override(node, names, value, label: str, warnings: list) -> bool:
@@ -818,6 +856,60 @@ def _check_settings_drift(node, rop, stage, inspected_frame: Optional[float],
 # USD export
 # --------------------------------------------------------------------------
 
+def _flatten_node_path(node_path: str) -> str:
+    """``/stage/a/rop`` -> ``stage_a_rop`` -- the export basename."""
+    return node_path.strip("/").replace("/", "_")
+
+
+def _export_usd_names(node_paths) -> tuple:
+    """Assign each ROP node path a **unique** export filename.
+
+    Flattening a node path to a filename is not injective: ``/stage/a_b/rop``
+    and ``/stage/a/b_rop`` are two different ROPs that both become
+    ``stage_a_b_rop.usd``. Left alone, the second export overwrites the first,
+    both manifest entries point at the survivor, and asking for the first ROP
+    renders the second ROP's scene with no error anywhere (UNVERIFIED.md C7).
+
+    Only names that actually collide are changed, and the suffix is a digest of
+    the node's own path -- so an ordinary scene keeps byte-identical filenames,
+    and the same scene always produces the same names. A counter or a PID would
+    make the filename depend on discovery order or on which process ran, which
+    is exactly what a farm submission holding a ``usd_path`` cannot tolerate.
+
+    Returns ``(names, collisions)``: ``names`` maps node path -> filename, and
+    ``collisions`` lists the ``(basename, [node paths])`` groups that needed
+    disambiguating, so the caller can warn about them.
+    """
+    groups: dict = {}
+    for path in node_paths:
+        groups.setdefault(_flatten_node_path(path), []).append(path)
+
+    names: dict = {}
+    taken = set()
+    for base, paths in groups.items():
+        if len(paths) == 1:
+            names[paths[0]] = base + ".usd"
+            taken.add(names[paths[0]])
+
+    collisions = []
+    for base in sorted(groups):
+        paths = groups[base]
+        if len(paths) == 1:
+            continue
+        for path in sorted(paths):
+            digest = hashlib.sha1(path.encode("utf-8")).hexdigest()
+            # Widen only if the short form would clash with another export in
+            # the same pass; 8 hex chars is plenty for the ROPs in one scene.
+            for width in (8, 16, 40):
+                candidate = f"{base}_{digest[:width]}.usd"
+                if candidate not in taken:
+                    break
+            names[path] = candidate
+            taken.add(candidate)
+        collisions.append((base, sorted(paths)))
+    return names, collisions
+
+
 def export_usd(rop_node, out_path: str, frame_range=None,
                flatten: bool = False, warnings: Optional[list] = None) -> str:
     """Write the ROP's input stage to disk so husk can render it.
@@ -826,6 +918,11 @@ def export_usd(rop_node, out_path: str, frame_range=None,
     matters: ``Export()`` serialises the stage as cooked at a single time, so
     animation, motion blur samples and per-frame value clips are silently lost.
     The USD ROP re-cooks per frame and handles all of that.
+
+    ``frame_range`` is applied through :func:`_force_parm`, which clears the
+    ``$FSTART``/``$FEND`` expressions the ROP ships with and reads the value
+    back. Without that the range is ignored and the whole playbar is exported
+    (UNVERIFIED.md C8).
     """
     warnings = warnings if warnings is not None else []
     parent = rop_node.parent()
@@ -867,15 +964,19 @@ def export_usd(rop_node, out_path: str, frame_range=None,
             # One self-contained file (fileperframe=0) keeps the husk command
             # simple. A missing parm here means the wrong frames get exported,
             # so say so rather than exporting a single frame in silence.
+            #
+            # These go through _force_parm, not _set_parm: f1/f2 arrive as the
+            # expressions $FSTART/$FEND, which a plain set() does not beat (C8).
+            # Every export used to cover the whole playbar as a result.
             for name, value in (("trange", 1), ("f1", start), ("f2", end),
                                 ("f3", inc), ("fileperframe", 0)):
-                if not _set_parm(tmp, name, value):
+                if not _force_parm(tmp, name, value):
                     warnings.append(
-                        f"{rop_node.path()}: usd_rop has no '{name}' parameter on "
-                        f"this build; the exported range may not be {start}-{end}"
-                        f"x{inc} as requested."
+                        f"{rop_node.path()}: usd_rop's '{name}' parameter could "
+                        f"not be set to {value!r} on this build; the exported "
+                        f"range may not be {start}-{end}x{inc} as requested."
                     )
-        elif not _set_parm(tmp, "trange", 0):
+        elif not _force_parm(tmp, "trange", 0):
             warnings.append(
                 f"{rop_node.path()}: usd_rop has no 'trange' parameter; the "
                 f"export may cover the ROP's whole range, not the current frame."
@@ -1394,9 +1495,9 @@ def inspect(hip_path: str, export: bool = False,
         inspected_frame=inspected_frame,
     )
 
-    rop_nodes = find_render_rops()
-    if rop_filter:
-        rop_nodes = [n for n in rop_nodes if n.path() == rop_filter]
+    discovered = find_render_rops()
+    rop_nodes = ([n for n in discovered if n.path() == rop_filter]
+                 if rop_filter else list(discovered))
     if not rop_nodes:
         warnings.append("No USD Render ROPs found in /stage or /out.")
 
@@ -1404,6 +1505,26 @@ def inspect(hip_path: str, export: bool = False,
         tempfile.gettempdir(), "hsl",
         os.path.splitext(os.path.basename(hip_path))[0],
     )
+
+    # Export filenames are derived from *every* ROP in the scene, not just the
+    # --rop subset, so `--rop X` writes the same file a full pass would (C7).
+    export_names, name_collisions = _export_usd_names(
+        [n.path() for n in discovered])
+    if export:
+        selected = {n.path() for n in rop_nodes}
+        for base, paths in name_collisions:
+            if not selected.intersection(paths):
+                continue
+            mapping = "; ".join(f"{p} -> {export_names[p]}" for p in paths)
+            joined = (" and ".join(paths) if len(paths) == 2
+                      else ", ".join(paths))
+            warnings.append(
+                f"Export filename collision: {joined} all flatten to "
+                f"'{base}.usd'. Only one file would have survived and the other "
+                f"ROPs would have rendered its stage instead of their own, so "
+                f"each is exported to a distinct, path-derived filename "
+                f"({mapping})."
+            )
 
     seen_settings: dict[str, RenderSettings] = {}
     seen_products: dict[str, RenderProduct] = {}
@@ -1469,7 +1590,8 @@ def inspect(hip_path: str, export: bool = False,
                     f"--allow-volume-bake to export anyway."
                 )
             else:
-                usd_name = node.path().strip("/").replace("/", "_") + ".usd"
+                usd_name = export_names.get(
+                    node.path(), _flatten_node_path(node.path()) + ".usd")
                 # Export only what is being rendered when the caller said so.
                 frame_range = export_frames or (
                     (rop.frame_start, rop.frame_end, rop.frame_inc)

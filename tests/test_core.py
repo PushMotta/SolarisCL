@@ -1843,6 +1843,246 @@ class TestInspectCliFrame(unittest.TestCase):
         self.assertNotIn("described at frame", out)
 
 
+class TestMultiRopRender(unittest.TestCase):
+    """`hsl render` can queue several ROPs. The queue starts chunks in
+    submission order, so --parallel 1 renders one ROP after another."""
+
+    def setUp(self):
+        self.manifest = sample_manifest()
+        self.manifest.rops.append(RenderRop(
+            node_path="/stage/usdrender_rop2", node_type="usdrender_rop",
+            renderer="BRAY_HdKarma", settings_prim="/Render/rendersettings",
+            frame_start=1, frame_end=1))
+        self._real_inspect = bridge.inspect_hip
+        self._real_save = bridge.save_cached
+        bridge.inspect_hip = lambda *a, **k: self.manifest
+        bridge.save_cached = lambda m: ""
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        bridge.inspect_hip = self._real_inspect
+        bridge.save_cached = self._real_save
+
+    def _render(self, extra):
+        args = build_parser().parse_args(
+            ["render", "s.hip", "--no-cache", "--dry-run"] + extra)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cmd_render(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_two_rops_render_in_the_order_asked_for(self):
+        code, out, _ = self._render(["--rop", "/stage/usdrender_rop2",
+                                     "--rop", "/stage/usdrender_rop1"])
+        self.assertEqual(code, 0)
+        self.assertIn("# --- /stage/usdrender_rop2 ---", out)
+        self.assertLess(out.index("/stage/usdrender_rop2"),
+                        out.index("/stage/usdrender_rop1"))
+
+    def test_all_rops_renders_everything(self):
+        code, out, _ = self._render(["--all-rops"])
+        self.assertEqual(code, 0)
+        self.assertIn("/stage/usdrender_rop1", out)
+        self.assertIn("/stage/usdrender_rop2", out)
+
+    def test_multiple_rops_reject_a_single_output_path(self):
+        # One file path shared by two ROPs means one silently overwrites the
+        # other -- same guard the cook command has.
+        code, _, err = self._render(["--all-rops", "--output", "/tmp/x.exr"])
+        self.assertEqual(code, 4)
+        self.assertIn("--output", err)
+
+    def test_unknown_rop_is_reported_with_the_scene_list(self):
+        code, _, err = self._render(["--rop", "/stage/nope"])
+        self.assertEqual(code, 2)
+        self.assertIn("/stage/nope", err)
+        self.assertIn("/stage/usdrender_rop1", err)
+
+    def test_a_duplicate_rop_renders_once_and_says_so(self):
+        code, out, err = self._render(["--rop", "/stage/usdrender_rop1",
+                                       "--rop", "/stage/usdrender_rop1"])
+        self.assertEqual(code, 0)
+        self.assertIn("duplicate", err)
+        self.assertNotIn("# ---", out)     # collapsed back to a single ROP
+
+    def test_no_selection_still_asks_the_user_to_choose(self):
+        # Two ROPs and no --rop stays an error: rendering everything is the
+        # explicit --all-rops opt-in, not a silent default.
+        code, _, err = self._render([])
+        self.assertEqual(code, 2)
+        self.assertIn("--rop", err)
+
+    def test_husk_multi_rop_needs_every_stage_exported(self):
+        self.manifest.rops[0].usd_path = "/tmp/a.usd"      # rop2 has none
+        code, _, err = self._render(["--engine", "husk", "--all-rops"])
+        self.assertEqual(code, 3)
+        self.assertIn("/stage/usdrender_rop2", err)
+
+    def test_multi_rop_jobs_carry_their_rop_as_task_id(self):
+        args = build_parser().parse_args(["render", "s.hip"])
+        jobs, err = cli_mod._render_jobs_for_rop(
+            args, self.manifest, self.manifest.rops[0], "hython",
+            None, None, tag_task=True)
+        self.assertIsNone(err)
+        self.assertTrue(all(j.task_id == "/stage/usdrender_rop1" for j in jobs))
+        # A single-ROP render keeps today's untagged jobs and output format.
+        jobs, _ = cli_mod._render_jobs_for_rop(
+            args, self.manifest, self.manifest.rops[0], "hython",
+            None, None, tag_task=False)
+        self.assertTrue(all(j.task_id == "" for j in jobs))
+
+
+class TestBatchCli(unittest.TestCase):
+    """`hsl batch` renders several scenes back to back, reading them all
+    before rendering anything."""
+
+    def setUp(self):
+        self._real_inspect = bridge.inspect_hip
+        self._real_load = bridge.load_cached
+        self._real_save = bridge.save_cached
+        bridge.load_cached = lambda hip: None
+        bridge.save_cached = lambda m: ""
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        bridge.inspect_hip = self._real_inspect
+        bridge.load_cached = self._real_load
+        bridge.save_cached = self._real_save
+
+    def _manifest_for(self, hip):
+        return SceneManifest(hip_path=hip, rops=[RenderRop(
+            node_path="/stage/usdrender_rop1", node_type="usdrender_rop",
+            frame_start=1, frame_end=1)])
+
+    def _batch(self, argv):
+        args = build_parser().parse_args(argv)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cli_mod.cmd_batch(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def _run_with_fake_queue(self, argv):
+        """Run a real (non-dry) batch against a queue stub, capturing jobs."""
+        captured = {}
+
+        class FakeQueue:
+            def __init__(self, jobs, max_parallel=1, on_event=None):
+                captured["jobs"] = jobs
+                captured["parallel"] = max_parallel
+                self.warnings = []
+                self.tasks = []
+
+            def start(self, block=False):
+                pass
+
+        original = cli_mod.RenderQueue
+        cli_mod.RenderQueue = FakeQueue
+        try:
+            code, _, _ = self._batch(argv)
+        finally:
+            cli_mod.RenderQueue = original
+        return code, captured
+
+    def test_scenes_render_in_the_order_given(self):
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(hip)
+        code, out, err = self._batch(["batch", "a.hip", "b.hip", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertLess(out.index("a.hip"), out.index("b.hip"))
+        self.assertIn("2 scene(s)", err)
+
+    def test_a_bad_scene_stops_the_batch_before_anything_renders(self):
+        # A typo in scene 3 must surface before scenes 1-2 spend hours
+        # rendering -- every scene is read up front.
+        calls = []
+
+        def fake_inspect(hip, **k):
+            calls.append(hip)
+            if hip == "b.hip":
+                raise bridge.InspectError("no such .hip")
+            return self._manifest_for(hip)
+
+        bridge.inspect_hip = fake_inspect
+        code, out, err = self._batch(["batch", "a.hip", "b.hip", "c.hip",
+                                      "--dry-run"])
+        self.assertEqual(code, 2)
+        self.assertIn("b.hip", err)
+        self.assertNotIn("c.hip", calls)
+        self.assertEqual(out, "")
+
+    def test_a_scene_with_no_render_rops_is_an_error(self):
+        def fake_inspect(hip, **k):
+            manifest = self._manifest_for(hip)
+            if hip == "b.hip":
+                manifest.rops = []
+            return manifest
+
+        bridge.inspect_hip = fake_inspect
+        code, _, err = self._batch(["batch", "a.hip", "b.hip", "--dry-run"])
+        self.assertEqual(code, 2)
+        self.assertIn("b.hip", err)
+
+    def test_task_ids_carry_the_hip_name(self):
+        # Node paths repeat across scenes; without the hip prefix two scenes'
+        # /stage/usdrender_rop1 chunks would be indistinguishable in a queue.
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(hip)
+        code, captured = self._run_with_fake_queue(["batch", "a.hip", "b.hip"])
+        self.assertEqual(code, 0)
+        self.assertEqual([j.task_id for j in captured["jobs"]],
+                         ["a.hip:/stage/usdrender_rop1",
+                          "b.hip:/stage/usdrender_rop1"])
+
+    def test_frames_override_applies_to_every_scene(self):
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(hip)
+        code, captured = self._run_with_fake_queue(
+            ["batch", "a.hip", "b.hip", "--frames", "5-6"])
+        self.assertEqual(code, 0)
+        chunks = [j.chunk for j in captured["jobs"]]
+        self.assertTrue(all(c.start == 5 and c.count == 2 for c in chunks))
+
+    def test_husk_batch_requires_exported_stages(self):
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(hip)
+        code, _, err = self._batch(["batch", "a.hip", "--engine", "husk",
+                                    "--dry-run"])
+        self.assertEqual(code, 3)
+        self.assertIn("a.hip", err)
+
+    def test_husk_batch_narrows_the_export_to_the_requested_frames(self):
+        # The export genuinely narrows now (UNVERIFIED C8); a husk batch that
+        # did not forward --frames would render frames the USD does not carry.
+        captured = {}
+
+        def fake_inspect(hip, **k):
+            captured[hip] = k
+            manifest = self._manifest_for(hip)
+            manifest.rops[0].usd_path = "/tmp/%s.usd" % hip
+            return manifest
+
+        bridge.inspect_hip = fake_inspect
+        code, _, _ = self._batch(["batch", "a.hip", "--engine", "husk",
+                                  "--frames", "5-6", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["a.hip"]["export_frames"], (5, 6, 1))
+        # And a hython batch, which exports nothing, passes none.
+        captured.clear()
+        code, _, _ = self._batch(["batch", "a.hip", "--frames", "5-6",
+                                  "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIsNone(captured["a.hip"]["export_frames"])
+
+    def test_live_volumes_block_a_husk_batch(self):
+        def fake_inspect(hip, **k):
+            manifest = self._manifest_for(hip)
+            manifest.rops[0].usd_path = "/tmp/a.usd"
+            manifest.live_volumes = [LiveVolume(prim_path="/v", field_count=2)]
+            return manifest
+
+        bridge.inspect_hip = fake_inspect
+        code, _, err = self._batch(["batch", "a.hip", "--engine", "husk",
+                                    "--dry-run"])
+        self.assertEqual(code, 3)
+        self.assertIn("hython", err)
+
+
 class TestConsoleEncoding(unittest.TestCase):
     """A fresh Windows console is cp1252. Printing a character it cannot map
     raises UnicodeEncodeError half way through a report -- the user loses the

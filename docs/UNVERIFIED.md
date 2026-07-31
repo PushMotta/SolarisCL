@@ -11,6 +11,11 @@ confirmed. What is still genuinely unknown is listed below with a way to check
 it — do not "fix" those from recall, because the failure mode is a silently
 incorrect render, not an exception.
 
+Two further defects were found by a targeted multi-ROP export probe on
+2026-07-31 (C7 — colliding export filenames, C8 — `frame_range` defeated by the
+ROP's `$FSTART`/`$FEND` expressions) and have since been fixed and re-probed on
+both 21.0.729 and 22.0.368; both are written up in section C.
+
 The synthetic probe's one SKIP (D2 — typed AOV prims) was then **resolved
 separately** by running `/hip-check` on a real production Karma shot
 (`SHOT_SandBurst_ROCHA_v14`, Houdini 22.0.368): the inspector read its ROPs,
@@ -21,7 +26,8 @@ Move each newly confirmed item into the Verified table with the version you
 checked, and fix the code for anything that comes back wrong.
 
 Status key: `?` unverified · `OK` confirmed on a real install · `FIXED` was
-wrong, corrected and re-confirmed
+wrong, corrected and re-confirmed · `WRONG` proven wrong on a real install and
+**not yet fixed**
 
 ---
 
@@ -60,10 +66,11 @@ now first in the candidate list.
 
 ## C. USD ROP parameters — `hsl/inspector.py` `export_usd()`
 
-Set via `_set_parm()`. Note that `savestyle` is a **string menu**: `parm.set()`
-accepts an unknown token without raising, so a wrong value here is doubly silent
-— no exception *and* a return value of `True`. Only using a real menu token
-works.
+Set via `_set_parm()`, except the frame-range block which goes through
+`_force_parm()` (clears the parm's expression, then reads the value back — see
+C8). Note that `savestyle` is a **string menu**: `parm.set()` accepts an unknown
+token without raising, so a wrong value here is doubly silent — no exception
+*and* a return value of `True`. Only using a real menu token works.
 
 | # | Parameter | Consequence if wrong | Status |
 |---|---|---|---|
@@ -80,10 +87,121 @@ silently ignored it, making `--flatten` a no-op. Fixed: `export_usd()` now picks
 a real token via `_flatten_token()` (prefers `flattenalllayers`, falls back to
 `flattenstage`) and warns if neither is present.
 
-**Still open (`docs/TASKS.md` T1):** the other `_set_parm()` calls in
-`export_usd()` (`lopoutput`, `trange`, …) still ignore their return values. On
-21/22 those parms all exist so nothing is lost today, but on an untested build a
-missing `lopoutput` would export to the wrong path with no warning.
+**Still open (`docs/TASKS.md` T1):** `lopoutput` and the range parms now check
+their return values (`lopoutput` aborts the export, the range parms warn), but
+`enableoutputprocessor_simplerelativepaths` and `savestyle` still discard theirs
+— both are harmless when absent, which is why they are left alone.
+
+### Multi-ROP export in one pass  ·  measured (22.0.368), 2026-07-31
+
+Asked for the CLI's multi-ROP sequential rendering: with `--export-usd` and **no**
+`--rop`, does one inspector pass yield a usable `usd_path` for *every* render ROP?
+Probed on a throwaway two-ROP `/stage` scene (`sphere → rendersettings →
+usdrender_rop`, twice, distinct prim paths and distinct authored ranges 1-2 / 5-7),
+plus a deliberately colliding variant. Every parm name used to build the scene was
+probed first, not recalled.
+
+| # | Finding | Status | Evidence |
+|---|---|---|---|
+| C6 | one pass exports **every** ROP found; each `RenderRop.usd_path` is populated, and each file holds that ROP's **own** stage | `OK` (22) | manifest had 2 rops, both `usd_path` non-empty and existing; `stage_usdrender_rop_A.usd` → `/geo_A`, `/Render/rs_A`, `stage_usdrender_rop_B.usd` → `/geo_B`, `/Render/rs_B`. `--rop B` wrote one file only |
+| C7 | the export filename is `node.path().strip("/").replace("/", "_") + ".usd"`, so two ROPs whose paths differ only in **where the separator falls** collide silently | `FIXED` (21, 22) | was: `/stage/a_b/rop` and `/stage/a/b_rop` both → `stage_a_b_rop.usd`, **one** file, both manifest entries pointing at it, `/geo_SECOND` only, no warning. Now two files, right stages, warning |
+| C8 | `export_usd(frame_range=…)` does **not** narrow the export on a stock `usd_rop` | `FIXED` (21, 22) | was: `f1`/`f2` ship as the expressions `$FSTART` / `$FEND`, `_set_parm` returned `True` while `rawValue()` stayed `'$FSTART'`. Now cleared first and read back — 3-4 asked, 3-4 written |
+
+**C7 was fixed on 2026-07-31.** `inspect()` no longer flattens each node path in
+isolation: `_export_usd_names()` takes **every** render ROP discovered in the
+scene, groups them by flattened basename, and disambiguates only the groups with
+more than one member by appending an 8-char SHA-1 of that node's own path.
+
+- Deterministic on purpose. The suffix is a digest of the path, never a counter
+  or a PID — a farm submission holding a `usd_path` must get the same filename
+  from the same scene on any machine, in any discovery order.
+- Names come from the **unfiltered** ROP list, so `--rop /stage/a_b/rop` writes
+  the *same* file a full pass would rather than reverting to the colliding name.
+- Ordinary scenes are untouched: a group of one keeps the old basename exactly.
+- The disambiguation is announced in `manifest.warnings`, naming both ROPs and
+  the file each got, because a filename that silently changed shape is its own
+  small trap.
+
+Measured on the same colliding scene, Houdini 22.0.368:
+
+| | before | after |
+|---|---|---|
+| files on disk | 1 (`stage_a_b_rop.usd`) | 2 (`…_84d15dc9.usd`, `…_06a64410.usd`) |
+| `/stage/a_b/rop` → | `stage_a_b_rop.usd`, contents `/geo_SECOND` | `…_84d15dc9.usd`, contents `/geo_FIRST` ✓ |
+| `/stage/a/b_rop` → | `stage_a_b_rop.usd`, contents `/geo_SECOND` | `…_06a64410.usd`, contents `/geo_SECOND` ✓ |
+| warning | none | `Export filename collision: /stage/a/b_rop and /stage/a_b/rop all flatten to 'stage_a_b_rop.usd'. Only one file would have survived…` |
+| `--rop /stage/a_b/rop` alone | — | same `…_84d15dc9.usd` as the full pass |
+| non-colliding two-ROP scene | `stage_usdrender_rop_A/B.usd` | **identical**, and no warning |
+
+Re-run on **21.0.729** with the scene rebuilt there: the same two filenames, the
+same digests (they are a function of the node path alone, so they are stable
+across versions, processes and machines), the same prims in each, same warning.
+
+**C8 was the K4 defect again, in the export path, and was fixed on 2026-07-31.**
+`parm.set()` does not beat a default *expression*, and `_set_parm()` reports
+`True` because nothing raised — so the miss was invisible on both channels the
+code watches. Measured before the fix: asking
+`export_usd(rop, out, frame_range=(3, 4, 1))` for two frames wrote **240** time
+samples (frames 1–240, 16 705 B).
+
+The fix is `_force_parm()`, used for every parm in `export_usd()`'s range block:
+it calls `deleteAllKeyframes()` first (the K4 mechanism, **re-probed here on the
+`usd_rop` parms rather than assumed**), sets the value, and then **reads it back**
+— so a build where this stops working returns `False` and the existing warning
+fires instead of exporting the wrong frames in silence. Probed on 22.0.368, fresh
+`usd_rop`, playbar 1–240:
+
+| parm | ships as | `_set_parm` | `_force_parm` |
+|---|---|---|---|
+| `trange` | `'off'` → 0, no keyframes | `True`, eval 1 ✓ | `True`, eval 1 ✓ |
+| `f1` | **`'$FSTART'`**, 1 keyframe | `True`, raw still `'$FSTART'`, eval **1.0** ✗ | `True`, raw `'3'`, eval **3.0** ✓ |
+| `f2` | **`'$FEND'`**, 1 keyframe | `True`, raw still `'$FEND'`, eval **240.0** ✗ | `True`, raw `'4'`, eval **4.0** ✓ |
+| `f3` | `'1'`, no keyframes | `True`, eval 1.0 ✓ | `True`, eval 1.0 ✓ |
+| `fileperframe` | `'off'`, no keyframes | `True`, eval 0 ✓ | `True`, eval 0 ✓ |
+
+`deleteAllKeyframes()` exists on all five and is harmless on the four that carry
+no expression. An absent parm still returns `False`, so the warning path is
+intact. **21.0.729 produced this table line for line** — same `$FSTART`/`$FEND`
+defaults, same failure under `_set_parm`, same success under `_force_parm`.
+
+End to end on the animated two-ROP scene (radius = `$F * 0.1`, so the time
+samples are an honest witness of which frames were written):
+
+| run | before | after |
+|---|---|---|
+| `export_usd(frame_range=(3,4,1))` | 240 samples, 1–240, 16 705 B | **2 samples, [3, 4]**, 1 859 B |
+| `--export-frames 3 4 1` (both ROPs) | 240 samples each, 16 705 B | **[3, 4]** each, layer timeCodes 3.0–4.0, 1 859 B |
+| no `--export-frames`, ROP A authored 1-2 | 240 samples | **[1, 2]**, 1 857 B |
+| no `--export-frames`, ROP B authored 5-7 | 240 samples | **[5, 6, 7]**, 1 915 B |
+| `frame_range=None` | — | 1 sample (current frame) |
+
+The last two rows are the wider win: the ROP's **own** authored range was being
+ignored too, so *every* husk export covered the whole playbar. The 1 859 B vs
+16 705 B on a toy sphere is the shape of the "exporting 1-240 to render frame 12"
+cost on a real shot. Repeated on **21.0.729** (scene rebuilt there):
+`--export-frames 3 4 1` → samples `[3, 4]`, 1 754 B.
+
+**What is still not proven:** the `_force_parm` read-back returning `False` — the
+guard for a build where `deleteAllKeyframes()` stops clearing the expression.
+Both installs here clear it, so that branch has never fired against a real
+Houdini (same shape as D12). Nor has any of this been run on a **production**
+shot; the evidence is a synthetic two-ROP scene on both builds.
+
+**`--export-frames` is global, not per-ROP**: the one tuple replaces *each* ROP's
+authored range for every ROP in the pass —
+`export_frames or (rop.frame_start, rop.frame_end, rop.frame_inc)`. There is no
+per-ROP form, and **no manifest field records what was actually exported**:
+`RenderRop`'s `frame_start` / `frame_end` stayed the ROP's own authored 1-2 and
+5-7 in both the plain and the `--export-frames 3 4 1` run. A consumer cannot tell
+from the manifest which frames a `usd_path` covers. That mattered less when the
+answer was always "all of them"; now that the export genuinely narrows (C8), a
+consumer that assumes otherwise would ask husk for frames the USD does not carry.
+Recording it needs a new `manifest.py` field — see `docs/TASKS.md`.
+
+**For the multi-ROP husk wiring:** C6 is the answer — one pass does give a
+per-ROP `usd_path`, so multi-ROP husk is wireable. C7 (filename collisions) and
+C8 (the range no-op) are both fixed above, so per-ROP `usd_path` integrity and
+the requested frame range can now be relied on.
 
 ## D. USD schema access — `hsl/inspector.py` `walk_stage()`
 
@@ -479,6 +597,9 @@ destinations are reported as a warning rather than silently overwriting.
 | K6 | ROP dependencies readable from `inputs()`; `fetch` points via its `source` parm | 21.0.729, 22.0.368 | 2026-07-28 | `merge`/other non-task nodes are traversed through, not reported |
 | K7 | `--output` on a **File Cache SOP** cook repoints the cache | 22.0.368 | 2026-07-29 | setting the SOP's own `file` parm reaches the inner ROP: 2 frames landed at the redirected path, **nothing** at the SOP's authored location |
 | K9 | `initsim` discriminates as a sequential signal | 22.0.368 | 2026-07-29 | two Geometry ROPs identical but for this parm: `0` → `sequential=False`, `1` → `sequential=True`. Proves it is read and flips the classification; that "Initialize Simulation OPs" *implies* frame-to-frame state is its documented meaning, not something this probe exercised (see K8) |
+| C6 | one `--export-usd` pass exports **every** ROP, each to its own `usd_path`, each holding that ROP's own stage | 22.0.368 | 2026-07-31 | two-ROP throwaway scene: 2 rops, 2 files, `/geo_A` vs `/geo_B`. Multi-ROP husk is wireable |
+| C7 | **fixed** — export filenames are made unique per pass (`_export_usd_names`): colliding groups get an 8-char SHA-1 of the node path, and the manifest warns | 21.0.729, 22.0.368 | 2026-07-31 | was one file for `/stage/a_b/rop` + `/stage/a/b_rop`; now 2 files, `/geo_FIRST` and `/geo_SECOND` in the right ones, warning present. `--rop` gives the same name as a full pass; a non-colliding scene's names are unchanged |
+| C8 | **fixed** — `export_usd()` sets the range with `_force_parm` (`deleteAllKeyframes()` then set then read back), so `$FSTART`/`$FEND` no longer defeat it | 21.0.729, 22.0.368 | 2026-07-31 | was: asked 3-4, got 240 frames. Now `--export-frames 3 4 1` → samples `[3, 4]` (1 859 B vs 16 705 B); no flag → each ROP's own range, `[1,2]` and `[5,6,7]`. Same defect as K4 |
 | K-COOK | **end-to-end headless cook** | 22.0.368 | 2026-07-28 | throwaway scene: `find_output_tasks` found 4 tasks (2 geometry ROPs, 1 dop, 1 filecache in `/obj`), classified cache/cache/sim/cache, read `final_rop → cache_rop` off the input chain, and the queue wrote **6 real `.bgeo.sc` files**; sequential filecache stayed 1 chunk under `chunk_size=2` |
 
 ## Still unknown (do not guess)

@@ -14,7 +14,7 @@ library. The plain-Python half stays testable with no Houdini installed.
   Do not trust this file for push state — run
   `git log --oneline origin/main..main`. At rewrite time the UI mode
   restructure and this rewrite itself had not been pushed.
-- **Green:** 227 tests, boundary lint, 55 drift checks, ui-imports,
+- **Green:** 243 tests, boundary lint, 55 drift checks, ui-imports,
   whitespace. `python -m unittest discover -s tests` needs no Houdini.
 - **Project root:** `F:\Nexus Projects\SolarisCL` — the working dir **is** the
   git root. `_archive\` is the original delivery, gitignored and disposable.
@@ -97,6 +97,31 @@ lists them; the GUI has a **Caches & Sims** mode.
   lives in **`hsl/progress.py`** (stdlib-only, unit-tested); `ui.py` keeps
   thin Qt wrappers. The empty-state blank detail box is gone.
 
+### Newest: several ROPs in a row, several scenes in a row
+
+- **`hsl render` takes repeatable `--rop` / `--all-rops`.** ROPs queue in the
+  order given; the queue starts chunks in submission order, so `--parallel 1`
+  (the default) is strictly one ROP after another, and a failed ROP does not
+  stop the ones behind it. `--output` with several ROPs is rejected (one path,
+  N writers). Multi-ROP jobs carry `task_id=rop path`; single-ROP renders stay
+  untagged and byte-identical to before.
+- **`hsl batch a.hip b.hip …`** renders whole scenes back to back. Every scene
+  is inspected before anything renders (fail fast), task ids are
+  `hipname:/rop/path`, and it is deliberately plainer than `render` — no
+  per-render editing flags.
+- **The GUI render mode grew a ticked ROP table** (hidden for single-ROP
+  scenes — zero change to the common case). The override panels edit the
+  *current* ROP only; other ticked ROPs render with their own scene settings,
+  and the output override is disabled (with the reason shown) when several
+  are ticked.
+- **Two export defects found and fixed on the way (UNVERIFIED C7/C8):**
+  colliding export filenames (`/stage/a_b/rop` vs `/stage/a/b_rop` → same
+  file, second wins, silently) now get a stable SHA-1 suffix plus a warning;
+  and `f1`/`f2` on the USD ROP are `$FSTART`/`$FEND` *expressions*, so every
+  husk export silently covered the **whole playbar** until now —
+  `_force_parm()` clears the expression and reads the value back. K4's trap,
+  third appearance.
+
 ## Proven vs not — read before trusting anything
 
 `docs/UNVERIFIED.md` is the register. Newly **verified on 21.0.729 + 22.0.368**
@@ -118,8 +143,12 @@ mid-cook left no orphan hython.
   force `sequential=False` and confirm the chunked result differs.
 - **K10 — the Tractor `.alf` dialect.** The structure is tested; no Tractor
   exists here to accept it.
-- **No Solaris frame has ever been rendered** by this tool, and the GUI has
-  never been clicked in a live session (it is driven offscreen).
+- **Real renders confirmed 2026-07-31.** The user tested the tool and frames
+  rendered successfully. Engine, scene and interface were not recorded, so the
+  finer-grained unknowns below (ALF_PROGRESS cadence in practice, Karma
+  licence, the Indie cap) each stay open on their own terms — "it works" is
+  not evidence for any specific one of them. Whether the GUI has been driven
+  live rather than offscreen is likewise unrecorded.
 - **D12** — the `TypeError` fallback in `_stage_at()` (for a hython whose
   `stage()` lacks the `frame=` keyword) has never triggered; both installs
   here have the keyword.
@@ -187,11 +216,21 @@ mid-cook left no orphan hython.
   `_apply_override` warns loudly rather than silently ignoring them.
 - Concurrent-render check for the PID-scoped overlays was never run with real
   parallel Houdini.
+- **`RenderJob.label` has no ROP path**, so two ROPs with identical frame
+  ranges get identical Tractor task titles in an exported `.alf`
+  (`hsl/farm.py`, pre-existing, surfaced by GUI multi-ROP).
+- **No manifest field records which frames a `usd_path` covers.** Mattered
+  little while exports always covered the playbar; post-C8 an export is
+  genuinely narrow, so a consumer that assumes otherwise would ask husk for
+  frames the USD does not carry. `render`/`batch` forward `--frames` into the
+  export, so the CLI is self-consistent — the gap is for *other* consumers.
+- The `_force_parm()` read-back-failed branch has never fired (both installs
+  clear expressions) — same shape as D12.
 
 ## How to run / verify
 
 ```bash
-python -m unittest discover -s tests           # 227 tests, no Houdini needed
+python -m unittest discover -s tests           # 243 tests, no Houdini needed
 python .claude/hooks/boundary_guard.py --check-tree .
 python scripts/check_drift.py
 python scripts/check_ui_imports.py

@@ -53,6 +53,91 @@ def _pick_rop(manifest: SceneManifest, requested: str) -> Optional[RenderRop]:
     return None
 
 
+def _pick_rops(manifest: SceneManifest, requested, all_rops: bool):
+    """The render ROPs to run, in the order asked for.
+
+    Returns None when selection failed (already reported to stderr). With no
+    request at all this defers to :func:`_pick_rop`, so a single-ROP scene
+    still renders without flags and a multi-ROP scene still asks the user to
+    choose — rendering *everything* stays an explicit ``--all-rops`` opt-in.
+    """
+    if all_rops:
+        if not manifest.rops:
+            sys.stderr.write("No USD Render ROPs found in this scene.\n")
+            return None
+        return list(manifest.rops)
+    if requested:
+        chosen, missing = [], []
+        for path in requested:
+            rop = manifest.rop(path)
+            if rop is None:
+                missing.append(path)
+            elif rop in chosen:
+                sys.stderr.write(f"Ignoring duplicate --rop {path}.\n")
+            else:
+                chosen.append(rop)
+        if missing:
+            names = "\n  ".join(r.node_path for r in manifest.rops) or "(none)"
+            for path in missing:
+                sys.stderr.write(f"No ROP at {path}.\n")
+            sys.stderr.write(f"Scene contains:\n  {names}\n")
+            return None
+        return chosen
+    single = _pick_rop(manifest, "")
+    return [single] if single else None
+
+
+def _run_queue(jobs, parallel: int, verb: str) -> int:
+    """Drive jobs through a RenderQueue with console reporting; exit code.
+
+    Shared by render and batch. Chunks tagged with a task id (multi-ROP,
+    batch) get it as a prefix so interleaved output stays attributable; an
+    untagged single-ROP render prints exactly what it always did.
+    """
+    lock = threading.Lock()
+
+    def on_event(event, *payload):
+        if event == "task_output":
+            task, line = payload
+            with lock:
+                prefix = f"{task.job.task_id} " if task.job.task_id else ""
+                sys.stdout.write(f"[{prefix}{task.job.chunk}] {line}\n")
+                sys.stdout.flush()
+        elif event == "task_finished":
+            task = payload[0]
+            with lock:
+                prefix = f"{task.job.task_id} " if task.job.task_id else ""
+                sys.stderr.write(
+                    f"[{prefix}{task.job.chunk}] {task.state.value} "
+                    f"in {task.duration:.1f}s (exit {task.returncode})\n"
+                )
+
+    try:
+        queue = RenderQueue(jobs, max_parallel=parallel, on_event=on_event)
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 4
+    queue.start(block=True)
+
+    for warning in queue.warnings:
+        sys.stderr.write(f"warning: {warning}\n")
+
+    failed = [t for t in queue.tasks if t.state is State.FAILED]
+    # A skipped chunk never ran because something upstream of it did not
+    # finish. Nothing was rendered, so it cannot count as success either.
+    skipped = [t for t in queue.tasks if t.state is State.SKIPPED]
+    if failed or skipped:
+        parts = []
+        if failed:
+            parts.append(f"{len(failed)} failed")
+        if skipped:
+            parts.append(f"{len(skipped)} skipped (a dependency did not finish)")
+        sys.stderr.write(f"\n{', '.join(parts)}, of {len(queue.tasks)} chunk(s).\n")
+        return 1
+    sys.stderr.write(f"\n{verb} {len(queue.tasks)} chunk(s).\n")
+    return 0
+
+
 def cmd_inspect(args) -> int:
     manifest = bridge.inspect_hip(args.hip, hython=args.hython,
                                   export_usd=args.export_usd,
@@ -344,6 +429,117 @@ def _resolve_aovs(manifest: SceneManifest, spec: str) -> list:
             if any(w in _aov_keys(v) for w in wanted)]
 
 
+def _render_jobs_for_rop(args, manifest: SceneManifest, rop: RenderRop,
+                         engine: str, settings_overrides, keep, tag_task: bool):
+    """Overlays and chunks for one render ROP: ``(jobs, None)`` or ``(None, code)``.
+
+    Everything here is genuinely per-ROP — the husk overlay chain edits *this*
+    ROP's exported USD and the frame override rewrites *this* ROP's range —
+    which is what lets a multi-ROP render just call it once per ROP.
+    """
+    if engine == "husk" and not rop.usd_path:
+        prefix = f"{rop.node_path}: " if tag_task else ""
+        sys.stderr.write(f"{prefix}The stage could not be written to USD; "
+                         f"nothing to render.\n")
+        for warning in manifest.warnings:
+            sys.stderr.write(f"  {warning}\n")
+        return None, 3
+
+    if args.frames:
+        start, end, inc = args.frames
+        rop.frame_start, rop.frame_end, rop.frame_inc = start, end, inc
+        rop.use_frame_range = end != start
+
+    base_usd = rop.usd_path
+    if engine == "husk" and getattr(args, "relink_from", None) and not args.dry_run:
+        try:
+            result = bridge.relink_assets(base_usd, args.relink_from, hython=args.hython)
+        except bridge.InspectError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return None, 3
+        if result.get("usd_out"):
+            base_usd = result["usd_out"]
+            sys.stderr.write(f"Relinked {len(result['relinked'])} asset(s); "
+                             f"{len(result['still_missing'])} still missing.\n")
+            # Drop what the relink resolved, so preflight judges the USD that
+            # is actually about to render — not the state before the fix.
+            resolved = {entry.get("old") for entry in result.get("relinked", [])}
+            manifest.missing_assets = [a for a in manifest.missing_assets
+                                       if a.asset_path not in resolved]
+
+    # AOV selection is a USD edit, not a husk flag: keep only the requested
+    # RenderVars by rendering an overlay produced by bridge.filter_aovs.
+    usd_for_render = base_usd
+    if keep is not None and not args.dry_run:
+        try:
+            usd_for_render = bridge.filter_aovs(base_usd, keep, hython=args.hython)
+        except bridge.InspectError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return None, 3
+
+    # Karma knobs are USD attributes, not husk flags. On husk they go into an
+    # overlay now; on hython render_direct sublayers them at render start.
+    if engine == "husk" and settings_overrides and not args.dry_run:
+        try:
+            result = bridge.override_settings(usd_for_render, settings_overrides,
+                                              hython=args.hython,
+                                              settings_prim=args.settings or "")
+        except bridge.InspectError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return None, 3
+        if result.get("usd_out"):
+            usd_for_render = result["usd_out"]
+        for entry in result.get("applied", []):
+            sys.stderr.write(f"  {entry['key']}: {entry['old']!r} -> {entry['new']!r}\n")
+        if result.get("skipped"):
+            for entry in result["skipped"]:
+                sys.stderr.write(f"  skipped {entry['key']}: {entry['why']}\n")
+
+    # husk -o redirects only the FIRST product, so on a multi-product shot the
+    # crypto/depth passes would quietly keep writing where the scene pointed
+    # them. Redirect them all in USD instead. One product needs no overlay --
+    # husk's own flag does the job without a hython round-trip.
+    output_for_engine = args.output or None
+    settings_for_output = manifest.resolve_settings(rop)
+    product_count = len(settings_for_output.products) if settings_for_output else 0
+    if engine == "husk" and args.output and product_count > 1:
+        if args.dry_run:
+            print(f"# {product_count} products will be redirected under {args.output} "
+                  f"by a USD overlay authored at render time (husk -o moves only the first)")
+        else:
+            try:
+                usd_for_render = bridge.override_output(
+                    usd_for_render, args.output, hython=args.hython)
+            except bridge.InspectError as exc:
+                sys.stderr.write(f"{exc}\n")
+                return None, 3
+            sys.stderr.write(f"Redirected all {product_count} product(s) under "
+                             f"{args.output}.\n")
+            output_for_engine = None      # the overlay did it; don't double-apply
+
+    jobs = husk_mod.jobs_for_rop(
+        manifest, rop, usd_for_render,
+        chunk_size=args.chunk,
+        engine=engine,
+        renderer=args.renderer or None,
+        camera=args.camera or None,
+        settings_prim=args.settings or None,
+        output=output_for_engine,
+        threads=args.threads or None,
+        snapshot_interval=args.snapshot or None,
+        resolution=tuple(args.res) if args.res else None,
+        # hython repaths inside the LOP network at render time; the husk path
+        # already relinked the exported USD above, so it needs nothing here.
+        relink_dirs=(args.relink_from or None) if engine == "hython" else None,
+        settings_overrides=(settings_overrides or None) if engine == "hython" else None,
+        extra_args=args.extra or None,
+        # Group this ROP's chunks under its own task id so a multi-ROP queue
+        # reports per ROP; a single-ROP render keeps today's untagged output.
+        task_id=rop.node_path if tag_task else None,
+    )
+    return jobs, None
+
+
 def cmd_render(args) -> int:
     engine = ("hython" if getattr(args, "direct_hython", False)
               else getattr(args, "engine", husk_mod.DEFAULT_ENGINE))
@@ -383,10 +579,15 @@ def cmd_render(args) -> int:
                              f"({bridge.cache_path_for(args.hip)}); "
                              f"--no-cache to read the scene again.\n")
 
+    # Narrow the export to one ROP only when exactly one was asked for — a
+    # multi-ROP render needs every selected stage written.
+    rop_filter = (args.rop[0]
+                  if len(args.rop) == 1 and not getattr(args, "all_rops", False)
+                  else "")
     if manifest is None:
         manifest = bridge.inspect_hip(args.hip, hython=args.hython,
                                       export_usd=export_usd, usd_dir=args.usd_dir,
-                                      flatten=args.flatten, rop=args.rop,
+                                      flatten=args.flatten, rop=rop_filter,
                                       allow_volume_bake=allow_volume_bake,
                                       # Export only the frames asked for, not
                                       # the ROP's whole authored range.
@@ -396,9 +597,16 @@ def cmd_render(args) -> int:
                 bridge.save_cached(manifest)
             except OSError:
                 pass                       # a cache we cannot write is not an error
-    rop = _pick_rop(manifest, args.rop)
-    if rop is None:
+    rops = _pick_rops(manifest, args.rop, getattr(args, "all_rops", False))
+    if not rops:
         return 2
+
+    if args.output and len(rops) > 1:
+        sys.stderr.write(
+            f"--output sets one path, but {len(rops)} ROPs are being rendered "
+            f"— each would overwrite the others'. Narrow it with --rop, or "
+            f"leave the outputs to the scene.\n")
+        return 4
 
     # Live volumes bake tens of GB/frame into a husk USD export. Unless the user
     # opted in with --allow-volume-bake, the inspector skipped the export — so
@@ -422,22 +630,9 @@ def cmd_render(args) -> int:
             f"--allow-volume-bake: exporting {len(manifest.live_volumes)} live "
             f"volume(s), {total_fields} field(s) — expect tens of GB per frame.\n")
 
-    if engine == "husk" and not rop.usd_path:
-        sys.stderr.write("The stage could not be written to USD; nothing to render.\n")
-        for warning in manifest.warnings:
-            sys.stderr.write(f"  {warning}\n")
-        return 3
-
-    if args.frames:
-        start, end, inc = args.frames
-        rop.frame_start, rop.frame_end, rop.frame_inc = start, end, inc
-        rop.use_frame_range = end != start
-
     # Missing textures fail the render mid-flight — surface them for *both*
-    # engines (they are a property of the scene, not of the export), and relink
-    # if asked. Reporting these was husk-only until hython became the default,
-    # which would have made broken textures silent on the common path.
-    base_usd = rop.usd_path
+    # engines (they are a property of the scene, not of one ROP), and relink
+    # if asked (per exported USD, inside the per-ROP build below).
     if manifest.missing_assets:
         sys.stderr.write(f"{len(manifest.missing_assets)} unresolved asset(s) in the scene:\n")
         for asset in manifest.missing_assets:
@@ -446,25 +641,8 @@ def cmd_render(args) -> int:
             sys.stderr.write(
                 "  (pass --relink-from DIR to repath them, or fix the scene.)\n")
 
-    if engine == "husk" and getattr(args, "relink_from", None) and not args.dry_run:
-        try:
-            result = bridge.relink_assets(base_usd, args.relink_from, hython=args.hython)
-        except bridge.InspectError as exc:
-            sys.stderr.write(f"{exc}\n")
-            return 3
-        if result.get("usd_out"):
-            base_usd = result["usd_out"]
-            sys.stderr.write(f"Relinked {len(result['relinked'])} asset(s); "
-                             f"{len(result['still_missing'])} still missing.\n")
-            # Drop what the relink resolved, so preflight below judges the USD
-            # that is actually about to render — not the state before the fix.
-            resolved = {entry.get("old") for entry in result.get("relinked", [])}
-            manifest.missing_assets = [a for a in manifest.missing_assets
-                                       if a.asset_path not in resolved]
-
-    # AOV selection is a USD edit, not a husk flag: keep only the requested
-    # RenderVars by rendering an overlay produced by bridge.filter_aovs.
-    usd_for_render = base_usd
+    # AOV selection resolves once against the manifest; the overlay itself is
+    # authored per exported USD in the per-ROP build.
     keep = None
     if engine == "husk" and getattr(args, "aovs", ""):
         keep = _resolve_aovs(manifest, args.aovs)
@@ -476,75 +654,29 @@ def cmd_render(args) -> int:
         if set(keep) == {v.prim_path for v in manifest.vars}:
             keep = None                       # selection is everything: no filter
 
-    if keep is not None and not args.dry_run:
-        try:
-            usd_for_render = bridge.filter_aovs(base_usd, keep, hython=args.hython)
-        except bridge.InspectError as exc:
-            sys.stderr.write(f"{exc}\n")
-            return 3
+    # Build jobs ROP by ROP, in the order asked for. The queue starts chunks
+    # in submission order, so at --parallel 1 this renders one ROP after the
+    # other — and a failed ROP does not stop the ones behind it.
+    per_rop = []
+    for rop in rops:
+        jobs, err = _render_jobs_for_rop(args, manifest, rop, engine,
+                                         settings_overrides, keep,
+                                         tag_task=len(rops) > 1)
+        if err is not None:
+            return err
+        per_rop.append((rop, jobs))
+    all_jobs = [job for _, jobs in per_rop for job in jobs]
 
-    # Karma knobs are USD attributes, not husk flags. On husk they go into an
-    # overlay now; on hython render_direct sublayers them at render start.
-    if engine == "husk" and settings_overrides and not args.dry_run:
-        try:
-            result = bridge.override_settings(usd_for_render, settings_overrides,
-                                              hython=args.hython,
-                                              settings_prim=args.settings or "")
-        except bridge.InspectError as exc:
-            sys.stderr.write(f"{exc}\n")
-            return 3
-        if result.get("usd_out"):
-            usd_for_render = result["usd_out"]
-        for entry in result.get("applied", []):
-            sys.stderr.write(f"  {entry['key']}: {entry['old']!r} -> {entry['new']!r}\n")
-        if result.get("skipped"):
-            for entry in result["skipped"]:
-                sys.stderr.write(f"  skipped {entry['key']}: {entry['why']}\n")
-
-    # husk -o redirects only the FIRST product, so on a multi-product shot the
-    # crypto/depth passes would quietly keep writing where the scene pointed
-    # them. Redirect them all in USD instead. One product needs no overlay --
-    # husk's own flag does the job without a hython round-trip.
-    output_for_engine = args.output or None
-    settings_for_output = manifest.resolve_settings(rop)
-    product_count = len(settings_for_output.products) if settings_for_output else 0
-    if engine == "husk" and args.output and product_count > 1:
-        if args.dry_run:
-            print(f"# {product_count} products will be redirected under {args.output} "
-                  f"by a USD overlay authored at render time (husk -o moves only the first)")
-        else:
-            try:
-                usd_for_render = bridge.override_output(
-                    usd_for_render, args.output, hython=args.hython)
-            except bridge.InspectError as exc:
-                sys.stderr.write(f"{exc}\n")
-                return 3
-            sys.stderr.write(f"Redirected all {product_count} product(s) under "
-                             f"{args.output}.\n")
-            output_for_engine = None      # the overlay did it; don't double-apply
-
-    jobs = husk_mod.jobs_for_rop(
-        manifest, rop, usd_for_render,
-        chunk_size=args.chunk,
-        engine=engine,
-        renderer=args.renderer or None,
-        camera=args.camera or None,
-        settings_prim=args.settings or None,
-        output=output_for_engine,
-        threads=args.threads or None,
-        snapshot_interval=args.snapshot or None,
-        resolution=tuple(args.res) if args.res else None,
-        # hython repaths inside the LOP network at render time; the husk path
-        # already relinked the exported USD above, so it needs nothing here.
-        relink_dirs=(args.relink_from or None) if engine == "hython" else None,
-        settings_overrides=(settings_overrides or None) if engine == "hython" else None,
-        extra_args=args.extra or None,
-    )
-
-    # Preflight — frame range, resolution, output path, free disk, unresolved
-    # assets, volume bake. This ran only in the GUI until now, so CLI and farm
-    # users got none of it.
-    checks = preflight.run_preflight_checks(jobs[0], manifest)
+    # Preflight — judged on each ROP's first chunk, with scene-level findings
+    # deduplicated so N ROPs do not repeat every missing texture N times.
+    seen_checks = set()
+    checks = []
+    for _, jobs in per_rop:
+        for check in preflight.run_preflight_checks(jobs[0], manifest):
+            key = (check.level, check.message)
+            if key not in seen_checks:
+                seen_checks.add(key)
+                checks.append(check)
     for check in checks:
         sys.stderr.write(f"[preflight {check.level}] {check.message}\n")
     errors = [c for c in checks if c.level == "error"]
@@ -557,71 +689,146 @@ def cmd_render(args) -> int:
     if args.dry_run:
         if keep is not None:
             print(f"# AOVs filtered to: {args.aovs} "
-                  f"(overlay USD authored from {os.path.basename(rop.usd_path)} at render time)")
+                  f"(overlay USD authored at render time)")
 
-        # What this will actually leave on disk, resolved per frame.
-        chunk_frames = [f for job in jobs
-                        for f in (job.chunk.start + i * job.chunk.inc
-                                  for i in range(job.chunk.count))]
-        planned = husk_mod.planned_outputs(manifest, rop, output=args.output,
-                                           frames=chunk_frames)
-        if planned:
-            print("# Files this render will write:")
-            for entry in planned:
-                if entry["unresolved"]:
-                    print(f"#   {entry['template']}  "
-                          f"(unexpandable token — cannot preview the filename)")
-                elif entry["files"]:
-                    print(f"#   {entry['files'][0]}")
-                    if len(entry["files"]) > 1:
-                        print(f"#   … {len(entry['files'])} files, last "
-                              f"{entry['files'][-1]}")
-                else:
-                    print(f"#   {entry['template']}   "
-                          f"(filename decided by husk / the ROP)")
-        else:
-            print("# No output path is declared in the scene; husk/the ROP decides it.")
+        for rop, jobs in per_rop:
+            if len(per_rop) > 1:
+                print(f"# --- {rop.node_path} ---")
+            # What this will actually leave on disk, resolved per frame.
+            chunk_frames = [f for job in jobs
+                            for f in (job.chunk.start + i * job.chunk.inc
+                                      for i in range(job.chunk.count))]
+            planned = husk_mod.planned_outputs(manifest, rop, output=args.output,
+                                               frames=chunk_frames)
+            if planned:
+                print("# Files this render will write:")
+                for entry in planned:
+                    if entry["unresolved"]:
+                        print(f"#   {entry['template']}  "
+                              f"(unexpandable token — cannot preview the filename)")
+                    elif entry["files"]:
+                        print(f"#   {entry['files'][0]}")
+                        if len(entry["files"]) > 1:
+                            print(f"#   … {len(entry['files'])} files, last "
+                                  f"{entry['files'][-1]}")
+                    else:
+                        print(f"#   {entry['template']}   "
+                              f"(filename decided by husk / the ROP)")
+            else:
+                print("# No output path is declared in the scene; husk/the ROP decides it.")
 
-        for job in jobs:
+        for job in all_jobs:
             print(husk_mod.format_command(husk_mod.build_command(job)))
         return 0
 
-    lock = threading.Lock()
+    return _run_queue(all_jobs, args.parallel, "Rendered")
 
-    def on_event(event, *payload):
-        if event == "task_output":
-            task, line = payload
-            with lock:
-                sys.stdout.write(f"[{task.job.chunk}] {line}\n")
-                sys.stdout.flush()
-        elif event == "task_finished":
-            task = payload[0]
-            with lock:
-                sys.stderr.write(
-                    f"[{task.job.chunk}] {task.state.value} "
-                    f"in {task.duration:.1f}s (exit {task.returncode})\n"
-                )
 
-    queue = RenderQueue(jobs, max_parallel=args.parallel, on_event=on_event)
-    queue.start(block=True)
+def cmd_batch(args) -> int:
+    """Render several .hip files, one scene after another.
 
-    for warning in queue.warnings:
-        sys.stderr.write(f"warning: {warning}\n")
+    Deliberately plainer than ``hsl render``: engine, frames, chunking and
+    parallelism apply to every scene, and the per-render editing options
+    (--aovs, --set, --output, --relink-from) do not exist here — run those as
+    individual renders. Every scene is read before anything renders, so a bad
+    path in scene 3 surfaces before scenes 1 and 2 spend hours rendering.
+    """
+    export_usd = args.engine == "husk"
 
-    failed = [t for t in queue.tasks if t.state is State.FAILED]
-    # A skipped chunk never ran because something upstream of it did not
-    # finish. Nothing was rendered, so it cannot count as success either.
-    skipped = [t for t in queue.tasks if t.state is State.SKIPPED]
-    if failed or skipped:
-        parts = []
-        if failed:
-            parts.append(f"{len(failed)} failed")
-        if skipped:
-            parts.append(f"{len(skipped)} skipped (a dependency did not finish)")
-        sys.stderr.write(f"\n{', '.join(parts)}, of {len(queue.tasks)} chunk(s).\n")
-        return 1
-    sys.stderr.write(f"\nRendered {len(queue.tasks)} chunk(s).\n")
-    return 0
+    plans = []
+    for hip in args.hips:
+        manifest = None
+        if not export_usd and not args.no_cache:
+            manifest = bridge.load_cached(hip)
+            if manifest is not None:
+                sys.stderr.write(f"{hip}: using the cached scene read; "
+                                 f"--no-cache to read it again.\n")
+        if manifest is None:
+            try:
+                manifest = bridge.inspect_hip(hip, hython=args.hython,
+                                              export_usd=export_usd,
+                                              allow_volume_bake=False,
+                                              # The export now genuinely
+                                              # narrows to the frames asked
+                                              # for (UNVERIFIED C8); without
+                                              # this, husk would be sent
+                                              # frames the USD does not carry.
+                                              export_frames=(args.frames
+                                                             if export_usd
+                                                             else None))
+            except bridge.InspectError as exc:
+                sys.stderr.write(f"{hip}: {exc}\n")
+                return 2
+            if not export_usd:
+                try:
+                    bridge.save_cached(manifest)
+                except OSError:
+                    pass               # a cache we cannot write is not an error
+        if export_usd and manifest.live_volumes:
+            sys.stderr.write(
+                f"{hip}: {len(manifest.live_volumes)} live volume(s) would "
+                f"bake into the USD export — render this scene with "
+                f"--engine hython, or individually with "
+                f"'hsl render --allow-volume-bake'.\n")
+            return 3
+        if not manifest.rops:
+            sys.stderr.write(f"{hip}: no USD Render ROPs found.\n")
+            return 2
+        plans.append((hip, manifest))
+
+    per_rop, all_jobs = [], []
+    for hip, manifest in plans:
+        for rop in manifest.rops:
+            if export_usd and not rop.usd_path:
+                sys.stderr.write(f"{hip}: {rop.node_path}: the stage could not "
+                                 f"be written to USD; nothing to render.\n")
+                return 3
+            if args.frames:
+                start, end, inc = args.frames
+                rop.frame_start, rop.frame_end, rop.frame_inc = start, end, inc
+                rop.use_frame_range = end != start
+            jobs = husk_mod.jobs_for_rop(
+                manifest, rop, rop.usd_path,
+                chunk_size=args.chunk, engine=args.engine,
+                # Node paths repeat across scenes; the hip name keeps queue
+                # reporting unambiguous.
+                task_id=f"{os.path.basename(hip)}:{rop.node_path}",
+            )
+            per_rop.append((manifest, jobs))
+            all_jobs += jobs
+
+    sys.stderr.write(f"{len(plans)} scene(s), "
+                     f"{sum(len(m.rops) for _, m in plans)} ROP(s), "
+                     f"{len(all_jobs)} chunk(s).\n")
+
+    # Preflight per ROP, deduplicated — same shape as render's.
+    seen_checks = set()
+    checks = []
+    for manifest, jobs in per_rop:
+        for check in preflight.run_preflight_checks(jobs[0], manifest):
+            key = (check.level, check.message)
+            if key not in seen_checks:
+                seen_checks.add(key)
+                checks.append(check)
+    for check in checks:
+        sys.stderr.write(f"[preflight {check.level}] {check.message}\n")
+    errors = [c for c in checks if c.level == "error"]
+    if errors and not args.dry_run and not args.skip_preflight:
+        sys.stderr.write(
+            f"\n{len(errors)} preflight error(s) — nothing rendered. Fix them, or "
+            f"re-run with --skip-preflight to render anyway.\n")
+        return 5
+
+    if args.dry_run:
+        current = None
+        for job in all_jobs:
+            if job.hip_file != current:
+                current = job.hip_file
+                print(f"# --- {current} ---")
+            print(husk_mod.format_command(husk_mod.build_command(job)))
+        return 0
+
+    return _run_queue(all_jobs, args.parallel, "Rendered")
 
 
 def cmd_ui(args) -> int:
@@ -662,7 +869,12 @@ def build_parser() -> argparse.ArgumentParser:
                                "what --aovs, --relink-from and farm submission need")
     p_render.add_argument("--direct-hython", action="store_true",
                           help="Shortcut for --engine hython (0 USD disk space)")
-    p_render.add_argument("--rop", default="", help="ROP node path")
+    p_render.add_argument("--rop", action="append", default=[], metavar="PATH",
+                          help="ROP node path (repeatable: several ROPs render "
+                               "in order, one after another at --parallel 1)")
+    p_render.add_argument("--all-rops", action="store_true",
+                          help="Render every render ROP in the scene, in the "
+                               "order found")
     p_render.add_argument("--frames", type=parse_frames, default=None,
                           help="1001, 1001-1100 or 1001-1100x2")
     p_render.add_argument("--chunk", type=int, default=0,
@@ -732,6 +944,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_cook.add_argument("--dry-run", action="store_true",
                         help="Print the commands without running them")
     p_cook.set_defaults(func=cmd_cook)
+
+    p_batch = sub.add_parser(
+        "batch", help="Render several .hip files one after another")
+    p_batch.add_argument("hips", nargs="+", metavar="hip",
+                         help="Scenes to render, in order")
+    p_batch.add_argument("--engine", choices=["husk", "hython"],
+                         default=husk_mod.DEFAULT_ENGINE,
+                         help="Render engine for every scene (see 'render')")
+    p_batch.add_argument("--frames", type=parse_frames, default=None,
+                         help="Override every ROP's range: 1001, 1001-1100 "
+                              "or 1001-1100x2")
+    p_batch.add_argument("--chunk", type=int, default=0,
+                         help="Frames per process (0 = one process)")
+    p_batch.add_argument("--parallel", type=int, default=1,
+                         help="Concurrent processes")
+    p_batch.add_argument("--no-cache", action="store_true",
+                         help="Always re-read each scene instead of reusing a "
+                              "cached read of an unchanged .hip")
+    p_batch.add_argument("--skip-preflight", action="store_true",
+                         help="Render even if preflight reports errors")
+    p_batch.add_argument("--dry-run", action="store_true",
+                         help="Print the render commands and stop")
+    p_batch.set_defaults(func=cmd_batch)
 
     p_hython = sub.add_parser("hython",
                               help="List the Houdini/hython installs found on this machine")
