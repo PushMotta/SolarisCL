@@ -35,17 +35,19 @@ rather than assumed — but see "Check it actually works" below.
 2. Install Qt for the window:
 
    ```
-   pip install PySide6
+   python -m pip install PySide6
    ```
 
-   Skip this if you only want the command line.
+   (`python -m pip`, not bare `pip` — Windows often leaves `pip.exe` off
+   `PATH` even when `python` is on it.) Skip this if you only want the
+   command line.
 3. Double-click **`launch_ui.bat`**.
 
 **Linux / macOS**
 
 ```bash
 unzip hsl-<version>.zip && cd hsl-<version>
-pip install PySide6            # window only
+python -m pip install PySide6  # window only
 ./bin/hsl ui                   # or: ./bin/hsl inspect scene.hip
 ```
 
@@ -175,7 +177,16 @@ reported as a warning rather than guessed at.
 ## 6. When something goes wrong
 
 **`ModuleNotFoundError: No module named 'PySide6'`**
-The window needs Qt: `pip install PySide6`. The command line does not.
+The window needs Qt: `python -m pip install PySide6`. The command line does
+not.
+
+**`'pip' is not recognized`**
+Windows installs `pip.exe` into a `Scripts\` folder that is often not on
+`PATH` even when `python` is. Run it as a module instead — `python -m pip
+install PySide6` — or, if `python` is also missing, `py -m pip install
+PySide6` (the `py` launcher is registered by the python.org installer
+regardless of `PATH`). Houdini's `hython` has no pip and cannot stand in
+here.
 
 **`'python' is not recognized`**
 Python is not on your `PATH`. Either reinstall it with "Add Python to PATH"
