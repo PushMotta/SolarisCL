@@ -724,6 +724,44 @@ def cmd_render(args) -> int:
     return _run_queue(all_jobs, args.parallel, "Rendered")
 
 
+def _rop_spec_matches(spec: str, hip_argv_path: str, rop_node_path: str) -> bool:
+    """True when a ``--rop`` SPEC selects ``rop_node_path`` in the scene read
+    from ``hip_argv_path``.
+
+    A SPEC is either a bare node path or scene-qualified as ``scene:path``,
+    split at the LAST colon -- so a Windows drive letter is never mistaken
+    for the scene/ROP separator. It counts as qualified only when the text
+    after that colon starts with "/" and the text before it is non-empty
+    (node paths never contain ":", so this is unambiguous); otherwise the
+    whole SPEC is the bare node path.
+
+    A bare SPEC applies to every scene. A qualified SPEC applies only when
+    its qualifier equals the scene's argv path, its basename, or its
+    basename without the .hip/.hiplc/.hipnc extension -- case-insensitively,
+    since this is Windows.
+    """
+    qualifier, sep, tail = spec.rpartition(":")
+    if sep and qualifier and tail.startswith("/"):
+        node_path = tail
+    else:
+        qualifier, node_path = "", spec
+
+    if node_path != rop_node_path:
+        return False
+    if not qualifier:
+        return True
+
+    basename = os.path.basename(hip_argv_path)
+    stem = basename
+    lowered = basename.lower()
+    for ext in (".hip", ".hiplc", ".hipnc"):
+        if lowered.endswith(ext):
+            stem = basename[:-len(ext)]
+            break
+    candidates = (hip_argv_path, basename, stem)
+    return any(os.path.normcase(qualifier) == os.path.normcase(c) for c in candidates)
+
+
 def cmd_batch(args) -> int:
     """Render several .hip files, one scene after another.
 
@@ -732,6 +770,9 @@ def cmd_batch(args) -> int:
     (--aovs, --set, --output, --relink-from) do not exist here — run those as
     individual renders. Every scene is read before anything renders, so a bad
     path in scene 3 surfaces before scenes 1 and 2 spend hours rendering.
+
+    ``--rop`` narrows which ROPs render, per scene (see _rop_spec_matches).
+    With none given, every render ROP of every scene runs, as before.
     """
     export_usd = args.engine == "husk"
 
@@ -775,6 +816,48 @@ def cmd_batch(args) -> int:
             sys.stderr.write(f"{hip}: no USD Render ROPs found.\n")
             return 2
         plans.append((hip, manifest))
+
+    if args.rop:
+        # Two passes: first work out what each scene would keep and which
+        # SPECs fired anywhere, without touching the manifests yet -- so an
+        # unmatched SPEC (a typo, most likely) can be reported on its own
+        # even when it also happens to leave some scene empty. Reported
+        # second, "scene left with nothing" then means what it says: every
+        # SPEC was valid somewhere, this scene just has none of them.
+        matched_any = [False] * len(args.rop)
+        per_scene_kept = []
+        for hip, manifest in plans:
+            kept = []
+            for rop in manifest.rops:
+                for index, spec in enumerate(args.rop):
+                    if _rop_spec_matches(spec, hip, rop.node_path):
+                        matched_any[index] = True
+                        kept.append(rop)
+                        break
+            per_scene_kept.append((hip, manifest, kept))
+
+        missing = [spec for spec, hit in zip(args.rop, matched_any) if not hit]
+        if missing:
+            for spec in missing:
+                sys.stderr.write(
+                    f"--rop {spec} matched no ROP in any scene. Check the "
+                    f"path, and, if it is scene-qualified, that the "
+                    f"qualifier matches a .hip being rendered.\n")
+            return 2
+
+        empty = [(hip, manifest) for hip, manifest, kept in per_scene_kept if not kept]
+        if empty:
+            for hip, manifest in empty:
+                names = "\n  ".join(r.node_path for r in manifest.rops)
+                sys.stderr.write(
+                    f"{hip}: no --rop matched a ROP in this scene, so nothing "
+                    f"would render from it. Scene contains:\n  {names}\n"
+                    f"  -> add a --rop for one of these, or drop --rop to "
+                    f"render them all.\n")
+            return 2
+
+        for hip, manifest, kept in per_scene_kept:
+            manifest.rops = kept
 
     per_rop, all_jobs = [], []
     for hip, manifest in plans:
@@ -952,6 +1035,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("--engine", choices=["husk", "hython"],
                          default=husk_mod.DEFAULT_ENGINE,
                          help="Render engine for every scene (see 'render')")
+    p_batch.add_argument("--rop", action="append", default=[], metavar="SPEC",
+                         help="Render only this ROP (repeatable). SPEC is a "
+                              "bare node path (applies to every scene) or "
+                              "scene-qualified as scene.hip:/path (applies "
+                              "only to that scene, matched by argv path, "
+                              "basename, or basename without extension). "
+                              "Default: every render ROP of every scene")
     p_batch.add_argument("--frames", type=parse_frames, default=None,
                          help="Override every ROP's range: 1001, 1001-1100 "
                               "or 1001-1100x2")

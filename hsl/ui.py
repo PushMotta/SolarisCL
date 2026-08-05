@@ -8,16 +8,17 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QFont, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-    QVBoxLayout, QWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import bridge, farm, husk as husk_mod, preflight, presets, progress, resources
@@ -65,6 +66,45 @@ class InspectWorker(QObject):
         except OSError:
             pass
         self.finished.emit(manifest)
+
+
+class BatchInspectWorker(QObject):
+    """Reads one .hip for the batch list, off the Qt thread.
+
+    The same shape as :class:`InspectWorker` -- ``bridge.inspect_hip`` in a
+    worker, the result crossing back as a signal, no widget touched from here
+    -- with the hip path carried in both signals. A batch reads several
+    scenes, so the window has to know which row a result belongs to; the
+    manifest's own ``hip_path`` cannot say that for a *failed* read.
+
+    The read is export-free (``export_usd=False``), which is what makes the
+    manifest cache safe to fill and reuse here exactly as ``hsl batch`` does:
+    nothing about the scene on disk changes, so a later run can skip the
+    hython launch entirely.
+    """
+    finished = Signal(str, object)   # hip path, SceneManifest
+    failed = Signal(str, str)        # hip path, message
+
+    def __init__(self, hip_path: str, hython: str = ""):
+        super().__init__()
+        self.hip_path = hip_path
+        self.hython = hython
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            manifest = bridge.inspect_hip(
+                self.hip_path, hython=self.hython,
+                export_usd=False, flatten=False,
+            )
+        except Exception as exc:
+            self.failed.emit(self.hip_path, str(exc))
+            return
+        try:
+            bridge.save_cached(manifest)
+        except OSError:
+            pass
+        self.finished.emit(self.hip_path, manifest)
 
 
 class FilterWorker(QObject):
@@ -175,6 +215,36 @@ _STATUS_STYLES = {
     "error": "color: #F44336; font-weight: bold;",
 }
 
+# Rows in the batch list that could not be read. Same red as the error status
+# style, applied to a tree item (which takes a brush, not a stylesheet).
+_ERROR_BRUSH = QBrush(QColor("#F44336"))
+
+
+@dataclass
+class BatchScene:
+    """One .hip in the batch list, and how far reading it has got.
+
+    Holds no render settings of its own: the manifest is the scene's
+    description and stays the only source of truth, exactly as in the other
+    modes. Which ROPs are ticked lives in the tree widget, the same way the
+    render mode's ticked-ROP table works -- that is a choice about this run,
+    not a fact about the scene.
+    """
+    path: str
+    manifest: Optional[SceneManifest] = None
+    error: str = ""             # why this scene cannot take part, if it cannot
+    detail: str = ""            # hython's own words, for the row's tooltip
+    reading: bool = False       # a BatchInspectWorker is out for it right now
+    cached: bool = False        # the manifest came from the on-disk cache
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.path)
+
+    @property
+    def ready(self) -> bool:
+        return self.manifest is not None and not self.error and not self.reading
+
 
 # --------------------------------------------------------------------------
 # Main window
@@ -211,18 +281,34 @@ class LauncherWindow(QMainWindow):
         # button therefore records an intent here rather than doing work now.
         self._relink_dirs: dict = {}
 
+        # Batch mode: the listed scenes, in the order they render, kept
+        # index-aligned with the top-level rows of ``batch_tree``. Scenes are
+        # read one at a time in the background -- several hython processes at
+        # once would each want gigabytes for no gain.
+        self._batch_scenes: list = []
+        self._batch_pending: list = []      # hip paths still waiting for a read
+        self._batch_thread: Optional[QThread] = None
+        self._batch_worker: Optional[BatchInspectWorker] = None
+        self._last_mode = self.MODE_RENDER
+
         self._build_ui()
         self._populate_hython_options()
         self._connect()
         self._set_scene_loaded(False)
+        self._refresh_batch_status()
 
     # -- construction -----------------------------------------------------
 
-    MODE_RENDER, MODE_COOK = 0, 1
+    MODE_RENDER, MODE_COOK, MODE_BATCH = 0, 1, 2
 
     def _engine(self) -> str:
         """The selected render engine token — "hython" (default) or "husk"."""
         return self.engine_combo.currentData() or husk_mod.DEFAULT_ENGINE
+
+    def _batch_engine(self) -> str:
+        """Batch mode's own engine token. Separate from the render mode's so
+        switching tabs never quietly re-points the other mode's engine."""
+        return self.batch_engine_combo.currentData() or husk_mod.DEFAULT_ENGINE
 
     def _set_status(self, text: str, level: str = "info") -> None:
         """Set the scene status line and colour it by severity.
@@ -343,6 +429,7 @@ class LauncherWindow(QMainWindow):
         self.mode_tabs = QTabWidget()
         self.mode_tabs.addTab(render_page, "Render")
         self.mode_tabs.addTab(self._build_tasks_panel(), "Caches && Sims")
+        self.mode_tabs.addTab(self._build_batch_panel(), "Batch")
         splitter.addWidget(self.mode_tabs)
 
         splitter.addWidget(self._build_run_panel())
@@ -912,6 +999,608 @@ class LauncherWindow(QMainWindow):
 
         self._launch_queue(self._jobs_for_cook_tasks(chosen), verb="Cooking")
 
+    # -- batch mode --------------------------------------------------------
+    #
+    # The GUI's ``hsl batch``: several .hip files rendered back to back. Kept
+    # deliberately plain, like the CLI command it mirrors -- engine, frames,
+    # chunk and concurrency apply to every scene, and there is no per-ROP
+    # editing here at all. Overriding one scene's camera, AOVs, resolution or
+    # output is per-scene work and belongs in the Render tab.
+    #
+    # What the GUI adds over the CLI is the tick: ``hsl batch`` renders every
+    # render ROP of every scene, with no way to choose. Here every ROP starts
+    # ticked (same default) and can be unticked to skip it.
+
+    def _build_batch_panel(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        hint = QLabel(
+            "Renders whole scenes back to back. Every render ROP starts "
+            "ticked — untick the ones this run should skip. Each ROP renders "
+            "with the settings its own scene carries; there are no per-ROP "
+            "overrides here. Use the Render tab to change one scene's camera, "
+            "AOVs, resolution or output.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_STATUS_STYLES["muted"])
+        layout.addWidget(hint)
+
+        button_row = QHBoxLayout()
+        self.batch_add_btn = QPushButton("Add Scenes…")
+        self.batch_add_btn.setToolTip(
+            "Choose one or more .hip files. Each is read in the background, "
+            "so the window stays usable while hython works.")
+        self.batch_remove_btn = QPushButton("Remove")
+        self.batch_remove_btn.setToolTip(
+            "Take the selected scenes out of this batch.")
+        self.batch_reread_btn = QPushButton("Read Again")
+        self.batch_reread_btn.setToolTip(
+            "Read the selected scenes again in hython, ignoring the cached "
+            "read — use this after saving changes to a scene.")
+        button_row.addWidget(self.batch_add_btn)
+        button_row.addWidget(self.batch_remove_btn)
+        button_row.addWidget(self.batch_reread_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        self.batch_tree = QTreeWidget()
+        self.batch_tree.setColumnCount(3)
+        self.batch_tree.setHeaderLabels(["Scene / ROP", "Frames", "Status"])
+        self.batch_tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.batch_tree.setRootIsDecorated(True)
+        header = self.batch_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.batch_tree.setMinimumHeight(150)
+        layout.addWidget(self.batch_tree, 1)
+
+        # "&&" would be needed for a literal ampersand in a group title; there
+        # is none here, and the title says plainly that nothing in this box is
+        # per-scene.
+        options = QGroupBox("Applies to every scene")
+        options_layout = QVBoxLayout(options)
+
+        top_row = QHBoxLayout()
+        self.batch_engine_combo = QComboBox()
+        self.batch_engine_combo.addItem("Hython (direct ROP, no USD export)", "hython")
+        self.batch_engine_combo.addItem(
+            "Husk (renders USD each scene has already exported)", "husk")
+        self.batch_engine_combo.setToolTip(
+            "Hython renders each ROP straight from its scene. Husk renders an "
+            "exported USD, so every scene must already have one — read it in "
+            "the Render tab with “Write USD while reading” turned on.")
+        top_row.addWidget(QLabel("Engine"))
+        top_row.addWidget(self.batch_engine_combo, 1)
+        top_row.addSpacing(12)
+
+        self.batch_frames_check = QCheckBox("Override frames")
+        self.batch_frames_check.setToolTip(
+            "Render these frames for every ticked ROP instead of the range "
+            "each one carries.")
+        self.batch_frame_start = QSpinBox(); self.batch_frame_start.setRange(-100000, 1000000)
+        self.batch_frame_end = QSpinBox(); self.batch_frame_end.setRange(-100000, 1000000)
+        self.batch_frame_inc = QSpinBox(); self.batch_frame_inc.setRange(1, 1000)
+        self.batch_frame_inc.setValue(1)
+        for spin in (self.batch_frame_start, self.batch_frame_end, self.batch_frame_inc):
+            spin.setEnabled(False)
+        top_row.addWidget(self.batch_frames_check)
+        top_row.addWidget(self.batch_frame_start)
+        top_row.addWidget(QLabel("to"))
+        top_row.addWidget(self.batch_frame_end)
+        top_row.addWidget(QLabel("step"))
+        top_row.addWidget(self.batch_frame_inc)
+        options_layout.addLayout(top_row)
+
+        bottom_row = QHBoxLayout()
+        self.batch_chunk_spin = QSpinBox()
+        self.batch_chunk_spin.setRange(0, 10000)
+        self.batch_chunk_spin.setSpecialValueText("all in one")
+        self.batch_chunk_spin.setToolTip("Frames per render process.")
+        bottom_row.addWidget(QLabel("Chunk size"))
+        bottom_row.addWidget(self.batch_chunk_spin)
+        bottom_row.addSpacing(12)
+
+        self.batch_parallel_spin = QSpinBox()
+        self.batch_parallel_spin.setRange(1, 64)
+        self.batch_parallel_spin.setValue(1)
+        self.batch_parallel_spin.setToolTip(
+            "How many renders run at once. At 1 the chunks run strictly in "
+            "the order listed, one scene finishing before the next starts.")
+        bottom_row.addWidget(QLabel("Concurrent renders"))
+        bottom_row.addWidget(self.batch_parallel_spin)
+        bottom_row.addStretch(1)
+        options_layout.addLayout(bottom_row)
+        layout.addWidget(options)
+
+        # The reason the batch cannot start has to be readable, not just a
+        # greyed-out button. It is shown here and, while this tab is in front,
+        # on the window's own status line.
+        self.batch_status = QLabel("")
+        self.batch_status.setWordWrap(True)
+        self.batch_status.setStyleSheet(_STATUS_STYLES["muted"])
+        layout.addWidget(self.batch_status)
+        return widget
+
+    # -- batch list ---------------------------------------------------------
+
+    def _batching(self) -> bool:
+        return self.mode_tabs.currentIndex() == self.MODE_BATCH
+
+    def _batch_scene(self, hip_path: str) -> Optional[BatchScene]:
+        key = os.path.normcase(hip_path)
+        return next((s for s in self._batch_scenes
+                     if os.path.normcase(s.path) == key), None)
+
+    def _batch_item(self, scene: BatchScene) -> Optional[QTreeWidgetItem]:
+        """The top-level row for ``scene``. The list and the tree are kept
+        index-aligned, so this is a lookup rather than a search of the tree.
+
+        Matched by identity, not equality: two entries could in principle hold
+        equal field values, and comparing whole manifests to find a row would
+        be both slow and wrong.
+        """
+        for index, candidate in enumerate(self._batch_scenes):
+            if candidate is scene:
+                return self.batch_tree.topLevelItem(index)
+        return None
+
+    @Slot()
+    def add_batch_scenes(self) -> None:
+        start = os.path.dirname(self.hip_edit.text().strip()) or os.path.expanduser("~")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choose Houdini scenes to render",
+            start, "Houdini scenes (*.hip *.hiplc *.hipnc);;All files (*)")
+        if not paths:
+            return
+
+        added, skipped = 0, 0
+        for raw in paths:
+            path = os.path.abspath(raw)
+            if self._batch_scene(path) is not None:
+                skipped += 1
+                continue
+            scene = BatchScene(path=path)
+            self._batch_scenes.append(scene)
+            item = QTreeWidgetItem([scene.name, "", ""])
+            item.setToolTip(0, path)
+            self.batch_tree.addTopLevelItem(item)
+            added += 1
+
+            # The cache is a read of this exact .hip, taken with no export, and
+            # is only used while it is newer than the file -- so reusing it is
+            # always safe and skips a whole hython launch. Same rule as the
+            # CLI's own batch.
+            cached = bridge.load_cached(path)
+            if cached is not None:
+                self._on_batch_manifest(scene, cached, cached_read=True)
+            else:
+                self._batch_pending.append(path)
+        self._start_next_batch_read()
+        self._refresh_batch_status()
+        if skipped:
+            self._set_status(
+                f"Added {added} scene(s); {skipped} already in the batch.",
+                "info")
+
+    @Slot()
+    def remove_batch_scenes(self) -> None:
+        """Drop the selected scenes. A scene still being read is dropped too;
+        its result is ignored when it arrives."""
+        rows = set()
+        for item in self.batch_tree.selectedItems():
+            top = item if item.parent() is None else item.parent()
+            row = self.batch_tree.indexOfTopLevelItem(top)
+            if row >= 0:
+                rows.add(row)
+        if not rows:
+            self._set_status("Select a scene in the list to remove it.", "warning")
+            return
+        for row in sorted(rows, reverse=True):
+            scene = self._batch_scenes.pop(row)
+            self.batch_tree.takeTopLevelItem(row)
+            if scene.path in self._batch_pending:
+                self._batch_pending.remove(scene.path)
+        self._refresh_batch_status()
+
+    @Slot()
+    def reread_batch_scenes(self) -> None:
+        """Read the selected scenes again, ignoring the cached read."""
+        rows = {self.batch_tree.indexOfTopLevelItem(
+                    item if item.parent() is None else item.parent())
+                for item in self.batch_tree.selectedItems()}
+        chosen = ([self._batch_scenes[r] for r in sorted(rows) if r >= 0]
+                  or list(self._batch_scenes))
+        if not chosen:
+            self._set_status("Add scenes before reading them again.", "warning")
+            return
+        for scene in chosen:
+            if scene.reading or scene.path in self._batch_pending:
+                continue
+            self._batch_pending.append(scene.path)
+        self._start_next_batch_read()
+        self._refresh_batch_status()
+
+    def _start_next_batch_read(self) -> None:
+        """Read the next queued scene, one at a time, off the Qt thread.
+
+        Serial on purpose: each read is a full hython launch loading a .hip,
+        and several at once would multiply the memory for no gain. The next
+        one starts from the thread's own ``finished`` signal -- by the time a
+        worker's result reaches the Qt thread the thread has not necessarily
+        stopped, so that is the only point at which starting another is safe.
+        """
+        if self._batch_thread is not None and self._batch_thread.isRunning():
+            return
+        scene = None
+        while self._batch_pending and scene is None:
+            scene = self._batch_scene(self._batch_pending.pop(0))
+        if scene is None:
+            return
+
+        scene.reading = True
+        scene.error = ""
+        scene.manifest = None
+        self._fill_batch_item(scene)
+
+        self._batch_thread = QThread(self)
+        self._batch_worker = BatchInspectWorker(
+            scene.path, hython=self.hython_edit.text().strip())
+        self._batch_worker.moveToThread(self._batch_thread)
+        self._batch_thread.started.connect(self._batch_worker.run)
+        self._batch_worker.finished.connect(self.on_batch_scene_read)
+        self._batch_worker.failed.connect(self.on_batch_scene_failed)
+        self._batch_worker.finished.connect(self._batch_thread.quit)
+        self._batch_worker.failed.connect(self._batch_thread.quit)
+        self._batch_thread.finished.connect(self._start_next_batch_read)
+        self._batch_thread.start()
+
+    @Slot(str, object)
+    def on_batch_scene_read(self, hip_path: str, manifest: SceneManifest) -> None:
+        scene = self._batch_scene(hip_path)
+        if scene is None:
+            return          # removed from the list while it was being read
+        self._on_batch_manifest(scene, manifest, cached_read=False)
+        self._refresh_batch_status()
+
+    @Slot(str, str)
+    def on_batch_scene_failed(self, hip_path: str, message: str) -> None:
+        scene = self._batch_scene(hip_path)
+        if scene is None:
+            return
+        scene.reading = False
+        scene.manifest = None
+        # No message box: a batch can list many scenes, and one modal per
+        # failure would be a wall of dialogs. The row carries the failure and
+        # the status line says the batch cannot start until it is dealt with.
+        # The row's own words stay short and readable -- hython's output is
+        # a traceback whose last line is often a fragment -- and the tooltip
+        # carries what hython actually said.
+        scene.error = "Could not read this scene in hython."
+        scene.detail = message
+        self._fill_batch_item(scene)
+        self._refresh_batch_status()
+
+    def _on_batch_manifest(self, scene: BatchScene, manifest: SceneManifest,
+                           cached_read: bool) -> None:
+        """Record a scene's manifest and redraw its row.
+
+        A scene with no render ROPs is an error state here, not an empty one:
+        ``hsl batch`` refuses the whole run over it rather than rendering the
+        rest, and a GUI that quietly skipped it would render less than the
+        list says.
+        """
+        scene.reading = False
+        scene.manifest = manifest
+        scene.cached = cached_read
+        # Short enough for the Status column; the row's tooltip and the status
+        # line carry the rest. A long sentence here widens the column until it
+        # squeezes the scene names out of view.
+        scene.error = "" if manifest.rops else "No USD Render ROP in this scene."
+        scene.detail = ("" if manifest.rops else
+                        "There is nothing to render in this scene. Add a USD "
+                        "Render ROP at the end of its LOP network and read it "
+                        "again, or take it out of the batch.")
+        self._fill_batch_item(scene)
+        self._seed_batch_frames(manifest)
+
+    def _seed_batch_frames(self, manifest: SceneManifest) -> None:
+        """Start the frames override at the first scene's own range, so
+        ticking the box offers something real rather than 1 to 1."""
+        if self.batch_frames_check.isChecked() or not manifest.rops:
+            return
+        if any(s.manifest is not None and s.manifest is not manifest
+               for s in self._batch_scenes):
+            return              # only the first scene read seeds the fields
+        rop = manifest.rops[0]
+        self.batch_frame_start.setValue(rop.frame_start)
+        self.batch_frame_end.setValue(rop.frame_end if rop.use_frame_range
+                                      else rop.frame_start)
+        self.batch_frame_inc.setValue(rop.frame_inc or 1)
+
+    def _fill_batch_item(self, scene: BatchScene) -> None:
+        """Redraw one scene's row and its ROP children.
+
+        Ticks are rebuilt (all on) whenever the scene is re-read: the ROP list
+        itself may have changed, so carrying old ticks across would tick by
+        row number rather than by ROP.
+        """
+        item = self._batch_item(scene)
+        if item is None:
+            return
+        self.batch_tree.blockSignals(True)
+        item.takeChildren()
+        brush = _ERROR_BRUSH if scene.error else QBrush()
+        item.setForeground(0, brush)
+        item.setForeground(2, brush)
+
+        if scene.reading:
+            item.setText(1, "")
+            item.setText(2, "Reading…")
+            item.setToolTip(2, "")
+        elif scene.error:
+            item.setText(1, "")
+            item.setText(2, scene.error)
+            item.setToolTip(2, (scene.detail or scene.error)[-4000:])
+        else:
+            rops = scene.manifest.rops if scene.manifest else []
+            item.setText(1, "")
+            item.setText(2, f"{len(rops)} ROP(s)"
+                            + (" (cached read)" if scene.cached else ""))
+            item.setToolTip(2, "")
+            for rop in rops:
+                child = QTreeWidgetItem([rop.node_path,
+                                         self._rop_frames_text(rop), ""])
+                child.setData(0, Qt.UserRole, rop.node_path)
+                child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+                # Ticked by default: `hsl batch` renders every ROP of every
+                # scene, and this mode does the same until told otherwise.
+                child.setCheckState(0, Qt.Checked)
+                child.setToolTip(0, f"{rop.node_path}  ({rop.node_type})")
+                item.addChild(child)
+            item.setExpanded(True)
+        self.batch_tree.blockSignals(False)
+
+    @staticmethod
+    def _rop_frames_text(rop: RenderRop) -> str:
+        if not rop.use_frame_range:
+            return str(rop.frame_start)
+        step = f" step {rop.frame_inc}" if rop.frame_inc != 1 else ""
+        return f"{rop.frame_start}-{rop.frame_end}{step}"
+
+    def _ticked_batch_rops(self) -> list:
+        """[(scene, rop)] for every ticked ROP, in submission order."""
+        chosen = []
+        for row, scene in enumerate(self._batch_scenes):
+            item = self.batch_tree.topLevelItem(row)
+            if item is None or scene.manifest is None:
+                continue
+            for index in range(item.childCount()):
+                child = item.child(index)
+                if child.checkState(0) != Qt.Checked:
+                    continue
+                rop = scene.manifest.rop(child.data(0, Qt.UserRole))
+                if rop is not None:
+                    chosen.append((scene, rop))
+        return chosen
+
+    def _batch_frames(self) -> Optional[tuple]:
+        """(start, end, inc) to force on every ticked ROP, or None."""
+        if not self.batch_frames_check.isChecked():
+            return None
+        return (self.batch_frame_start.value(), self.batch_frame_end.value(),
+                self.batch_frame_inc.value())
+
+    def _batch_readiness(self) -> tuple:
+        """(ready, message, level) — why the batch can or cannot start.
+
+        Fail-fast like ``hsl batch``: one scene that cannot be read stops the
+        whole run rather than rendering the others and reporting at the end.
+        The GUI's version of "fix it" is to remove the scene or read it again,
+        so the message says that.
+        """
+        scenes = self._batch_scenes
+        if not scenes:
+            return False, "Add scenes to render them one after another.", "muted"
+        reading = [s for s in scenes if s.reading]
+        if reading or self._batch_pending:
+            waiting = len(reading) + len(self._batch_pending)
+            return (False,
+                    f"Reading {waiting} of {len(scenes)} scene(s) in hython. "
+                    f"Large scenes take a while.", "info")
+        broken = [s for s in scenes if s.error]
+        if broken:
+            names = ", ".join(s.name for s in broken)
+            return (False,
+                    f"{len(broken)} of {len(scenes)} scene(s) cannot be "
+                    f"rendered: {names}. Remove them from the list, or fix "
+                    f"them and read again — the batch does not start until "
+                    f"every scene in it is readable.",
+                    "error")
+        ticked = self._ticked_batch_rops()
+        if not ticked:
+            return False, "Tick at least one ROP to render.", "warning"
+        return (True,
+                f"Ready: {len(ticked)} ROP(s) ticked across {len(scenes)} "
+                f"scene(s). They render in the order listed.", "info")
+
+    def _refresh_batch_status(self) -> None:
+        _ready, message, level = self._batch_readiness()
+        self.batch_status.setStyleSheet(_STATUS_STYLES.get(level, _STATUS_STYLES["info"]))
+        self.batch_status.setText(message)
+        if self._batching():
+            self._set_status(message, level)
+            self.refresh_command()
+        self._refresh_primary_action()
+
+    @Slot()
+    def _on_batch_tick(self) -> None:
+        self._refresh_batch_status()
+
+    # -- batch jobs ---------------------------------------------------------
+
+    def _batch_plan(self) -> tuple:
+        """([(scene, rop, jobs)], problem) for every ticked ROP, in order.
+
+        Jobs come only from ``jobs_for_rop`` — never assembled here. Hand-built
+        jobs are how a render previously lost its renderer, camera and settings
+        prim and then exited 0 having rendered with bare defaults.
+
+        ``problem`` is a sentence naming the scene and what to do about it, or
+        "" when the batch is buildable. Both husk-only refusals mirror the CLI:
+        a scene whose live volumes would bake into a USD export, and a ROP with
+        no exported USD to render.
+        """
+        engine = self._batch_engine()
+        if not self._batch_scenes:
+            return [], "Add scenes to render them one after another."
+
+        # Every *listed* scene is judged before any job is built, the way
+        # cmd_batch reads them all before rendering anything. Checking only
+        # the scenes with a ticked ROP would let an unreadable one sit in the
+        # list and be silently left out of a farm export -- which is exactly
+        # the half-valid batch this mode refuses to start.
+        for scene in self._batch_scenes:
+            if scene.reading:
+                return [], (f"{scene.name} is still being read. The batch "
+                            f"starts once every scene in it has been read.")
+            if scene.manifest is None or scene.error:
+                why = scene.error or "it has not been read yet."
+                return [], (f"{scene.name} cannot be rendered: {why} Remove it "
+                            f"from the list, or read it again — the batch does "
+                            f"not start until every scene in it is readable.")
+
+        frames = self._batch_frames()
+        hython = self.hython_combo.currentData() or ""
+        entries: list = []
+        for scene, rop in self._ticked_batch_rops():
+            manifest = scene.manifest
+            # The husk refusals below are about work actually queued, so they
+            # are judged per ticked ROP rather than per listed scene: a scene
+            # with every ROP unticked exports nothing and costs nothing.
+            if engine == "husk" and manifest.live_volumes:
+                total = sum(v.field_count for v in manifest.live_volumes)
+                return [], (
+                    f"{scene.name}: {len(manifest.live_volumes)} live "
+                    f"volume(s), {total} field(s) would bake tens of GB per "
+                    f"frame into a USD export. Render this batch with the "
+                    f"Hython engine, which needs no export, or cache those "
+                    f"volumes to .vdb and read the scene again.")
+            if engine == "husk" and not rop.usd_path:
+                return [], (
+                    f"{scene.name}: {rop.node_path} has no exported USD to "
+                    f"render. Read that scene in the Render tab with “Write "
+                    f"USD while reading” turned on, or switch this batch to "
+                    f"the Hython engine.")
+
+            # Never mutate the manifest's own ROP: it describes the scene, and
+            # the frames override is a choice about this run. (The CLI can
+            # edit it in place because its manifest dies with the process.)
+            queued = RenderRop(**{**rop.__dict__})
+            if frames:
+                queued.frame_start, queued.frame_end, queued.frame_inc = frames
+                queued.use_frame_range = frames[1] != frames[0]
+
+            jobs = husk_mod.jobs_for_rop(
+                manifest, queued, queued.usd_path,
+                chunk_size=self.batch_chunk_spin.value(),
+                engine=engine,
+                # The window's Hython selector picks which install renders, the
+                # same way it picks which one reads. Left unset, build_command
+                # falls back to whichever install it discovers.
+                hython_exe=(hython or None) if engine == "hython" else None,
+                # Node paths repeat across scenes, so the hip name keeps queue
+                # reporting unambiguous -- same task id as `hsl batch`.
+                task_id=f"{scene.name}:{rop.node_path}",
+            )
+            entries.append((scene, rop, jobs))
+
+        if not entries:
+            return [], "Tick at least one ROP to render."
+        return entries, ""
+
+    def _batch_jobs(self) -> tuple:
+        """(jobs, problem) — ``_batch_plan`` flattened into submission order."""
+        entries, problem = self._batch_plan()
+        return [job for _, _, jobs in entries for job in jobs], problem
+
+    def _refresh_batch_command(self) -> None:
+        """The shared Run panel, showing what this batch would do."""
+        entries, problem = self._batch_plan()
+        if problem or not entries:
+            self.command_view.setPlainText(problem)
+            self.preflight_label.setStyleSheet("color: palette(mid);")
+            self.preflight_label.setText("Preflight: No active job.")
+            self.preflight_label.setToolTip("")
+            return
+
+        all_jobs = [job for _, _, jobs in entries for job in jobs]
+        first_scene, first_rop, first_jobs = entries[0]
+        scenes = len({s.path for s, _, _ in entries})
+        lines = [f"# --- {first_scene.name} : {first_rop.node_path} ---",
+                 husk_mod.format_command(husk_mod.build_command(first_jobs[0]))]
+        remaining = len(all_jobs) - 1
+        if remaining:
+            lines.append(f"\n… and {remaining} more chunk(s) across "
+                         f"{len(entries)} ticked ROP(s) in {scenes} scene(s).")
+        lines.append("\n# Rendered in this order:")
+        for scene, rop, jobs in entries:
+            lines.append(f"#   {scene.name} : {rop.node_path}   "
+                         f"frames {self._batch_entry_frames_text(rop)}, "
+                         f"{len(jobs)} chunk(s)")
+        lines.append("\n# Each ROP renders with the settings its own scene "
+                     "carries. The Render tab is where one scene's camera, "
+                     "AOVs, resolution or output can be overridden.")
+        self.command_view.setPlainText("\n".join(lines))
+
+        # Preflight per ticked ROP, judged on that ROP's first chunk against
+        # its own scene's manifest, deduplicated by (level, message) so a
+        # finding shared by several scenes is reported once. Same shape as
+        # cmd_batch's.
+        seen: set = set()
+        checks = []
+        for scene, _rop, jobs in entries:
+            for check in preflight.run_preflight_checks(jobs[0], scene.manifest):
+                key = (check.level, check.message)
+                if key not in seen:
+                    seen.add(key)
+                    checks.append(check)
+        self._show_preflight(checks)
+
+    def _batch_entry_frames_text(self, rop: RenderRop) -> str:
+        """The frames one ticked ROP will actually render — its own range, or
+        the override that replaces it, labelled as such."""
+        frames = self._batch_frames()
+        if not frames:
+            return self._rop_frames_text(rop)
+        start, end, inc = frames
+        if start == end:
+            return f"{start} (override)"
+        step = f" step {inc}" if inc != 1 else ""
+        return f"{start}-{end}{step} (override)"
+
+    @Slot()
+    def start_batch(self) -> None:
+        jobs, problem = self._batch_jobs()
+        if problem or not jobs:
+            # The button is already disabled in every state that produces a
+            # problem here; this is the guard of record, since the same plan
+            # is what farm export builds and that button is never disabled.
+            QMessageBox.information(
+                self, "Cannot start this batch",
+                problem or "Tick at least one ROP to render.")
+            return
+        if self._batch_engine() == "husk" and not husk_mod.find_husk():
+            QMessageBox.warning(
+                self, "husk not found",
+                "husk is not on PATH and $HFS is not set.\n\n"
+                "Source houdini_setup, or set $HSL_HUSK to the husk binary.",
+            )
+            return
+        self._launch_queue(jobs, verb="Rendering",
+                           max_parallel=self.batch_parallel_spin.value())
+
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         open_action = QAction("&Open scene…", self)
@@ -950,8 +1639,23 @@ class LauncherWindow(QMainWindow):
         self.settings_table.itemChanged.connect(lambda *_: self.refresh_command())
         self.farm_btn.clicked.connect(self.export_farm_job)
         self.render_btn.clicked.connect(self._primary_action)
-        self.mode_tabs.currentChanged.connect(lambda *_: self._refresh_primary_action())
+        self.mode_tabs.currentChanged.connect(self._on_mode_changed)
         self.cancel_btn.clicked.connect(self.cancel_render)
+
+        self.batch_add_btn.clicked.connect(self.add_batch_scenes)
+        self.batch_remove_btn.clicked.connect(self.remove_batch_scenes)
+        self.batch_reread_btn.clicked.connect(self.reread_batch_scenes)
+        self.batch_tree.itemChanged.connect(lambda *_: self._on_batch_tick())
+        self.batch_engine_combo.currentIndexChanged.connect(
+            lambda *_: self._refresh_batch_status())
+        self.batch_frames_check.toggled.connect(self.batch_frame_start.setEnabled)
+        self.batch_frames_check.toggled.connect(self.batch_frame_end.setEnabled)
+        self.batch_frames_check.toggled.connect(self.batch_frame_inc.setEnabled)
+        self.batch_frames_check.toggled.connect(
+            lambda *_: self._refresh_batch_status())
+        for widget in (self.batch_frame_start, self.batch_frame_end,
+                       self.batch_frame_inc, self.batch_chunk_spin):
+            widget.valueChanged.connect(lambda *_: self._refresh_batch_status())
 
         self.engine_combo.currentIndexChanged.connect(self.refresh_command)
         for widget in (self.renderer_combo, self.camera_combo, self.settings_combo):
@@ -976,7 +1680,19 @@ class LauncherWindow(QMainWindow):
 
     def _refresh_primary_action(self) -> None:
         """One button, labelled and enabled for whichever mode is showing."""
-        if self._cooking():
+        if self._batching():
+            self.render_btn.setText("Render Batch")
+            ready, reason, _level = self._batch_readiness()
+            # The tooltip carries the reason too, but it is never the only
+            # place it appears -- a disabled button nobody can hover is not an
+            # explanation. See _refresh_batch_status().
+            self.render_btn.setToolTip(
+                "Render every ticked ROP, scene by scene, in the order listed."
+                if ready else reason)
+            self.farm_btn.setToolTip(
+                "Export every ticked ROP of every listed scene as one farm "
+                "submission file.")
+        elif self._cooking():
             self.render_btn.setText("Cook Ticked")
             self.render_btn.setToolTip(
                 "Cook the ticked caches and simulations. Order comes from the "
@@ -1001,13 +1717,37 @@ class LauncherWindow(QMainWindow):
                     "Export this render as a farm submission file.")
             ready = bool(ticked)
         self.render_btn.setEnabled(ready and not self._running)
+        # "Copy command" copies whatever preview is on screen, so it follows
+        # the mode: a batch has one without any scene being read in the Render
+        # tab. Outside batch mode the old rule stands (see _set_scene_loaded).
+        self.copy_btn.setEnabled(
+            bool(self.command_view.toPlainText()) if self._batching()
+            else bool(self.manifest and self.manifest.rops))
 
     @Slot()
     def _primary_action(self) -> None:
-        if self._cooking():
+        if self._batching():
+            self.start_batch()
+        elif self._cooking():
             self.cook_selected()
         else:
             self.start_render()
+
+    @Slot(int)
+    def _on_mode_changed(self, index: int) -> None:
+        """Repoint the shared Run panel at whichever mode came to the front.
+
+        The command preview and preflight line below the tabs describe one
+        mode at a time, so entering *or leaving* batch has to redraw them.
+        Switching between Render and Caches & Sims is left exactly as it was.
+        """
+        was_batch = self._last_mode == self.MODE_BATCH
+        self._last_mode = index
+        self._refresh_primary_action()
+        if index == self.MODE_BATCH:
+            self._refresh_batch_status()
+        elif was_batch:
+            self.refresh_command()
 
     # -- hython slots -----------------------------------------------------
 
@@ -1134,7 +1874,14 @@ class LauncherWindow(QMainWindow):
 
     @Slot()
     def export_farm_job(self) -> None:
-        if self._cooking():
+        if self._batching():
+            jobs, problem = self._batch_jobs()
+            if problem or not jobs:
+                QMessageBox.warning(
+                    self, "Nothing to export",
+                    problem or "Tick at least one ROP in the Batch tab first.")
+                return
+        elif self._cooking():
             jobs = self._cook_jobs_for_farm()
             if not jobs:
                 return          # already told the user why, or they cancelled
@@ -1650,6 +2397,13 @@ class LauncherWindow(QMainWindow):
 
     @Slot()
     def refresh_command(self) -> None:
+        # The Run panel is shared by every mode, so it shows whichever one is
+        # in front. Batch builds its own preview and preflight from its own
+        # scene list; everything below here is the render mode's.
+        if self._batching():
+            self._refresh_batch_command()
+            return
+
         ticked = self._ticked_render_rops()
         current = self.current_rop()
         multi = len(ticked) > 1
@@ -1761,16 +2515,24 @@ class LauncherWindow(QMainWindow):
                     seen_checks.add(key)
                     pf_warnings.append(check)
 
-        if pf_warnings:
-            errs = [w for w in pf_warnings if w.level == "error"]
-            warns = [w for w in pf_warnings if w.level == "warning"]
+        self._show_preflight(pf_warnings)
+
+    def _show_preflight(self, checks: list) -> None:
+        """Set the preflight line from a list of PreflightWarnings.
+
+        One implementation for every mode that runs preflight, so the line
+        reads identically whichever one produced it.
+        """
+        if checks:
+            errs = [w for w in checks if w.level == "error"]
+            warns = [w for w in checks if w.level == "warning"]
             if errs:
                 self.preflight_label.setStyleSheet("color: #F44336; font-weight: bold;")
                 self.preflight_label.setText(f"Preflight: {len(errs)} Error(s), {len(warns)} Warning(s).")
             else:
                 self.preflight_label.setStyleSheet("color: #FF9800; font-weight: bold;")
                 self.preflight_label.setText(f"Preflight: {len(warns)} Warning(s) detected.")
-            self.preflight_label.setToolTip("\n".join(f"[{w.level.upper()}] {w.message}" for w in pf_warnings))
+            self.preflight_label.setToolTip("\n".join(f"[{w.level.upper()}] {w.message}" for w in checks))
         else:
             self.preflight_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
             self.preflight_label.setText("Preflight: All checks passed cleanly.")
@@ -1984,7 +2746,13 @@ class LauncherWindow(QMainWindow):
         self._set_status("Preparing the USD failed.", "error")
         QMessageBox.critical(self, "Could not prepare the render", message[-4000:])
 
-    def _launch_queue(self, jobs: list, verb: str = "Rendering") -> None:
+    def _launch_queue(self, jobs: list, verb: str = "Rendering",
+                      max_parallel: Optional[int] = None) -> None:
+        """Hand a job list to the queue and wire its events onto the Qt thread.
+
+        ``max_parallel`` defaults to the Render tab's own concurrency spin;
+        batch mode passes its own instead, since its controls are separate.
+        """
         self.log_view.clear()
         self.overall_bar.setValue(0)
         self.overall_bar.setVisible(True)
@@ -1997,8 +2765,10 @@ class LauncherWindow(QMainWindow):
         self.bridge.task_finished.connect(self.on_task_finished)
         self.bridge.queue_finished.connect(self.on_queue_finished)
 
+        parallel = (self.parallel_spin.value() if max_parallel is None
+                    else max_parallel)
         try:
-            self.queue = RenderQueue(jobs, max_parallel=self.parallel_spin.value(),
+            self.queue = RenderQueue(jobs, max_parallel=parallel,
                                      on_event=self.bridge.dispatch)
         except ValueError as exc:
             # A dependency cycle in the scene: nothing can ever be scheduled.

@@ -6,6 +6,6 @@ Two halves, deliberately kept apart:
   * everything else runs in plain Python and talks to the inspector over JSON.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .manifest import SceneManifest  # noqa: F401

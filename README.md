@@ -100,6 +100,11 @@ python -m hsl.cli render shot.hip --all-rops
 # so a typo in the third .hip surfaces before the first spends hours.
 python -m hsl.cli batch shotA.hip shotB.hip shotC.hip --frames 1001-1100
 
+# Same batch, but render only one chosen ROP per scene: a bare path applies
+# everywhere, scene:/path picks a different ROP per scene
+python -m hsl.cli batch shotA.hip shotB.hip shotC.hip \
+    --rop shotB.hip:/stage/usdrender_fx --rop /stage/usdrender_beauty
+
 # GUI
 python -m hsl.cli ui shot.hip
 ```

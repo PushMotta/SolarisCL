@@ -1949,10 +1949,11 @@ class TestBatchCli(unittest.TestCase):
         bridge.load_cached = self._real_load
         bridge.save_cached = self._real_save
 
-    def _manifest_for(self, hip):
-        return SceneManifest(hip_path=hip, rops=[RenderRop(
-            node_path="/stage/usdrender_rop1", node_type="usdrender_rop",
-            frame_start=1, frame_end=1)])
+    def _manifest_for(self, hip, rop_paths=None):
+        paths = rop_paths if rop_paths is not None else ["/stage/usdrender_rop1"]
+        return SceneManifest(hip_path=hip, rops=[
+            RenderRop(node_path=p, node_type="usdrender_rop",
+                      frame_start=1, frame_end=1) for p in paths])
 
     def _batch(self, argv):
         args = build_parser().parse_args(argv)
@@ -2081,6 +2082,95 @@ class TestBatchCli(unittest.TestCase):
                                     "--dry-run"])
         self.assertEqual(code, 3)
         self.assertIn("hython", err)
+
+    def test_no_rop_flag_renders_every_rop_of_every_scene(self):
+        # Byte-identical to today's behaviour: with no --rop, filtering never
+        # runs at all. Two multi-ROP scenes prove every ROP of every scene
+        # still makes it into the queue, in manifest order -- the same
+        # assertion shape as test_task_ids_carry_the_hip_name.
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(
+            hip, ["/stage/usdrender_rop1", "/stage/usdrender_rop2"])
+        code, captured = self._run_with_fake_queue(["batch", "a.hip", "b.hip"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [j.task_id for j in captured["jobs"]],
+            ["a.hip:/stage/usdrender_rop1", "a.hip:/stage/usdrender_rop2",
+             "b.hip:/stage/usdrender_rop1", "b.hip:/stage/usdrender_rop2"])
+
+    def test_bare_rop_spec_filters_every_scene_that_has_it(self):
+        # A bare SPEC carries no scene qualifier, so it applies everywhere --
+        # including two scenes that happen to share the same default ROP
+        # name, which is the common case Houdini's own node naming produces.
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(
+            hip, ["/stage/usdrender_rop1", "/stage/usdrender_rop2"])
+        code, captured = self._run_with_fake_queue(
+            ["batch", "a.hip", "b.hip", "--rop", "/stage/usdrender_rop1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [j.task_id for j in captured["jobs"]],
+            ["a.hip:/stage/usdrender_rop1", "b.hip:/stage/usdrender_rop1"])
+
+    def test_qualified_rop_spec_picks_a_different_rop_per_scene(self):
+        # Each scene keeps only the ROP its own qualified SPEC names -- two
+        # scenes can render two different passes in the same batch run.
+        def fake_inspect(hip, **k):
+            return self._manifest_for(
+                hip, ["/stage/usdrender_beauty", "/stage/usdrender_fx"])
+
+        bridge.inspect_hip = fake_inspect
+        code, captured = self._run_with_fake_queue([
+            "batch", "a.hip", "b.hip",
+            "--rop", "a.hip:/stage/usdrender_beauty",
+            "--rop", "b.hip:/stage/usdrender_fx",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [j.task_id for j in captured["jobs"]],
+            ["a.hip:/stage/usdrender_beauty", "b.hip:/stage/usdrender_fx"])
+
+    def test_qualifier_matches_the_scene_name_with_or_without_extension(self):
+        # A qualifier may name the scene by its argv basename or that
+        # basename with the .hip stripped -- both must resolve to the same
+        # scene, case-insensitively (this is Windows).
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(
+            hip, ["/stage/rop1", "/stage/rop2", "/stage/rop3"])
+        code, captured = self._run_with_fake_queue([
+            "batch", "shotA.hip",
+            "--rop", "SHOTA:/stage/rop1",       # no extension, upper-case
+            "--rop", "shotA.hip:/stage/rop2",   # extension, matching case
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [j.task_id for j in captured["jobs"]],
+            ["shotA.hip:/stage/rop1", "shotA.hip:/stage/rop2"])
+
+    def test_a_scene_left_with_no_rops_after_filtering_is_an_error(self):
+        # A scene whose ROPs the given --rop SPECs happen not to name would
+        # otherwise render nothing with no explanation. Name the scene and
+        # list what it actually contains, so the fix is obvious.
+        def fake_inspect(hip, **k):
+            paths = (["/stage/usdrender_rop1"] if hip == "a.hip"
+                     else ["/stage/other_rop"])
+            return self._manifest_for(hip, paths)
+
+        bridge.inspect_hip = fake_inspect
+        code, _, err = self._batch(["batch", "a.hip", "b.hip",
+                                    "--rop", "/stage/usdrender_rop1",
+                                    "--dry-run"])
+        self.assertEqual(code, 2)
+        self.assertIn("b.hip", err)
+        self.assertIn("/stage/other_rop", err)
+
+    def test_a_rop_spec_matching_nothing_anywhere_is_an_error(self):
+        # A typo in a --rop path or qualifier must not silently render
+        # everything (the filter never applied) or nothing (mistaken for a
+        # real scene) -- it has to be reported by name.
+        bridge.inspect_hip = lambda hip, **k: self._manifest_for(hip)
+        code, _, err = self._batch(["batch", "a.hip",
+                                    "--rop", "/stage/does_not_exist",
+                                    "--dry-run"])
+        self.assertEqual(code, 2)
+        self.assertIn("/stage/does_not_exist", err)
 
 
 class TestReleaseBundle(unittest.TestCase):

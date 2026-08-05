@@ -97,7 +97,24 @@ lists them; the GUI has a **Caches & Sims** mode.
   lives in **`hsl/progress.py`** (stdlib-only, unit-tested); `ui.py` keeps
   thin Qt wrappers. The empty-state blank detail box is gone.
 
-### Newest: several ROPs in a row, several scenes in a row
+### Newest of all: the Batch tab, and `batch --rop`
+
+- **The GUI has a third mode, Batch** — add several `.hip` files, each reads
+  in the background (one hython at a time, cache-reused), every render ROP
+  starts ticked, untick to pick per scene. One primary action, "Render
+  Batch", disabled with the reason shown until *every* listed scene is
+  readable — the GUI equivalent of `cmd_batch`'s fail-fast. Deliberately
+  plain like the CLI: engine/frames/chunk/parallel apply to every scene; no
+  per-ROP overrides in this mode. Farm export judges the whole list first —
+  the first version would have silently dropped an unreadable scene from a
+  farm export, caught and fixed before shipping.
+- **`hsl batch --rop SPEC`** (repeatable): bare `/stage/rop` applies to every
+  scene, `shotB.hip:/stage/fx` picks per scene (split at last colon,
+  extension-insensitive scene match). A SPEC matching nothing anywhere, or a
+  scene left with no ROPs, is exit 2 — a typo must never silently change
+  what renders. No flags = byte-identical to before.
+
+### Newer: several ROPs in a row, several scenes in a row
 
 - **`hsl render` takes repeatable `--rop` / `--all-rops`.** ROPs queue in the
   order given; the queue starts chunks in submission order, so `--parallel 1`
@@ -218,7 +235,16 @@ mid-cook left no orphan hython.
   parallel Houdini.
 - **`RenderJob.label` has no ROP path**, so two ROPs with identical frame
   ranges get identical Tractor task titles in an exported `.alf`
-  (`hsl/farm.py`, pre-existing, surfaced by GUI multi-ROP).
+  (`hsl/farm.py`, pre-existing, surfaced by GUI multi-ROP and now reachable
+  from the Batch tab's farm export too).
+- **The queue table does not name the scene per row** — with a batch running,
+  scene identity lives in the log prefixes, not the Frames column. Weakest
+  part of the batch display; fine for one scene, worth a column for many.
+- **`_batch_plan()`'s pure part is unit-testable but untested** — scene
+  validation + job assembly in `ui.py` (import-check-only by policy). Same
+  extraction pattern as `hsl/progress.py` if it starts growing logic.
+- The shared status line keeps the batch message after switching tabs until
+  something else writes it; deliberate, but look at it in live use.
 - **No manifest field records which frames a `usd_path` covers.** Mattered
   little while exports always covered the playbar; post-C8 an export is
   genuinely narrow, so a consumer that assumes otherwise would ask husk for
