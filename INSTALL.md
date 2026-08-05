@@ -13,8 +13,8 @@ This guide is for **running** hsl. If you are working on its source, read
 | | Required? | Why |
 |---|---|---|
 | **Houdini** | **Yes** | hsl does not render anything itself. It drives Houdini's `hython` and `husk`. Without a Houdini install there is nothing for it to launch. |
-| **Python 3.9 or newer** | **Yes** | Runs the launcher. This is a normal Python from python.org — *not* the one inside Houdini. |
-| **PySide6** | Only for the window | The command line has no dependencies at all. |
+| **Python 3.9 or newer** | Only for the **slim** zip | The `…-win64-full.zip` ships its own Python — nothing to install. The slim zip needs a normal Python from python.org — *not* the one inside Houdini. |
+| **PySide6** | Only for the window, slim zip only | Already inside the full zip. The command line has no dependencies at all. |
 
 Houdini's own Python is not used to run the launcher; hsl starts `hython` as a
 separate process when it needs to read or render a scene. That separation is
@@ -28,7 +28,19 @@ rather than assumed — but see "Check it actually works" below.
 
 ## 2. Install
 
-**Windows**
+**Windows, standalone (recommended for artists): `hsl-<version>-win64-full.zip`**
+
+1. Unzip it anywhere you like, e.g. `C:\Tools\hsl`. Keep the folder together.
+2. Double-click **`launch_ui.bat`**. That is the whole install.
+
+The full zip carries its own Python and Qt in a `python\` folder inside — it
+touches nothing on the machine, needs no admin rights, and cannot conflict
+with any other Python that is or is not installed. Only Houdini itself must
+already be there. (The bundled runtime always wins; delete the `python\`
+folder if you specifically want the launcher to use your own Python.)
+
+**Windows, slim: `hsl-<version>.zip`** — when you already have Python and
+would rather share it:
 
 1. Unzip `hsl-<version>.zip` anywhere you like, e.g. `C:\Tools\hsl`.
    Keep the folder together — `launch_ui.bat` expects `hsl\` beside it.

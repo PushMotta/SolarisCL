@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Build the redistributable zip: ``dist/hsl-<version>.zip``.
+"""Build the redistributable zips.
 
-    python scripts/make_release.py
+    python scripts/make_release.py                     # dist/hsl-<version>.zip
+    python scripts/make_release.py --bundle-python     # + hsl-<version>-win64-full.zip
 
 What goes in is the runtime half only -- the package, the launchers and the
 install guide. The test suite, the agent pack, the developer docs and the
 build scripts stay out: they are how hsl is *worked on*, not how it is run,
 and shipping them only invites someone to run the wrong thing.
+
+``--bundle-python`` additionally builds the **standalone** zip: the same tree
+plus a ``python\\`` directory holding the official embeddable CPython with
+PySide6 seeded into it. Unzip, double-click ``launch_ui.bat``, done -- no
+Python install, no pip, no PATH, nothing touched outside the folder. It needs
+the network (one cached fetch from python.org) and a Windows dev machine, and
+it refuses to write a zip whose bundled interpreter cannot actually import
+PySide6 and hsl -- a broken standalone is a support ticket, not a release.
 
 Everything is nested under a single ``hsl-<version>/`` directory inside the
 zip, so extracting it anywhere leaves one tidy folder rather than scattering
@@ -19,6 +28,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
 import zipfile
 
@@ -50,6 +61,158 @@ REQUIRED = (
     "launch_ui.bat",
     "INSTALL.md",
 )
+
+
+# --- The bundled-Python ("standalone") build --------------------------------
+# Version notes, each deliberate:
+#   * 3.11.9 is the last 3.11 with an official embeddable binary (later
+#     3.11.x releases are source-only security fixes), and 3.11 is what the
+#     dev environment runs the suite under -- the bundle matches what is
+#     actually tested.
+#   * PySide6-Essentials covers everything hsl/ui.py imports (QtCore, QtGui,
+#     QtWidgets); the full PySide6 metapackage would add the Addons wheels --
+#     roughly another hundred megabytes -- for nothing.
+#   * The PySide6 pin matches the version the UI is verified against on this
+#     machine. Bump it deliberately, then re-run check_ui_imports and the
+#     bundle build, never as a side effect.
+# PySide6 wheels are abi3 (limited API), which is what makes seeding them
+# from the dev interpreter into the embeddable one legitimate; the smoke test
+# still proves it rather than trusting the tag.
+
+EMBED_VERSION = "3.11.9"
+EMBED_URL = ("https://www.python.org/ftp/python/{v}/python-{v}-embed-amd64.zip"
+             .format(v=EMBED_VERSION))
+PYSIDE_SPEC = "PySide6-Essentials==6.11.1"
+
+# Checked inside the full zip, on top of REQUIRED.
+FULL_REQUIRED = (
+    "python/python.exe",
+    "python/python311._pth",
+    "python/Lib/site-packages/PySide6/__init__.py",
+    "python/Lib/site-packages/shiboken6/__init__.py",
+)
+
+
+def patched_pth(text: str) -> str:
+    """Rewrite the embeddable build's ``._pth`` file for this layout.
+
+    That file controls ``sys.path`` *completely* -- no registry, no
+    ``PYTHONPATH``, no defaults. Three changes, each load-bearing:
+    ``Lib\\site-packages`` is where PySide6 is seeded; ``..`` is the app root
+    one level above ``python\\``, which is what makes ``-m hsl.cli`` resolve;
+    and ``import site`` (shipped commented out) turns the site-packages
+    machinery on. Idempotent: patching an already-patched file changes
+    nothing, so a cached runtime can be rebuilt safely.
+    """
+    lines = [line for line in text.splitlines()
+             if line.strip() and not line.strip().startswith("#")]
+    for entry in ("Lib\\site-packages", ".."):
+        if entry not in lines:
+            lines.append(entry)
+    if "import site" not in lines:
+        lines.append("import site")
+    return "\n".join(lines) + "\n"
+
+
+def _download(url: str, dest: str) -> None:
+    import urllib.request
+    tmp = dest + ".part"
+    with urllib.request.urlopen(url) as resp, open(tmp, "wb") as fh:
+        shutil.copyfileobj(resp, fh)
+    os.replace(tmp, dest)
+
+
+def build_python_runtime(python_dir: str) -> None:
+    """Assemble ``python\\``: embeddable CPython with PySide6 seeded in."""
+    cache = os.path.join(DIST, "_embed_cache", os.path.basename(EMBED_URL))
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    if not os.path.isfile(cache):
+        print(f"  fetching {EMBED_URL}")
+        _download(EMBED_URL, cache)
+    with zipfile.ZipFile(cache) as zf:
+        zf.extractall(python_dir)
+
+    pth_names = [n for n in os.listdir(python_dir) if n.endswith("._pth")]
+    if len(pth_names) != 1:
+        raise SystemExit(
+            f"expected exactly one ._pth in the embeddable zip, found: {pth_names}")
+    pth = os.path.join(python_dir, pth_names[0])
+    with open(pth, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    with open(pth, "w", encoding="utf-8") as fh:
+        fh.write(patched_pth(text))
+
+    print(f"  seeding {PYSIDE_SPEC}")
+    site = os.path.join(python_dir, "Lib", "site-packages")
+    run = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--target", site,
+         "--only-binary=:all:",
+         "--python-version", EMBED_VERSION.rsplit(".", 1)[0],
+         "--platform", "win_amd64",
+         "--quiet", "--no-warn-script-location", PYSIDE_SPEC],
+        capture_output=True, text=True)
+    if run.returncode != 0:
+        raise SystemExit(f"pip could not seed {PYSIDE_SPEC}:\n{run.stderr[-2000:]}")
+
+
+def smoke_test_bundle(staging: str) -> None:
+    """Prove the bundle with its *own* interpreter, not the dev one.
+
+    Anything failing here would fail on the artist's machine identically, so
+    the build stops rather than writing the zip.
+    """
+    exe = os.path.join(staging, "python", "python.exe")
+    checks = (
+        ("bundled Python runs",
+         [exe, "-c", "import sys; print(sys.version)"]),
+        ("PySide6 imports",
+         [exe, "-c", "import PySide6.QtCore, PySide6.QtGui, PySide6.QtWidgets"]),
+        ("hsl.ui imports",
+         [exe, "-c", "import hsl.ui"]),
+        ("hsl CLI answers",
+         [exe, "-m", "hsl.cli", "--help"]),
+    )
+    for label, cmd in checks:
+        run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if run.returncode != 0:
+            raise SystemExit(
+                f"bundle smoke test failed ({label}):\n"
+                f"{run.stdout[-1000:]}\n{run.stderr[-2000:]}")
+        print(f"  ok: {label}")
+
+
+def build_full_zip(tag: str) -> str:
+    """The standalone zip: the shipped tree plus the bundled runtime."""
+    bundle_root = os.path.join(DIST, "_bundle")
+    if os.path.isdir(bundle_root):
+        shutil.rmtree(bundle_root)
+    staging = os.path.join(bundle_root, tag)
+
+    for disk, rel in _members():
+        dest = os.path.join(staging, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(disk, dest)
+
+    build_python_runtime(os.path.join(staging, "python"))
+    smoke_test_bundle(staging)
+
+    out = os.path.join(DIST, f"{tag}-win64-full.zip")
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, dirnames, filenames in os.walk(staging):
+            dirnames.sort()
+            for name in sorted(filenames):
+                disk = os.path.join(dirpath, name)
+                rel = os.path.relpath(disk, staging).replace(os.sep, "/")
+                zf.write(disk, f"{tag}/{rel}")
+
+    with zipfile.ZipFile(out) as zf:
+        if zf.testzip() is not None:
+            raise SystemExit(f"{out} is corrupt")
+        inside = {n[len(tag) + 1:] for n in zf.namelist()}
+    missing = [n for n in REQUIRED + FULL_REQUIRED if n not in inside]
+    if missing:
+        raise SystemExit("standalone release is missing: " + ", ".join(missing))
+    return out
 
 
 def version() -> str:
@@ -87,7 +250,14 @@ def _members():
         yield disk, name
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    bundle_python = "--bundle-python" in args
+    unknown = [a for a in args if a != "--bundle-python"]
+    if unknown:
+        raise SystemExit(f"unknown argument(s): {' '.join(unknown)} "
+                         f"(only --bundle-python is understood)")
+
     tag = f"hsl-{version()}"
     os.makedirs(DIST, exist_ok=True)
     out = os.path.join(DIST, f"{tag}.zip")
@@ -114,6 +284,14 @@ def main() -> int:
     print(f"\nwrote {out}")
     print(f"  {len(shipped)} files, {size:,} bytes ({size / 1024:.0f} KB)")
     print(f"  extracts to: {tag}/")
+
+    if bundle_python:
+        print("\nstandalone build:")
+        full = build_full_zip(tag)
+        size = os.path.getsize(full)
+        print(f"\nwrote {full}")
+        print(f"  {size:,} bytes ({size / (1024 * 1024):.0f} MB)")
+        print(f"  extracts to: {tag}/ -- unzip, double-click launch_ui.bat")
     return 0
 
 

@@ -2083,6 +2083,59 @@ class TestBatchCli(unittest.TestCase):
         self.assertIn("hython", err)
 
 
+class TestReleaseBundle(unittest.TestCase):
+    """The standalone zip's correctness rests on the ._pth rewrite and the
+    launchers preferring the bundled runtime -- both testable without the
+    network the real build needs."""
+
+    # Verbatim shape of the file inside python.org's embeddable zip.
+    EMBED_PTH = ("python311.zip\n.\n\n"
+                 "# Uncomment to run site.main() automatically\n"
+                 "#import site\n")
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "scripts", "make_release.py")
+        spec = importlib.util.spec_from_file_location("make_release", path)
+        cls.mr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mr)
+
+    def test_pth_gains_site_packages_app_root_and_site(self):
+        lines = self.mr.patched_pth(self.EMBED_PTH).splitlines()
+        self.assertIn("python311.zip", lines)      # stdlib zip kept
+        self.assertIn(".", lines)                  # DLL directory kept
+        self.assertIn("Lib\\site-packages", lines)  # where PySide6 is seeded
+        self.assertIn("..", lines)                 # app root: -m hsl.cli
+        self.assertIn("import site", lines)        # shipped commented out
+        self.assertNotIn("#import site", lines)
+
+    def test_pth_patch_is_idempotent(self):
+        # A cached runtime gets patched again on rebuild; twice must equal once.
+        once = self.mr.patched_pth(self.EMBED_PTH)
+        self.assertEqual(once, self.mr.patched_pth(once))
+
+    def test_the_full_zip_demands_the_runtime_and_qt(self):
+        # A standalone zip missing these is a support ticket; the build must
+        # refuse to write it rather than ship it.
+        self.assertIn("python/python.exe", self.mr.FULL_REQUIRED)
+        self.assertTrue(any("PySide6" in name for name in self.mr.FULL_REQUIRED))
+
+    def test_launchers_prefer_the_bundled_runtime(self):
+        # Both .bats must check python\python.exe before running anything --
+        # otherwise the standalone zip silently depends on the machine's own
+        # Python, which is the exact failure it exists to remove. Read as
+        # ASCII: cmd.exe's default codepage mangles anything beyond it.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for rel in ("launch_ui.bat", os.path.join("bin", "hsl.bat")):
+            with io.open(os.path.join(root, rel), encoding="ascii") as fh:
+                text = fh.read()
+            self.assertIn("python\\python.exe", text, rel)
+            self.assertLess(text.index("python\\python.exe"),
+                            text.index("-m hsl."), rel)
+
+
 class TestConsoleEncoding(unittest.TestCase):
     """A fresh Windows console is cp1252. Printing a character it cannot map
     raises UnicodeEncodeError half way through a report -- the user loses the

@@ -245,6 +245,10 @@ python -m hsl.cli ui <hip>
 
 python scripts/make_icon.py                    # redraw hsl/assets/hsl.ico
 python scripts/make_release.py                 # dist/hsl-<version>.zip (gitignored)
+python scripts/make_release.py --bundle-python # + -win64-full.zip: standalone,
+                                               # embeddable CPython 3.11.9 +
+                                               # PySide6 seeded in, smoke-tested
+                                               # with its own interpreter
 ```
 
 Manual hython probe — write JSON to a **file**, never parse stdout:
