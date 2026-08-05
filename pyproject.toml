@@ -1,6 +1,6 @@
 [project]
 name = "hsl"
-version = "0.2.0"
+version = "0.3.0"
 description = "Launch Houdini Solaris renders from a .hip file"
 requires-python = ">=3.9"
 dependencies = []
