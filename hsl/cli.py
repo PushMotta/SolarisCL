@@ -230,7 +230,7 @@ def cmd_inspect(args) -> int:
     manifest = bridge.inspect_hip(args.hip, hython=args.hython,
                                   export_usd=args.export_usd,
                                   usd_dir=args.usd_dir, flatten=args.flatten,
-                                  frame=args.frame)
+                                  frame=args.frame, footprint=args.footprint)
     if args.json:
         print(manifest.to_json())
         return 0
@@ -293,6 +293,34 @@ def cmd_inspect(args) -> int:
         for v in manifest.live_volumes:
             print(f"    [!] {v.prim_path}  ({', '.join(v.field_names)})")
         print("    -> render with --engine hython (no export) or cache the volumes to .vdb.")
+
+    if manifest.footprint:
+        fp = manifest.footprint
+
+        def _count(value: Optional[int]) -> str:
+            # A count is a fact, not a byte figure -- sysinfo.human_bytes
+            # would fold None and 0 together, which is exactly the mistake
+            # SceneFootprint's own docstring warns against.
+            return "unknown" if value is None else str(value)
+
+        heaviest = fp.heaviest or "unknown"
+        print(f"\n  scene footprint -- heaviest: {heaviest}  "
+              f"(scan cost {fp.seconds:.1f}s)")
+        print(f"    volumes      {fp.volume_count} volume(s), "
+              f"{_count(fp.active_voxels)} active voxel(s), "
+              f"{sysinfo.human_bytes(fp.voxel_bytes)} voxel data, "
+              f"uncompressed, no renderer overhead")
+        print(f"    textures     {fp.texture_count} texture(s), "
+              f"{sysinfo.human_bytes(fp.texture_bytes)} on disk, not in memory")
+        print(f"    geometry     {_count(fp.point_count)} point(s), "
+              f"{_count(fp.prim_count)} prim(s), "
+              f"{_count(fp.instance_count)} point-instancer instance(s)")
+        print(f"    framebuffer  {sysinfo.human_bytes(fp.framebuffer_bytes)} exact "
+              f"(width x height x channels x bytes-per-channel, summed over products)")
+        if fp.skipped:
+            print("    skipped (not counted above):")
+            for item in fp.skipped:
+                print(f"      - {item}")
 
     for warning in manifest.warnings:
         print(f"\n  warning: {warning}")
@@ -1030,6 +1058,11 @@ def build_parser() -> argparse.ArgumentParser:
                                 "the scene's current one")
     p_inspect.add_argument("--export-usd", action="store_true",
                            help="Also write the USD to disk")
+    p_inspect.add_argument("--footprint", action="store_true",
+                           help="Scan volumes, textures and geometry for what "
+                                "the scene contains (costs scan time on a "
+                                "heavy stage; reports scene contents, not a "
+                                "memory requirement)")
     p_inspect.set_defaults(func=cmd_inspect)
 
     p_render = sub.add_parser("render", parents=[common], help="Render with husk or hython")

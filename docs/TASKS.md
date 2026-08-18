@@ -3,6 +3,27 @@
 Ordered by risk. Each has an acceptance criterion — "done" means the criterion
 is demonstrated, not that the code looks right.
 
+## T10 — Calibrated memory estimate  ·  blocked on data, not on code
+
+`hsl` now measures what each render used (`memlog`) and what each scene
+contains (`SceneFootprint`), and records the two together. That pairing is the
+only route to answering "will this *unrendered* scene fit?" honestly.
+
+**Do not start this until there is real data.** A model fitted to two samples
+is recall wearing a lab coat, which is exactly what this codebase refuses. A
+fit over one studio's own shots, on one delegate and one Houdini build, is a
+different thing from an invented constant — but only once the samples exist.
+
+**Done when:** given a scene with no history of its own, `hsl` states a range
+drawn from measured renders of scenes with a comparable footprint on the same
+machine, says how many samples it rests on, and **says nothing at all** when
+that number is too small. Never a single confident figure.
+
+Two known confounders to handle rather than ignore: the delegate (Karma CPU
+and XPU differ enormously, so samples must not be pooled across them), and
+chunk size (peak is per process, so a 100-frame chunk and a 1-frame chunk of
+the same scene are not comparable samples).
+
 ## ~~T1 — `export_usd()` ignores failed parameter writes~~  ·  **DONE 2026-07-26**
 
 A missing `lopoutput` now **aborts** the export instead of returning a path

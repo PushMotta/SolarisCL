@@ -229,6 +229,16 @@ mid-cook left no orphan hython.
   Use the editor tools.
 - **`hash()` on a string is randomised per process** — was the manifest cache
   key; now SHA-1.
+- **Houdini authors volume fields as time samples with no default value.**
+  `attr.Get()` at the default time code returns `None` for `filePath`,
+  `fieldName` *and* `fieldDataType` on a real Solaris volume — read at
+  `inspected_frame` instead. This is not a missing number, it is a **wrong
+  answer**: the footprint scan read 481,683,137 active voxels at frame 1074
+  and `None` at the default, so it called a volume-dominated shot
+  "heaviest: textures on disk". It also invalidates the older D-VOL note
+  claiming `fieldName` is authored empty — it is not; it was read at the
+  wrong moment. Same trap for time-sampled point positions (a fixture reads
+  110 points instead of 160).
 - **Windows `PeakWorkingSetSize` covers the process you spawned and *nothing
   it spawns*.** A `.bat` wrapper around a child that allocated 300 MB measured
   **8.1 MB**. Direct spawns are fine (`hython.exe` allocating 400 MB measured

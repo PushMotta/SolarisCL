@@ -16,6 +16,12 @@ Two further defects were found by a targeted multi-ROP export probe on
 ROP's `$FSTART`/`$FEND` expressions) and have since been fixed and re-probed on
 both 21.0.729 and 22.0.368; both are written up in section C.
 
+A third was found on 2026-08-18 by `scripts/_probe_live_volumes.py` (N10 — the
+live-volume and missing-asset scans reading at the **default time code**, which
+made a cached `.vdb` sequence look like a bake risk *and* let a real bake
+through) and has been fixed and re-probed on both builds; it is written up in
+section N and it **corrects two claims in section D** (D7, D-VOL).
+
 The synthetic probe's one SKIP (D2 — typed AOV prims) was then **resolved
 separately** by running `/hip-check` on a real production Karma shot
 (`SHOT_SandBurst_ROCHA_v14`, Houdini 22.0.368): the inspector read its ROPs,
@@ -335,14 +341,23 @@ current frame.
 
 ### Live volumes bake on export  ·  `OK` (22, real scene)
 
+> **Amended 2026-08-18 by N10.** Two claims in this section were right about
+> the real shot for the wrong reason and are corrected in place below: the
+> "**empty** `filePath`" test (it is empty only when read at the wrong time
+> code, and a live volume's real path is an `op:` one) and "`fieldName` is
+> authored empty". Nothing here was deleted — the corrections are marked
+> inline, the same way B5, C4, C7 and C8 record theirs.
+
 `inspector.scan_live_volumes()` flags volumes that will **bake** into a USD
 export. A SOP-imported volume has no `.vdb` on disk: its `UsdVolOpenVDBAsset`
-fields carry an **empty** `filePath`, so exporting the stage serialises the
-voxels into the layer — ~44 GB observed for a single frame on `SHOT_SandBurst`,
-~1 TB for a full range. So the husk (USD-export) path is the wrong engine for
-such shots; `render_direct` (hython) renders the live data with no export.
+fields carry an `op:` reference back into the running session (**corrected**:
+this section originally said "an **empty** `filePath`" — see N10), so exporting
+the stage serialises the voxels into the layer — ~44 GB observed for a single
+frame on `SHOT_SandBurst`, ~1 TB for a full range. So the husk (USD-export) path
+is the wrong engine for such shots; `render_direct` (hython) renders the live
+data with no export.
 
-The scan groups empty-`filePath` `OpenVDBAsset` prims under their owning
+The scan groups live-`filePath` `OpenVDBAsset` prims under their owning
 `UsdVol.Volume` and lands them in `manifest.live_volumes`. Preflight raises a
 `volume_bake` **warning** for the husk engine (not the hython engine, which
 never exports), and — the real guard — `inspect(..., allow_volume_bake=False)`
@@ -353,7 +368,7 @@ never exports), and — the real guard — `inspect(..., allow_volume_bake=False
 | # | Assumption | Status | Evidence |
 |---|---|---|---|
 | D6 | `prim.IsA(UsdVol.OpenVDBAsset)` matches Houdini's SOP-imported volume fields | `OK` (22, real scene) | SandBurst `/stage/Render_01` → **8** `OpenVDBAsset` prims, matching the count `volume_probe.py` saw |
-| D7 | `GetFilePathAttr().Get().path` is empty for a live field, set for a `.vdb`-referenced one | `OK` (22, real + synthetic) | **0 of 8** fields carried a `filePath` on the real shot; a synthetic stage with one live and one `.vdb`-backed volume flagged **only** the live one |
+| D7 | `GetFilePathAttr().Get().path` is empty for a live field, set for a `.vdb`-referenced one | **`WRONG` on both counts, `FIXED` by N10** (21, 22) | the "0 of 8 fields carried a `filePath`" reading was taken at the **default time code**, where every time-sampled attribute reads `None`. Read at the frame, a live field carries an `op:` path and a cached one carries its `.vdb`. The test is now `filePath` empty **or `op:`** ⇒ live, read at `inspected_frame` |
 | D8 | `UsdVol.Volume` owns the field prims (fields are children) | `OK` (22, real scene) | all 8 fields' parents were `Volume`-typed; `_owning_volume()` resolved to that parent every time |
 
 **Verified 2026-07-26 on Houdini 22.0.368** against
@@ -369,16 +384,27 @@ genuinely prevented, not merely reported. `allow_volume_bake=True` was
 deliberately **not** exercised: that *is* the multi-GB bake, and C: has ~57 GB
 free.
 
-**`fieldName` is authored empty on real Solaris volumes** (8/8 on SandBurst) —
-the field name lives in the **prim name** (`density`, `vel`). So
-`scan_live_volumes()`'s `or prim.GetName()` fallback is load-bearing, not
-defensive: reading `GetFieldNameAttr()` alone would label every warning with
-empty field names. Do not "simplify" it away.
+~~**`fieldName` is authored empty on real Solaris volumes** (8/8 on SandBurst)~~
+— **corrected 2026-08-18 (N10).** It is not authored empty; it is authored as a
+**time sample with no default value** and was read at the default time code
+(N8 measured the same three attributes returning `None` there and real values at
+frame 1074). Measured on the fixture: `fieldName` reads `''` without a time code
+and `density` / `surface` at the frame, on both 21.0.729 and 22.0.368.
+
+The `or prim.GetName()` fallback is still load-bearing, but **for a different
+reason than was recorded**: not because Houdini leaves the name empty, but
+because a caller that passes no frame — or an attribute genuinely authored
+without one — would otherwise label every warning with empty field names. Do not
+"simplify" it away.
 
 **Division of labour with the missing-asset scan** (confirmed on the synthetic
-stage): an **empty** `filePath` is a *live volume* (bake risk); an **authored
-but unresolved** `filePath` is a *missing asset* and is reported by
-`scan_missing_assets` instead. The two never double-report the same field.
+stage, and re-confirmed by `scripts/_probe_live_volumes.py` on 21 and 22): a
+`filePath` that is **empty or `op:`** is a *live volume* (bake risk); one that
+**names a file the resolver cannot find** is a *missing asset* and is reported by
+`scan_missing_assets` instead. The two never double-report the same field, and
+both now read at the same frame so they cannot disagree about which they are
+looking at. (**Corrected**: the original wording said "an **empty** `filePath`",
+which mis-sorted a live `op:` volume into "cached" — see N10.)
 
 ## E. husk CLI flags — `hsl/husk.py` `build_command()`
 
@@ -597,6 +623,245 @@ bound** — an old record loaded from a store written before this change default
 to `peak_rss_is_tree=False`, which is not merely the safe default but the true
 one.
 
+## N. Scene footprint — `hsl/inspector.py` `_FootprintScan`
+
+`SceneManifest.footprint` counts what a scene **contains** that drives render
+memory. Facts, each labelled with exactly what it counts — deliberately *not* a
+prediction, for the reasons in `manifest.SceneFootprint`'s own docstring.
+
+Opt-in the whole way down: `hsl inspect --footprint` → `bridge.inspect_hip(
+footprint=True)` → `hython -m hsl.inspector … --footprint` →
+`inspect(footprint=True)`. Off by default, and the scan reuses the stage each
+ROP has **already cooked**, so it never adds a cook of its own.
+
+**Verified 2026-08-18 on Houdini 22.0.368 and 21.0.729** with
+`scripts/_probe_footprint.py` — **30/30 checks OK on both builds, identical
+numbers**. Cost measured on the production shot
+(`SHOT_Train_Aerial_DUDA_v05.hiplc`) with `scripts/_probe_footprint_cost.py`.
+
+The probe is built so every expected number is known *independently of the code
+under test*: the voxel count comes from `hou.VDB.activeVoxelCount()` on the SOP
+that built the grid, the textures are files the probe wrote itself, and the
+points/instances/framebuffer are arithmetic on a hand-authored USD layer.
+
+| # | Assumption | Status | Evidence |
+|---|---|---|---|
+| N1 | channels and bytes-per-channel can be **measured** off the USD library: `Sdf.ValueTypeNames.Find(name)`, then the buffer protocol on that type's array form | `OK` (21, 22) | `color3f` → `(3, 4)`, `float` → `(1, 4)`, `half` → `(1, 2)`, `color4f` → `(4, 4)`, `color3h` → `(3, 2)`, `matrix4d` → `(16, 8)`. `token`/`string`/an unknown name → `None`, never a default width |
+| N2 | `hou.VDB.activeVoxelCount()` is the **sparse** count, not the bounding-box product | `OK` (21, 22) | fixture grid: **29 999** active vs **91 125** (45³) bounding box — a 3× difference, so the two cannot be confused |
+| N3 | there is **no `pyopenvdb`** under hython, so a `.vdb` cannot be opened from Python directly | `OK` (22) | `ModuleNotFoundError`. A temporary File SOP is the route instead |
+| N4 | a File SOP's `activeVoxelCount()` matches the writing SOP exactly | `OK` (21, 22) | 29 999 written, 29 999 read back; and 33 032 527 on a 140 MB grid |
+| N5 | live SOP-imported volumes carry an **`op:` filePath** that resolves back to the SOP | `OK` (21, 22) | `sopimport` **and** `sopcreate` both author `op:/obj/…/vdbfrompolygons1.sop.volumes:SDF_FORMAT_ARGS:…`; `hou.node()` finds it and counting costs ~0.2 ms because the stage cook already cooked it |
+| N6 | `UsdVol.Volume` **is** a `UsdGeom.Gprim` | `OK` (22) | Volume, Mesh, Points, Sphere, BasisCurves all answer `IsA(Gprim)` true; `PointInstancer` does not. Found by a failing probe check — the first implementation counted every volume twice, once as a volume and once as geometry |
+| N7 | `fieldDataType` is authored by a SOP import but left **empty** by the Volume LOP | `OK` (21, 22) | live → `float`; file-backed → `''`, so the grid's own `vdbType` supplies the width there |
+| N8 | Houdini authors volume fields as **time samples with no default value** | `OK` (22, real shot) | see below — this is the load-bearing one |
+| N10 | `scan_live_volumes()` and `scan_missing_assets()` read at the default time code, so a cached `.vdb` **sequence** reads as a live volume | `FIXED` (21, 22) | was: a `$F4` Volume LOP and a time-sampled reference to a real `.vdb` were both reported as bake risks and their exports **refused**, while the genuinely live `op:` volume exported 819 B under `allow_volume_bake=False`. Now the exact opposite, on both builds — see below |
+
+### N8: the time code is load-bearing, not a refinement · `OK` (22, real scene)
+
+On `SHOT_Train_Aerial_DUDA_v05` every volume field attribute is authored
+(`HasAuthoredValue()` is True) yet a plain `attr.Get()` returns **`None`**. They
+carry **one time sample at frame 1074 and no default value**
+(`globalauthortimesamples=1` in the `op:` args), so reading at the default time
+code sees nothing there:
+
+| attribute | `Get()` (default) | `Get(1074)` |
+|---|---|---|
+| `filePath` | `None` | `op:/stage/sim_Primary/sopnet/OUT.sop.volumes:…` |
+| `fieldName` | `None` | `density` / `vel` |
+| `fieldDataType` | `None` | `float` / `float3` |
+
+`Usd.Attribute.Get(timeCode)` falls back to the default value when an attribute
+has no samples, so **passing a frame is never worse than not passing one**. The
+scan therefore reads everything at `manifest.inspected_frame`.
+
+What that one change was worth on the real shot:
+
+| | reading at the default time code | reading at frame 1074 |
+|---|---|---|
+| `active_voxels` | `None` — not measured | **481 683 137** |
+| `voxel_bytes` | `None` | **2 212 216 484** (2.06 GiB) |
+| `skipped` | 4 fields "carry no on-disk .vdb and no `op:` reference" | **empty** |
+| `heaviest` | `textures on disk` (1.28 GiB) | **`volume data`** (2.06 GiB) |
+
+The last row is the point. The unfixed version did not merely omit a number, it
+returned a **confidently wrong answer to the only question the field exists to
+answer** — it named textures as the heaviest thing in a shot whose volumes are
+60% larger. The byte figures are internally consistent: solving
+`4·D + 12·V = 2 212 216 484` against `D + V = 481 683 137` gives 446.0 M float
+density voxels and 35.7 M `float3` velocity voxels, which is the shape a pyro
+cache has.
+
+`scripts/_probe_footprint.py` pins this with a fixture mesh whose points exist
+**only** as a time sample: 110 points read without a time code, 160 with.
+
+### What the scan costs · measured (22.0.368)
+
+On the production shot — 3 render ROPs, 167 MB `.hip`, opens on frame 1074:
+
+| ROP | stage cook | footprint | volumes | textures | geometry | framebuffer |
+|---|---|---|---|---|---|---|
+| `/stage/usdrender_rop1` | 77.96 s | 0.148 s | 0.016 | 0.100 | 0.028 | 0.004 |
+| `/stage/componentoutput1/thumbnail_render` | 0.19 s | 0.020 s | 0.000 | 0.001 | 0.019 | 0.000 |
+| `/stage/Train_asset/thumbnail_render` | 211.10 s | 0.017 s | 0.001 | 0.013 | 0.002 | 0.001 |
+| **total** | **289.2 s** | **0.185 s** | 0.017 | 0.114 | 0.049 | 0.005 |
+
+**The footprint adds 0.185 s to 289 s of cooking — 0.06%.** The cook is paid
+whether or not a footprint was asked for, so that 0.185 s is the whole of what
+`--footprint` costs on this shot. Counting 481 M voxels took 0.017 s, because
+the `op:` route asks a SOP the stage cook had already cooked.
+
+What it found: 2 volumes / 4 fields / 481 683 137 active voxels / 2.06 GiB of
+voxel data, 35 textures / 1 374 564 705 B (1.28 GiB) on disk, 32 327 642 points
+across 11 geometry prims, 281 500 point-instancer instances, and a
+290 304 000 B (276.9 MiB) framebuffer. Nothing in `skipped`.
+
+### The one part that is genuinely expensive, and is switchable
+
+Counting an **on-disk `.vdb`** means opening it. Measured by writing grids at
+four voxel sizes and timing a File SOP read plus `activeVoxelCount()`:
+
+| file | active voxels | read + count |
+|---|---|---|
+| 0.2 MB | 29 999 | 0.003 s |
+| 3.2 MB | 743 562 | 0.011 s |
+| 12.8 MB | 2 973 330 | 0.054 s |
+| 49.8 MB | 11 892 878 | 0.153 s |
+| 140.0 MB | 33 032 527 | 0.394 s |
+
+That is ~320–350 MB/s at the large end — a real file read, and the grid is held
+in memory while it is counted. So it is separately switchable:
+`--footprint-no-vdb-files` / `inspect(footprint_vdb_files=False)`. The files it
+then skips are **named in `footprint.skipped`**, never silently counted as zero.
+`delayload=1` on the File SOP made no difference (0.407 s vs 0.394 s) and
+`loadtype=delayed` raised `hou.OperationFailed`.
+
+**This part has never run on a production shot** — the one real scene available
+here references its volumes through `op:` paths, not `.vdb` files, so the cost
+above is synthetic only.
+
+### Measured vs expected, on the fixture · `OK` (21.0.729, 22.0.368)
+
+Every row was compared against a number derived without using the scan:
+
+| term | expected | measured | how "expected" was obtained |
+|---|---|---|---|
+| `active_voxels` | 59 998 | 59 998 | `hou.VDB.activeVoxelCount()` × 2 volume prims |
+| `voxel_bytes` | 239 992 | 239 992 | active × 4 (the grid's own `float`) |
+| — not the bbox | ≠ 182 250 | ≠ | 45³ × 2, deliberately different |
+| `volume_count` | 2 | 2 | two `UsdVolVolume` prims |
+| `texture_count` | 3 | 3 | **4** asset references over 3 files — proves deduplication |
+| `texture_bytes` | 10 500 | 10 500 | 1000 + 2500 + 7000, files the probe wrote |
+| `point_count` | 160 | 160 | 4 + 6 + 100 + 50 authored points |
+| `prim_count` | 5 | 5 | 3 meshes + points + sphere (volumes excluded) |
+| `instance_count` | 7 | 7 | `protoIndices` of length 7 |
+| `framebuffer_bytes` | 160 000 | 160 000 | 100 × 50 × (3·4 + 1·4 + 4·4) |
+| `scanned` | True | True | |
+| footprint when not asked for | `None` | `None` | "nobody scanned this", not "empty" |
+
+Deduplication was also checked across stages (scanning the same stage twice
+leaves every total unchanged), which is what makes a multi-ROP pass safe.
+
+### Definitions worth not guessing at
+
+* **`prim_count` is renderable geometry prims** (`UsdGeom.Gprim`) — meshes,
+  curves, point clouds, quadrics. It is *not* the total prim count of the stage
+  and *not* polygons. Volumes and point instancers are excluded so the three
+  geometry-ish terms partition cleanly (N6).
+* **`texture_bytes` excludes a volume's own `.vdb`.** Those bytes are already in
+  the volume terms; counting them twice would make a cached sim look like a
+  texture problem in `heaviest`. When it happens it is stated in `skipped`.
+* **`op:` asset paths are never counted as textures.** They are live Houdini
+  data with no file on disk, and `os.path.getsize` would simply fail.
+* **`framebuffer_bytes` sums every `UsdRenderSettings` prim on the stage**, not
+  one render. A scene with several (the production shot has thumbnail ROPs
+  alongside the main render) says so in `skipped`.
+* **`None` versus `0`**, applied to every term: never scanned → `None`; scanned
+  and found nothing → `0`; scanned, something is there and none of it could be
+  counted → `None`, because 0 would be a lie.
+
+### N10: the same time code, in the two scans the footprint work did not touch · `FIXED` (21.0.729, 22.0.368)
+
+N8 fixed the footprint scan. `scan_live_volumes()` and `scan_missing_assets()`
+were left reading at the default time code, which N10 recorded as a defect
+waiting to happen. It was not hypothetical: probed on **2026-08-18** with
+`scripts/_probe_live_volumes.py`, a fixture holding four volume routes and one
+render ROP each, described at frame 2.
+
+| route | how it is authored | what it actually is |
+|---|---|---|
+| **cached** | Volume LOP, `filepath1` = `…/cache.$F4.vdb`, real files on disk | a cached sequence — safe to export |
+| **sampled** | hand-authored layer, `filePath` set **only** as time samples at 1/2/3 → the same real `.vdb`s | the exact shape N8 measured on the real shot |
+| **live** | `sopimport` from a VDB SOP → `op:/obj/vol_src/vdbfrompolygons1.sop.volumes:…` | the ~44 GB/frame bake |
+| **gone** | time-sampled `filePath` → a `.vdb` that is not on disk, plus a time-sampled texture that is not on disk | two missing assets |
+
+Measured on 22.0.368. "no tc" is the function called without a frame, which is
+what `inspect()` used to do:
+
+| route | before (no tc) | after, no tc | after, at frame 2 | correct? |
+|---|---|---|---|---|
+| cached | **live** ✗ | live ✗ | **not live** | ✓ |
+| sampled | **live** ✗ | live ✗ | **not live** | ✓ |
+| live | **not live** ✗ | **live** ✓ | **live** | ✓ |
+| gone | **live** ✗ | live ✗ | not live, **2 missing assets** | ✓ |
+
+Both columns after the fix matter. The `op:` test alone repairs the live case
+even with no frame; the *time code* is what repairs the other three. Neither
+half is sufficient, which is why both are in the change.
+
+What that meant for the export, through `inspect(export=True,
+allow_volume_bake=False)` — the guard the CLI's `hsl render --engine husk`
+depends on:
+
+| ROP | before | after (22.0.368) | after (21.0.729) |
+|---|---|---|---|
+| `rop_cached` | **0 bytes, export refused** | 1 871 B written | 1 878 B |
+| `rop_sampled` | **0 bytes, export refused** | 1 505 B written | 1 510 B |
+| `rop_live` | **819 B written — the bake went ahead** | **0 bytes, `usd_path` empty**, warning | **0 bytes**, warning |
+| `rop_gone` | 0 bytes, export refused | 1 505 B written | 1 510 B |
+| `manifest.live_volumes` | `/cached_vol`, `/World/sampled_vol`, `/World/gone_vol` | `/live_vol/volume_0` | same |
+| `manifest.missing_assets` | **0** | the missing `.vdb` **and** the missing texture | same |
+
+The `rop_live` row is the one that changes the safety story. The original claim
+(D7) was that an empty `filePath` means live — but a live volume's `filePath` is
+only empty when it is *time-dependent* and read at the wrong moment. This
+fixture's SOP import is not time-dependent (`globalauthortimesamples=0`), so its
+`op:` path was readable at the default time code, the old test read it as "a
+file", and the guard let the bake through. On the production shot the sim *is*
+time-dependent (`globalauthortimesamples=1`), the path read as `None`, and the
+verdict came out right by accident. Two scenes, the same code, opposite errors.
+
+**The mechanism.** One helper, `_attr_value(attr, time_code)`, now serves all
+three scans (the footprint's `_value` delegates to it), so they cannot drift
+apart about which moment they describe; `inspect()` passes
+`manifest.inspected_frame` to each. `scan_live_volumes()` calls a live path
+`""` **or** one starting `op:`, and `scan_missing_assets()` skips `op:` paths
+outright.
+
+**No regression on the real shot.** `SHOT_Train_Aerial_DUDA_v05.hiplc`
+(22.0.368, opens on frame 1074), `/stage/usdrender_rop1`, both readings taken in
+the same run:
+
+| | at the default time code (old) | at frame 1074 (new) |
+|---|---|---|
+| live volumes | `/shot/vol/sim_Primary/volume_0`, `/shot/vol/sim_Secondary/volume_0` | **the same two** |
+| why | `filePath` read `None` | `filePath` reads `op:/stage/sim_Primary/sopnet/OUT.sop.volumes:…` |
+| missing assets | 12 | **12** — the same 12 `Z:/Resources/FabLibrary/…` textures |
+| `fieldName` | `''` (4/4 fields) | `density` / `vel` |
+
+The verdict is unchanged and the shot still refuses to export, which is the
+point: the guard that prevented the measured 44 GB/frame bake keeps working, and
+now for the reason it claims. The `fieldName` row is the direct evidence for the
+D-VOL correction above.
+
+**What this does not cover.** `--allow-volume-bake` on **21.0.729** does not
+work for a SOP-imported volume: the export fails with `Layer saved to a location
+generated from a node path: …/obj/vol_src/vdbfrompolygons1.usd` and
+`export_usd()` correctly reports it and leaves `usd_path` empty (so the failure
+is loud, not silent). 22.0.368 exports it fine. That is in `export_usd()`, which
+this change does not touch — with `allow_volume_bake=True` the classification is
+not consulted at all — but it is the one probe check that is `WRONG` on 21, and
+it has **not** been retested against the pre-fix code.
+
 ## F. Environment and licensing
 
 | # | Assumption | Status |
@@ -642,7 +907,7 @@ one.
 | D6 | `IsA(UsdVol.OpenVDBAsset)` matches SOP-imported fields | 22.0.368 | 2026-07-26 | SandBurst: 8 field prims |
 | D7 | empty `filePath` ⇒ live volume; set ⇒ cached | 22.0.368 | 2026-07-26 | 0/8 on the real shot; synthetic stage flagged only the live volume |
 | D8 | `UsdVol.Volume` owns the field prims | 22.0.368 | 2026-07-26 | 8/8 parents `Volume`-typed |
-| D-VOL | `scan_live_volumes` + the export guard | 22.0.368 | 2026-07-26 | 4 volumes / 8 fields; `allow_volume_bake=False` wrote **0 bytes**, disk free unchanged |
+| D-VOL | `scan_live_volumes` + the export guard | 22.0.368 | 2026-07-26 | 4 volumes / 8 fields; `allow_volume_bake=False` wrote **0 bytes**, disk free unchanged. **Amended 2026-08-18 (N10)**: the verdict held, but the empty-`filePath` and empty-`fieldName` readings behind it were artefacts of the default time code |
 | E-OUT | `override_product_paths` redirects every product | 22.0.368 | 2026-07-26 | file + directory mode; `$F4` preserved; empty `productName` falls back to prim name; source untouched |
 | G1–G3 | Sublayer LOP exists, composes stronger, parm is `filepath1` | 22.0.368 | 2026-07-26 | `layer` is not a type; downstream file's opinion wins |
 | G-RELINK | hython-engine relink on the real shot | 22.0.368 | 2026-07-26 | SandBurst: 4 unresolved → **0** after relink; ROP input rewired to `/stage/hsl_relink` |
@@ -663,6 +928,15 @@ one.
 | C6 | one `--export-usd` pass exports **every** ROP, each to its own `usd_path`, each holding that ROP's own stage | 22.0.368 | 2026-07-31 | two-ROP throwaway scene: 2 rops, 2 files, `/geo_A` vs `/geo_B`. Multi-ROP husk is wireable |
 | C7 | **fixed** — export filenames are made unique per pass (`_export_usd_names`): colliding groups get an 8-char SHA-1 of the node path, and the manifest warns | 21.0.729, 22.0.368 | 2026-07-31 | was one file for `/stage/a_b/rop` + `/stage/a/b_rop`; now 2 files, `/geo_FIRST` and `/geo_SECOND` in the right ones, warning present. `--rop` gives the same name as a full pass; a non-colliding scene's names are unchanged |
 | C8 | **fixed** — `export_usd()` sets the range with `_force_parm` (`deleteAllKeyframes()` then set then read back), so `$FSTART`/`$FEND` no longer defeat it | 21.0.729, 22.0.368 | 2026-07-31 | was: asked 3-4, got 240 frames. Now `--export-frames 3 4 1` → samples `[3, 4]` (1 859 B vs 16 705 B); no flag → each ROP's own range, `[1,2]` and `[5,6,7]`. Same defect as K4 |
+| N1 | channels + bytes-per-channel measured off the USD library, not a table | 21.0.729, 22.0.368 | 2026-08-18 | `color3f`→(3,4), `half`→(1,2), `matrix4d`→(16,8); `token`/unknown→`None`. `scripts/_probe_footprint.py` |
+| N2 | `hou.VDB.activeVoxelCount()` is the sparse active count | 21.0.729, 22.0.368 | 2026-08-18 | 29 999 active vs 91 125 bounding box on the fixture |
+| N5 | live SOP volumes carry an `op:` filePath resolving back to the SOP | 21.0.729, 22.0.368 | 2026-08-18 | `sopimport` and `sopcreate` both; counting costs ~0.2 ms since the stage cook already cooked the SOP |
+| N6 | `UsdVol.Volume` **is** a `UsdGeom.Gprim` | 22.0.368 | 2026-08-18 | caught by a failing probe check; volumes are now excluded from `prim_count` so they are not counted twice |
+| N8 | volume field attributes are **time samples with no default value** | 22.0.368 | 2026-08-18 | real shot: `filePath`/`fieldName`/`fieldDataType` all `None` at the default time code, real values at frame 1074. Fixed `active_voxels` from `None` to 481 683 137 and flipped `heaviest` from textures to volume data |
+| N-COST | the footprint scan costs 0.185 s against a 289 s cook on a real shot | 22.0.368 | 2026-08-18 | 3 ROPs; per-part volumes 0.017 / textures 0.114 / geometry 0.049 / framebuffer 0.005. `scripts/_probe_footprint_cost.py` |
+| N10 | **fixed** — `scan_live_volumes` / `scan_missing_assets` read at `inspected_frame`, and a live volume is `filePath` empty **or** `op:` | 21.0.729, 22.0.368 | 2026-08-18 | 18/18 probe checks on 22, 17/18 on 21 (the one miss is N12, in `export_usd`). A `$F4` `.vdb` sequence went from "live, export refused, 0 bytes" to **1 871 B exported**; the genuinely live `op:` volume went from **819 B silently baked** to 0 bytes + warning. Real shot `SHOT_Train_Aerial_DUDA_v05` unchanged: the same 2 live volumes and the same 12 missing textures. `scripts/_probe_live_volumes.py` |
+| D7 | **corrected** — an empty `filePath` is not the live-volume test; a live field carries an `op:` path, and it reads empty only at the wrong time code | 21.0.729, 22.0.368 | 2026-08-18 | fixture SOP import with `globalauthortimesamples=0` was classified **cached** by the old test and its bake exported; real shot's time-dependent sim read `None` and was classified live by accident |
+| N-FIXTURE | every footprint term matches an independently known value | 21.0.729, 22.0.368 | 2026-08-18 | 30/30 checks, identical on both builds; dedup across stages verified |
 | M11–M17 | **fixed** — whole-process-tree peak memory via a Windows Job Object opened before each spawn | Win 11 10.0.26200 | 2026-08-18 | a `.bat` wrapper round a 300 MB child read **8.0 MB** before and **315.5 MB** after (8.1 → 317.4 MB through `RenderQueue`); direct `hython.exe` still ~400 MB delta; `python -c pass` still 8.1 MB. Nested-job assignment works here (this test process is itself in a job). The figure is **committed** memory, not working set |
 | K-COOK | **end-to-end headless cook** | 22.0.368 | 2026-07-28 | throwaway scene: `find_output_tasks` found 4 tasks (2 geometry ROPs, 1 dop, 1 filecache in `/obj`), classified cache/cache/sim/cache, read `final_rop → cache_rop` off the input chain, and the queue wrote **6 real `.bgeo.sc` files**; sequential filecache stayed 1 chunk under `chunk_size=2` |
 
@@ -716,6 +990,44 @@ one.
   scope per render, reading `memory.peak`; the same before/after fixture in
   this section is the way to prove it (a `.sh` wrapper launching a child that
   touches 300 MB must report ~300 MB, not ~8 MB).
+- **N9** — **counting on-disk `.vdb` files has never run on a production shot.**
+  The route is proven (a File SOP's count matches the writing SOP exactly, on
+  both builds) and the cost is measured synthetically at ~320–350 MB/s, but the
+  one real scene available here references its volumes through `op:` paths, so
+  the file-reading branch was never exercised on real data. Check: point
+  `scripts/_probe_footprint_cost.py` at a shot with a `.vdb` sequence on disk
+  and compare `active_voxels` against the same grids opened in a File SOP by
+  hand. The memory question matters as much as the time one — the scan holds
+  one grid at a time, so a 5 GB cache means a 5 GB spike; that is why
+  `--footprint-no-vdb-files` exists.
+- **N10** — **fixed 2026-08-18**, see section N above. Kept here only as a
+  pointer: `scan_live_volumes()` and `scan_missing_assets()` now read at
+  `manifest.inspected_frame`, and a live volume is `filePath` empty **or**
+  `op:`. Probe: `scripts/_probe_live_volumes.py`.
+- **N11** — **the relink pair still reads at the default time code.**
+  `author_relink_overlay()` and `relink_assets()` walk every asset attribute
+  with a bare `attr.Get()`, exactly as `scan_missing_assets()` used to. Now that
+  the scan reports a **time-sampled** missing asset, the two can disagree:
+  `manifest.missing_assets` names a file that `--relink-from` will read as
+  `None` and skip, so it lands in neither `relinked` nor `still_missing`. Not
+  fixed here because a repath for a time-sampled asset is not the same edit —
+  authoring one `over` with a default value would *replace* an animated
+  reference with a static one, which is a worse failure than the one it cures,
+  and getting it right means authoring per-sample. Nothing observed on a real
+  shot: the production shot's 12 missing textures all carry default values and
+  relink correctly. Check: point `relink_assets` at the `gone` route of
+  `scripts/_probe_live_volumes.py` (whose `filePath` and `inputs:file` exist
+  only as time samples) and confirm whether the overlay repaths them or
+  silently reports nothing.
+- **N12** — **`--allow-volume-bake` on 21.0.729 fails for a SOP-imported
+  volume.** Exporting the fixture's live volume raised `Layer saved to a
+  location generated from a node path: …/obj/vol_src/vdbfrompolygons1.usd`;
+  22.0.368 exported the same scene without complaint. The failure is *loud* —
+  `export_usd()` warns and leaves `usd_path` empty — so nothing renders a stale
+  file, and this is not on the default path (the guard refuses the export first
+  unless the flag is passed). Not investigated further, and not retested against
+  the pre-fix code. Check: on 21, `inspect(export=True,
+  allow_volume_bake=True)` on any `sopimport` volume ROP.
 - **A3** — the `::`-versioned type-name split path.
 - **E8/E9** — accepted values for `--complexity` and `--purpose`.
 - **F2/F3** — Karma license behaviour and the Indie resolution cap.

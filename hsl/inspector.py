@@ -18,13 +18,14 @@ import json
 import os
 import sys
 import tempfile
+import time
 import traceback
 from typing import Any, Iterable, Optional
 
 from .manifest import (
     TASK_CACHE, TASK_RENDER, TASK_SIM, TASK_UNKNOWN, Camera, LiveVolume,
     MissingAsset, OutputTask, RenderProduct, RenderRop, RenderSettings,
-    RenderVar, SceneManifest,
+    RenderVar, SceneFootprint, SceneManifest,
 )
 # Plain-Python, no Houdini: the output-naming rule, shared with the UI/CLI
 # preview so the two can never disagree about where a render lands.
@@ -255,6 +256,60 @@ def _delegate_settings(prim) -> dict[str, Any]:
     return out
 
 
+def _time_code(frame) -> Any:
+    """``Usd.TimeCode(frame)``, or ``None`` when there is nothing to build it from.
+
+    Every scan that reads an attribute takes its time code through here, so
+    "read at the frame the manifest describes" has exactly one spelling.
+    """
+    if frame is None or Usd is None:
+        return None
+    try:
+        return Usd.TimeCode(float(frame))
+    except Exception:
+        return None
+
+
+def _attr_value(attr, time_code=None):
+    """An attribute's value at ``time_code`` -- never a bare ``Get()``.
+
+    Houdini authors volume fields (and plenty else) as **time samples with no
+    default value**: measured on the production shot, ``filePath``,
+    ``fieldName`` and ``fieldDataType`` are all ``HasAuthoredValue() == True``
+    yet all return ``None`` from a plain ``Get()``, because the one sample sits
+    at frame 1074 and there is no default underneath it. Reading at the wrong
+    moment therefore does not raise and does not warn -- it quietly answers
+    "empty", which is a different fact from "not authored" and led to exactly
+    the wrong conclusion (see ``docs/UNVERIFIED.md`` N8 and N10).
+
+    ``Get(timeCode)`` falls back to the default value when an attribute has no
+    samples, so passing a frame is never worse than not passing one.
+    """
+    if attr is None or not attr:
+        return None
+    if time_code is not None:
+        try:
+            return attr.Get(time_code)
+        except Exception:
+            pass
+    try:
+        return attr.Get()
+    except Exception:
+        return None
+
+
+def _is_live_asset_path(path: str) -> bool:
+    """True when an asset path names live Houdini data rather than a file.
+
+    An ``op:`` path is a reference back into the running session -- the SOP
+    that holds the voxels -- so there is nothing on disk for a USD export to
+    reference and the data bakes into the exported layer. An empty path is the
+    same situation with no reference authored at all. Everything else names a
+    file, whether or not the resolver can currently find it.
+    """
+    return not path or path.startswith("op:")
+
+
 def _first_target(rel) -> str:
     if not rel:
         return ""
@@ -328,7 +383,7 @@ def walk_stage(stage) -> tuple[list[RenderSettings], list[RenderProduct],
     return settings, products, render_vars, cameras
 
 
-def scan_missing_assets(stage) -> list[MissingAsset]:
+def scan_missing_assets(stage, time_code=None) -> list[MissingAsset]:
     """Asset-path attributes on the stage whose value does not resolve on disk.
 
     Every asset-valued attribute (texture ``inputs:file``, volume filenames,
@@ -336,16 +391,30 @@ def scan_missing_assets(stage) -> list[MissingAsset]:
     with an **empty** ``resolvedPath`` is one the resolver could not find — a
     missing texture. This is exactly what husk would fail on mid-render, caught
     here at read time instead. Deduplicated on (attribute, path).
+
+    ``time_code`` is the frame the manifest describes, and it is load-bearing:
+    an asset authored **only** as a time sample -- which is how Houdini writes
+    an animated reference -- reads as ``None`` at the default time code, so a
+    missing file would simply never be reported. Under-reporting, not
+    over-reporting, but the render still dies mid-frame on the thing preflight
+    was meant to catch (``docs/UNVERIFIED.md`` N10).
+
+    ``op:`` paths are skipped: they are live Houdini data, not files, so
+    "unresolved" carries no meaning there. On 22.0.368 the resolver hands the
+    ``op:`` string back as its own ``resolvedPath`` and they never reach this
+    branch anyway -- the skip is what stops a build that answers differently
+    from filling ``manifest.missing_assets`` with every volume in the scene.
     """
     missing: list[MissingAsset] = []
     seen: set = set()
+    tc = _time_code(time_code)
 
     def _check(attr, asset):
         if asset is None:
             return
         path = getattr(asset, "path", "") or ""
         resolved = getattr(asset, "resolvedPath", "") or ""
-        if not path or resolved:
+        if not path or resolved or path.startswith("op:"):
             return
         key = (str(attr.GetPath()), path)
         if key in seen:
@@ -357,9 +426,9 @@ def scan_missing_assets(stage) -> list[MissingAsset]:
         for attr in prim.GetAttributes():
             type_name = attr.GetTypeName()
             if type_name == Sdf.ValueTypeNames.Asset:
-                _check(attr, attr.Get())
+                _check(attr, _attr_value(attr, tc))
             elif type_name == Sdf.ValueTypeNames.AssetArray:
-                for asset in (attr.Get() or []):
+                for asset in (_attr_value(attr, tc) or []):
                     _check(attr, asset)
 
     return missing
@@ -383,43 +452,55 @@ def _owning_volume(prim) -> str:
     return str(prim.GetPath())
 
 
-def scan_live_volumes(stage) -> list[LiveVolume]:
+def scan_live_volumes(stage, time_code=None) -> list[LiveVolume]:
     """Volumes whose OpenVDB fields have no on-disk ``.vdb`` -- they bake on export.
 
-    A ``UsdVolOpenVDBAsset`` with an **empty** ``filePath`` carries no reference
-    to a file on disk: its voxels are live in the composed stage (SOP-imported).
-    Exporting such a stage *bakes* the volume into the exported layer -- tens of
-    GB per frame on a real shot, versus a few MB when a ``.vdb`` is referenced.
-    The husk (USD-export) path pays that cost every frame; the hython-direct
-    engine renders the live data without exporting.
+    A ``UsdVolOpenVDBAsset`` whose ``filePath`` is **empty**, or is an ``op:``
+    reference back into the running session, carries no file on disk: its voxels
+    are live in the composed stage (SOP-imported). Exporting such a stage *bakes*
+    the volume into the exported layer -- tens of GB per frame on a real shot,
+    versus a few MB when a ``.vdb`` is referenced. The husk (USD-export) path
+    pays that cost every frame; the hython-direct engine renders the live data
+    without exporting.
 
-    A field whose ``filePath`` *is* authored (even one that fails to resolve) is
-    **not** a bake -- that is a missing VDB, reported by
+    A field whose ``filePath`` names a **file** (even one that fails to resolve)
+    is **not** a bake -- that is a missing VDB, reported by
     :func:`scan_missing_assets` instead. Results are grouped by the owning
     ``UsdVolVolume`` prim so a caller can say "N live volumes".
+
+    ``time_code`` is the frame the manifest describes and both halves of the
+    verdict depend on it. Houdini authors these attributes as time samples with
+    no default value, so at the default time code every ``filePath`` reads
+    empty -- which made a perfectly ordinary ``.vdb`` sequence look like a live
+    volume and had ``inspect(allow_volume_bake=False)`` refuse a safe export.
+    Reading at the frame fixes that; the ``op:`` test is what keeps a genuinely
+    SOP-imported volume flagged now that its path is no longer invisible.
+    Both directions matter: the first is a refused export, the second is tens
+    of GB written to disk (``docs/UNVERIFIED.md`` N10).
     """
     if UsdVol is None:
         return []
 
     order: list[str] = []
     fields_by_volume: dict[str, list[str]] = {}
+    tc = _time_code(time_code)
 
     for prim in stage.Traverse():
         if not prim.IsA(UsdVol.OpenVDBAsset):
             continue
         asset = UsdVol.OpenVDBAsset(prim)
-        file_attr = asset.GetFilePathAttr()
-        value = file_attr.Get() if file_attr else None
+        value = _attr_value(asset.GetFilePathAttr(), tc)
         path = (getattr(value, "path", "") or "") if value is not None else ""
-        if path:
+        if not _is_live_asset_path(path):
             continue                      # references a real .vdb -- cheap to export
 
-        # `fieldName` is authored empty on every SOP-imported field observed on
-        # Houdini 22.0.368 (8/8 on SandBurst) -- the prim *name* carries it
-        # ("density", "vel"). So the fallback is load-bearing, not defensive:
-        # without it every warning would name its fields as empty strings.
-        name_attr = asset.GetFieldNameAttr()
-        field_name = str((name_attr.Get() if name_attr else "") or prim.GetName())
+        # `fieldName` is authored as a time sample with no default, so it too
+        # reads empty unless a frame is passed -- and on a SOP-imported field
+        # the prim *name* is the reliable carrier ("density", "vel") in any
+        # case. The fallback is load-bearing, not defensive: without it a
+        # warning would name its fields as empty strings.
+        field_name = str(_attr_value(asset.GetFieldNameAttr(), tc)
+                         or prim.GetName())
 
         owner = _owning_volume(prim)
         if owner not in fields_by_volume:
@@ -433,6 +514,646 @@ def scan_live_volumes(stage) -> list[LiveVolume]:
                    field_names=fields_by_volume[owner])
         for owner in order
     ]
+
+
+# --------------------------------------------------------------------------
+# Scene footprint -- what the scene *contains* that drives render memory
+# --------------------------------------------------------------------------
+#
+# Facts, each labelled with exactly what it counts. Deliberately **not** a
+# prediction: see ``manifest.SceneFootprint``'s docstring for why a total would
+# be a number someone then sizes a farm around.
+#
+# Everything here is opt-in (``inspect(footprint=True)``) because two of the
+# four parts cost real time on a heavy stage -- measured per part in
+# ``docs/UNVERIFIED.md`` section N.
+
+# Bytes per voxel for the OpenVDB grid types Houdini names through
+# ``hou.VDB.vdbType()``. Used only for a **file-backed** grid, where the USD
+# side authors no ``fieldDataType`` (measured: the Volume LOP leaves that token
+# empty, while a SOP-imported field authors it). The widths are arithmetic on
+# the type's own name -- ``Vec3f`` is three 32-bit floats -- not a recalled API.
+# ``hou.vdbType`` exposes exactly these members plus ``PointData``,
+# ``PointIndex`` and ``Invalid``, which have no fixed per-voxel width and are
+# therefore recorded in ``skipped`` rather than guessed.
+VDB_TYPE_BYTES = {
+    "Float": 4, "Double": 8, "Int32": 4, "Int64": 8, "Bool": 1,
+    "Vec3f": 12, "Vec3d": 24, "Vec3i": 12,
+}
+
+# The marker Houdini puts in an ``op:`` asset path between the node path and
+# the resolver's own arguments.
+_SDF_FORMAT_ARGS = ":SDF_FORMAT_ARGS:"
+
+# Suffixes Houdini appends to the node path inside an ``op:`` asset path.
+# Longest first, so ``.sop.volumes`` is not half-stripped to ``.sop``.
+_OP_PATH_SUFFIXES = (".sop.volumes", ".sop.geo", ".sop", ".volumes")
+
+
+def _value_type_shape(type_name) -> Optional[tuple]:
+    """``(channels, bytes_per_channel)`` for a USD type name, or ``None``.
+
+    Both numbers are **measured off the USD library itself** rather than read
+    from a table someone typed from memory: the type's array form exposes the
+    buffer protocol, whose ``itemsize`` is the element width and whose shape
+    says how many elements make up one value. So ``color3f`` answers ``(3, 4)``
+    and ``half`` answers ``(1, 2)`` because that is what the build in front of
+    us says, not because this file claims to know.
+
+    That matters most for the framebuffer term, where the tempting shortcut is
+    to assume every AOV is four floats. A ``half`` beauty pass and a ``float``
+    depth pass are 2 and 4 bytes per channel, and a cryptomatte is not three
+    channels -- guessing would silently double or halve the answer.
+
+    ``None`` means the type was not recognised (``token`` and ``string`` have
+    no buffer form, and an unknown name does not resolve at all). Callers must
+    record that in ``skipped``; they must never fall back to a default width.
+    """
+    if Sdf is None or not type_name:
+        return None
+    try:
+        value_type = Sdf.ValueTypeNames.Find(str(type_name))
+    except Exception:
+        return None
+    if not value_type:
+        return None
+    try:
+        empty = value_type.arrayType.defaultValue
+        view = memoryview(type(empty)(1))
+        # shape is (1,) for a scalar, (1, 3) for color3f, (1, 4, 4) for
+        # matrix4d -- so the channel count is the product of everything past
+        # the leading element count.
+        channels = 1
+        for dim in view.shape[1:]:
+            channels *= int(dim)
+        return int(channels), int(view.itemsize)
+    except Exception:
+        return None
+
+
+def _op_node_path(asset_path: str) -> str:
+    """The Houdini node path inside an ``op:`` asset path, or ``""``.
+
+    A SOP-imported volume does not carry an empty ``filePath`` in every case --
+    measured on 22.0.368, both ``sopimport`` and ``sopcreate`` author a live
+    reference that points straight back at the SOP::
+
+        op:/obj/vol_src/vdbfrompolygons1.sop.volumes:SDF_FORMAT_ARGS:...
+
+    which is the route to a real active-voxel count for live volumes: the node
+    it names has already been cooked by the stage cook, so asking it costs
+    fractions of a millisecond.
+    """
+    if not asset_path or not asset_path.startswith("op:"):
+        return ""
+    body = asset_path[3:].split(_SDF_FORMAT_ARGS, 1)[0]
+    for suffix in _OP_PATH_SUFFIXES:
+        if body.endswith(suffix):
+            return body[: -len(suffix)]
+    return body
+
+
+def _vdb_grids(geometry) -> dict:
+    """``{grid name: (active voxel count, bytes per voxel or None)}``.
+
+    Reads ``hou.VDB.activeVoxelCount()``, which is the **sparse** count -- the
+    voxels actually stored -- and not the bounding-box product. On the probe
+    fixture the two are 29 999 and 45x45x45 = 91 125, so the distinction is not
+    academic: taking the bounding box would have overstated that grid by 3x.
+    """
+    grids: dict = {}
+    for prim in geometry.prims():
+        counter = getattr(prim, "activeVoxelCount", None)
+        if counter is None:
+            continue                      # not a VDB primitive
+        try:
+            count = int(counter())
+        except Exception:
+            continue
+        try:
+            name = str(prim.attribValue("name"))
+        except Exception:
+            name = ""
+        width = None
+        try:
+            # hou.vdbType.Float -> "Float"
+            width = VDB_TYPE_BYTES.get(str(prim.vdbType()).rsplit(".", 1)[-1])
+        except Exception:
+            width = None
+        grids[name] = (count, width)
+    return grids
+
+
+class _FootprintScan:
+    """Accumulates footprint facts across one or more composed stages.
+
+    ``inspect()`` cooks a stage per render ROP and those stages overlap, so
+    every term is deduplicated by the identity of the thing counted -- prim
+    path for volumes and geometry, resolved file path for textures. Counting a
+    shared texture once per ROP would inflate the only number here that is
+    meant to be exact about disk.
+
+    Each ``scan()`` call reuses a stage the caller **already cooked**. That is
+    the whole reason this is affordable on a heavy shot: the cold LOP cook
+    dominates everything (~95 s on the production shot measured in
+    ``docs/UNVERIFIED.md``), and the footprint adds no cook of its own.
+
+    ``time_code`` is the frame the description is being taken at, and it is
+    **load-bearing rather than a refinement**. Houdini authors volume fields as
+    *time samples*: on the production shot every one of ``filePath``,
+    ``fieldName`` and ``fieldDataType`` carries a single sample at frame 1074
+    and **no default value**, so a plain ``attr.Get()`` returns ``None`` and
+    the field looks like it has no data at all. Reading at the frame turns four
+    "uncountable" fields into four real voxel counts. ``Get(timeCode)`` falls
+    back to the default value when an attribute has no samples, so passing a
+    frame is never worse than not passing one.
+    """
+
+    def __init__(self, count_vdb_files: bool = True, time_code=None):
+        self.count_vdb_files = count_vdb_files
+        self._tc = _time_code(time_code)
+
+        # `*_ran` says the part executed at least once. It is what separates
+        # "measured, and the answer is none" (0) from "nobody looked" (None) --
+        # a distinction the whole dataclass rests on.
+        self.volumes_ran = False
+        self.geometry_ran = False
+        self.framebuffer_ran = False
+
+        self.volumes: set = set()             # UsdVolVolume prim paths
+        self.fields: set = set()              # OpenVDBAsset prim paths
+        self.active_voxels = 0
+        self.voxel_bytes = 0
+        self.fields_counted = 0               # fields that yielded a count
+        self.voxel_width_missing = 0          # counted, but value size unknown
+
+        self.textures: dict = {}              # resolved path -> size in bytes
+        self.textures_ran = False
+        self.texture_unstattable = 0
+        self.volume_files: set = set()        # .vdb refs, counted as volumes
+
+        self.gprims: set = set()
+        self.point_count = 0
+        self.point_arrays_failed = 0
+        self.instancers: set = set()
+        self.instance_count = 0
+        self.instancer_reads_failed = 0
+
+        self.settings_seen: set = set()
+        self.framebuffer_bytes = 0
+        self.vars_sized = 0
+        self.unknown_var_types: set = set()
+        self.settings_without_resolution: set = set()
+
+        self.live_fields_uncounted: set = set()
+        self.unresolved_vdbs: set = set()
+        self.vdb_files_skipped: set = set()
+        self.vdb_files_failed: set = set()
+        self.seconds = 0.0
+        self.part_seconds: dict = {"volumes": 0.0, "textures": 0.0,
+                                   "geometry": 0.0, "framebuffer": 0.0}
+
+        # Cached per-node and per-file grid tables, so a stage referencing the
+        # same SOP or the same .vdb from several fields pays once.
+        self._sop_grids: dict = {}
+        self._file_grids: dict = {}
+        self._reader = None                   # temporary geo/file SOP pair
+
+    # -- reading ----------------------------------------------------------
+
+    def _value(self, attr):
+        """An attribute's value at the inspected frame.
+
+        Everything the scan reads goes through here, and through the same
+        :func:`_attr_value` the live-volume and missing-asset scans use, so the
+        three can never disagree about which moment they are describing.
+        """
+        return _attr_value(attr, self._tc)
+
+    # -- volumes ----------------------------------------------------------
+
+    def _sop_grid_table(self, node_path: str) -> dict:
+        if node_path in self._sop_grids:
+            return self._sop_grids[node_path]
+        table: dict = {}
+        node = hou.node(node_path) if hou is not None else None
+        if node is not None:
+            try:
+                table = _vdb_grids(node.geometry())
+            except Exception:
+                table = {}
+        self._sop_grids[node_path] = table
+        return table
+
+    def _file_grid_table(self, path: str) -> dict:
+        """Grid table for a ``.vdb`` on disk, read through a temporary File SOP.
+
+        There is **no ``pyopenvdb`` under hython** (checked on 22.0.368), so a
+        .vdb cannot be opened directly from Python. A File SOP can, and its
+        ``activeVoxelCount()`` matches the writing SOP exactly -- but it is a
+        real file read: measured at roughly 320-350 MB/s (a 140 MB grid took
+        0.39 s), and it holds that grid in memory while it is counted. That is
+        why this part is separately switchable through ``count_vdb_files``.
+        """
+        key = os.path.normcase(path)
+        if key in self._file_grids:
+            return self._file_grids[key]
+        table: dict = {}
+        try:
+            if self._reader is None:
+                parent = hou.node("/obj")
+                if parent is None:
+                    raise RuntimeError("no /obj to build a reader in")
+                container = parent.createNode("geo", "hsl_tmp_vdb_probe")
+                self._reader = (container, container.createNode("file"))
+            container, reader = self._reader
+            reader.parm("file").set(path)
+            table = _vdb_grids(reader.geometry())
+        except Exception:
+            self.vdb_files_failed.add(path)
+            table = {}
+        self._file_grids[key] = table
+        return table
+
+    def close(self) -> None:
+        """Drop the temporary File SOP, releasing whatever grid it still holds."""
+        if self._reader is None:
+            return
+        container, reader = self._reader
+        try:
+            reader.parm("file").set("")     # release the last grid's memory
+        except Exception:
+            pass
+        try:
+            container.destroy()
+        except Exception:
+            pass
+        self._reader = None
+
+    def _scan_volumes(self, stage) -> None:
+        if UsdVol is None:
+            return
+        self.volumes_ran = True
+        for prim in stage.Traverse():
+            if prim.IsA(UsdVol.Volume):
+                self.volumes.add(str(prim.GetPath()))
+            if not prim.IsA(UsdVol.OpenVDBAsset):
+                continue
+            path = str(prim.GetPath())
+            if path in self.fields:
+                continue
+            self.fields.add(path)
+
+            asset = UsdVol.OpenVDBAsset(prim)
+            value = self._value(asset.GetFilePathAttr())
+            raw = (getattr(value, "path", "") or "") if value is not None else ""
+            resolved = ((getattr(value, "resolvedPath", "") or "")
+                        if value is not None else "")
+
+            field_name = str(self._value(asset.GetFieldNameAttr())
+                             or prim.GetName())
+
+            # The grid's own value size. Authored on SOP-imported fields;
+            # measured empty on a Volume LOP, where the .vdb itself answers.
+            data_type = str(self._value(asset.GetFieldDataTypeAttr()) or "")
+            shape = _value_type_shape(data_type)
+            width = (shape[0] * shape[1]) if shape else None
+
+            node_path = _op_node_path(raw)
+            if node_path:
+                # Live, but referenced: `op:` points back at the SOP holding
+                # the grid, which the stage cook has already cooked.
+                table = self._sop_grid_table(node_path)
+            elif resolved and os.path.isfile(resolved):
+                self.volume_files.add(os.path.normcase(os.path.abspath(resolved)))
+                if not self.count_vdb_files:
+                    self.vdb_files_skipped.add(resolved)
+                    continue
+                table = self._file_grid_table(resolved)
+            elif raw:
+                # Authored but the resolver could not find it: a missing VDB,
+                # which scan_missing_assets reports as such. Nothing to count.
+                self.unresolved_vdbs.add(path)
+                continue
+            else:
+                # A live field with no on-disk .vdb and no op: reference back
+                # to a SOP -- the flavour scan_live_volumes() reports. Nothing
+                # here can count it, so say so rather than contribute 0.
+                self.live_fields_uncounted.add(path)
+                continue
+
+            entry = table.get(field_name)
+            if entry is None and len(table) == 1:
+                # A single-grid file whose grid name differs from the USD
+                # field name (a Volume LOP names the prim, not the grid).
+                entry = next(iter(table.values()))
+            if entry is None:
+                self.live_fields_uncounted.add(path)
+                continue
+
+            count, file_width = entry
+            self.active_voxels += count
+            self.fields_counted += 1
+            per_voxel = width if width is not None else file_width
+            if per_voxel is None:
+                self.voxel_width_missing += 1
+            else:
+                self.voxel_bytes += count * per_voxel
+
+    # -- textures ---------------------------------------------------------
+
+    def _add_texture(self, prim, attr, asset) -> None:
+        if asset is None:
+            return
+        path = getattr(asset, "path", "") or ""
+        resolved = getattr(asset, "resolvedPath", "") or ""
+        if not path or not resolved:
+            return                          # unresolved: a missing asset
+        if resolved.startswith("op:") or path.startswith("op:"):
+            return                          # live Houdini data, not a file
+        # A volume's own .vdb is counted in the volume terms; letting it also
+        # land here would double it into `heaviest` and make a cached sim look
+        # like a texture problem.
+        if UsdVol is not None and prim.IsA(UsdVol.OpenVDBAsset) \
+                and attr.GetName() == "filePath":
+            return
+        key = os.path.normcase(os.path.abspath(resolved))
+        if key in self.textures:
+            return
+        try:
+            self.textures[key] = os.path.getsize(resolved)
+        except OSError:
+            # Resolved but unreadable -- a permission or a stale mount. Not a
+            # missing asset (the resolver found it), so it is its own gap.
+            self.texture_unstattable += 1
+
+    def _scan_textures(self, stage) -> None:
+        if Sdf is None:
+            return
+        self.textures_ran = True
+        for prim in stage.Traverse():
+            for attr in prim.GetAttributes():
+                type_name = attr.GetTypeName()
+                if type_name == Sdf.ValueTypeNames.Asset:
+                    self._add_texture(prim, attr, self._value(attr))
+                elif type_name == Sdf.ValueTypeNames.AssetArray:
+                    for asset in (self._value(attr) or []):
+                        self._add_texture(prim, attr, asset)
+
+    # -- geometry ---------------------------------------------------------
+
+    def _scan_geometry(self, stage) -> None:
+        """Points, geometry prims and instances authored on the stage.
+
+        ``prim_count`` is **renderable geometry prims** -- meshes, curves,
+        point clouds and the quadrics -- not the total number of prims on the
+        stage, and not polygons. Volumes and point instancers are excluded
+        because they have their own terms, so the three never overlap.
+
+        This is the part that has to materialise arrays: USD offers no way to
+        ask an attribute how long it is without fetching it, so a point count
+        costs reading the points. That is the second-most expensive part of
+        the scan after opening .vdb files.
+        """
+        if UsdGeom is None:
+            return
+        self.geometry_ran = True
+        for prim in stage.Traverse():
+            path = str(prim.GetPath())
+
+            if prim.IsA(UsdGeom.PointInstancer):
+                if path in self.instancers:
+                    continue
+                self.instancers.add(path)
+                # Instances are counted, deliberately **not** weighted by what
+                # they instance: the same million instances are nearly free on
+                # one delegate and ruinous on another, and a weighting here
+                # would be an invented constant.
+                indices = self._value(
+                    UsdGeom.PointInstancer(prim).GetProtoIndicesAttr())
+                if indices is None:
+                    self.instancer_reads_failed += 1
+                else:
+                    self.instance_count += len(indices)
+                continue
+
+            if not prim.IsA(UsdGeom.Gprim):
+                continue
+            # A UsdVolVolume **is** a Gprim (checked on 22.0.368 -- Volume,
+            # Mesh, Points, Sphere and BasisCurves all answer IsA(Gprim) true,
+            # while PointInstancer does not). Counting it here as well as in
+            # volume_count would report one volume twice under two headings,
+            # so the three geometry terms are kept a clean partition:
+            # geometry prims, volumes, instancers.
+            if UsdVol is not None and prim.IsA(UsdVol.Volume):
+                continue
+            if path in self.gprims:
+                continue
+            self.gprims.add(path)
+
+            if not prim.IsA(UsdGeom.PointBased):
+                continue                    # a Sphere/Cube has no point array
+            points = self._value(UsdGeom.PointBased(prim).GetPointsAttr())
+            if points is None:
+                self.point_arrays_failed += 1
+            else:
+                self.point_count += len(points)
+
+    # -- framebuffer ------------------------------------------------------
+
+    def _scan_framebuffer(self, stage) -> None:
+        if UsdRender is None:
+            return
+        self.framebuffer_ran = True
+        for prim in stage.Traverse():
+            if not prim.IsA(UsdRender.Settings):
+                continue
+            path = str(prim.GetPath())
+            if path in self.settings_seen:
+                continue
+            self.settings_seen.add(path)
+
+            settings = UsdRender.Settings(prim)
+            resolution = self._value(settings.GetResolutionAttr())
+            if resolution is None or len(resolution) < 2:
+                self.settings_without_resolution.add(path)
+                continue
+            width, height = int(resolution[0]), int(resolution[1])
+
+            for product_path in _targets(settings.GetProductsRel()):
+                product_prim = stage.GetPrimAtPath(product_path)
+                if not product_prim or not product_prim.IsValid():
+                    continue
+                for var_path in _targets(
+                        UsdRender.Product(product_prim).GetOrderedVarsRel()):
+                    var_prim = stage.GetPrimAtPath(var_path)
+                    if not var_prim or not var_prim.IsValid():
+                        continue
+                    data_type = str(
+                        self._value(UsdRender.Var(var_prim).GetDataTypeAttr()) or "")
+                    shape = _value_type_shape(data_type)
+                    if shape is None:
+                        # An unrecognised width would be a guess multiplied by
+                        # a few million pixels. Record it instead.
+                        self.unknown_var_types.add(
+                            f"{var_path} ({data_type or 'no dataType'})")
+                        continue
+                    channels, per_channel = shape
+                    self.framebuffer_bytes += width * height * channels * per_channel
+                    self.vars_sized += 1
+
+    # -- driver -----------------------------------------------------------
+
+    def scan(self, stage) -> None:
+        """Add one composed stage's contents to the running totals."""
+        for name, part in (("volumes", self._scan_volumes),
+                           ("textures", self._scan_textures),
+                           ("geometry", self._scan_geometry),
+                           ("framebuffer", self._scan_framebuffer)):
+            start = time.time()
+            part(stage)
+            self.part_seconds[name] += time.time() - start
+            self.seconds += time.time() - start
+
+    def result(self) -> SceneFootprint:
+        """Freeze the totals into a :class:`SceneFootprint`.
+
+        Every gap becomes a sentence in ``skipped``. ``None`` is used only for
+        "not measured" -- a term that was measured and came to nothing stays 0,
+        because "this scene has no volumes" and "nobody counted the volumes"
+        are answers a farm decision turns on.
+        """
+        skipped: list = []
+
+        if self.unresolved_vdbs:
+            skipped.append(
+                f"{len(self.unresolved_vdbs)} OpenVDB field(s) name a .vdb the "
+                f"resolver could not find, so their voxels are not counted: "
+                f"{_sample(self.unresolved_vdbs)}. These are missing assets -- "
+                f"see manifest.missing_assets."
+            )
+        if self.live_fields_uncounted:
+            skipped.append(
+                f"{len(self.live_fields_uncounted)} OpenVDB field(s) carry no "
+                f"on-disk .vdb and no op: reference back to a SOP, so their "
+                f"active voxels could not be counted: "
+                f"{_sample(self.live_fields_uncounted)}. Their voxels are NOT "
+                f"included in the volume figures above."
+            )
+        if self.vdb_files_skipped:
+            skipped.append(
+                f"{len(self.vdb_files_skipped)} on-disk .vdb file(s) were not "
+                f"opened because VDB file counting was switched off, so their "
+                f"active voxels are not included: "
+                f"{_sample(self.vdb_files_skipped)}."
+            )
+        if self.vdb_files_failed:
+            skipped.append(
+                f"{len(self.vdb_files_failed)} .vdb file(s) could not be read "
+                f"to count their voxels: {_sample(self.vdb_files_failed)}."
+            )
+        if self.voxel_width_missing:
+            skipped.append(
+                f"{self.voxel_width_missing} volume field(s) were counted in "
+                f"active voxels but their grid value size was not recognised, "
+                f"so they contribute to the voxel count and NOT to the byte "
+                f"figure."
+            )
+        if self.texture_unstattable:
+            skipped.append(
+                f"{self.texture_unstattable} asset file(s) resolved but could "
+                f"not be measured on disk (permission, or a stale mount), so "
+                f"their bytes are missing from the texture total."
+            )
+        if self.volume_files:
+            skipped.append(
+                f"{len(self.volume_files)} .vdb file(s) referenced as volume "
+                f"data are counted in the volume figures, not in the texture "
+                f"figures, so the two never double-count the same bytes."
+            )
+        if self.point_arrays_failed:
+            skipped.append(
+                f"{self.point_arrays_failed} geometry prim(s) had a points "
+                f"attribute that could not be read, so their points are "
+                f"missing from the point count."
+            )
+        if self.instancer_reads_failed:
+            skipped.append(
+                f"{self.instancer_reads_failed} point instancer(s) would not "
+                f"report their instance count, so their instances are missing "
+                f"from the instance total."
+            )
+        if self.settings_without_resolution:
+            skipped.append(
+                f"{len(self.settings_without_resolution)} render settings "
+                f"prim(s) author no resolution, so their products contribute "
+                f"nothing to the framebuffer figure: "
+                f"{_sample(self.settings_without_resolution)}."
+            )
+        if self.unknown_var_types:
+            skipped.append(
+                f"{len(self.unknown_var_types)} render var(s) have a data type "
+                f"this build could not size, so they are missing from the "
+                f"framebuffer figure: {_sample(self.unknown_var_types)}."
+            )
+        if self.framebuffer_ran and not self.settings_seen:
+            skipped.append(
+                "The stage declares no UsdRenderSettings prim, so there was no "
+                "resolution to size a framebuffer from. That is why the "
+                "framebuffer figure is 'not measured' rather than zero."
+            )
+        if len(self.settings_seen) > 1:
+            skipped.append(
+                f"The framebuffer figure sums all {len(self.settings_seen)} "
+                f"render settings prims on the stage, not one render: "
+                f"{_sample(self.settings_seen)}. A single render pays only its "
+                f"own settings prim's share."
+            )
+
+        # The None/0 ladder, applied the same way to every term:
+        #   never ran            -> None   (nobody looked)
+        #   ran, found nothing   -> 0      (measured, and the answer is none)
+        #   ran, found some but  -> None   (there IS something here and it
+        #   could count none of it         could not be counted; 0 would lie)
+        if not self.volumes_ran:
+            voxels = voxel_bytes = None
+        elif not self.fields:
+            voxels, voxel_bytes = 0, 0
+        elif not self.fields_counted:
+            voxels = voxel_bytes = None
+        else:
+            voxels, voxel_bytes = self.active_voxels, self.voxel_bytes
+
+        if not self.framebuffer_ran or not self.settings_seen:
+            framebuffer = None
+        elif not self.vars_sized:
+            framebuffer = None
+        else:
+            framebuffer = self.framebuffer_bytes
+
+        return SceneFootprint(
+            volume_count=len(self.volumes),
+            active_voxels=voxels,
+            voxel_bytes=voxel_bytes,
+            texture_count=len(self.textures),
+            texture_bytes=(sum(self.textures.values())
+                           if self.textures_ran else None),
+            point_count=self.point_count if self.geometry_ran else None,
+            prim_count=len(self.gprims) if self.geometry_ran else None,
+            instance_count=self.instance_count if self.geometry_ran else None,
+            framebuffer_bytes=framebuffer,
+            scanned=True,
+            skipped=skipped,
+            seconds=round(self.seconds, 3),
+        )
+
+
+def _sample(items, limit: int = 3) -> str:
+    """Up to ``limit`` of ``items``, sorted, with a count of the remainder."""
+    ordered = sorted(items)
+    shown = ", ".join(ordered[:limit])
+    extra = len(ordered) - limit
+    return shown + (f" (+{extra} more)" if extra > 0 else "")
 
 
 # --------------------------------------------------------------------------
@@ -1453,7 +2174,9 @@ def inspect(hip_path: str, export: bool = False,
             usd_dir: str = "", flatten: bool = False,
             rop_filter: str = "", allow_volume_bake: bool = True,
             export_frames: Optional[tuple] = None,
-            frame: Optional[float] = None) -> SceneManifest:
+            frame: Optional[float] = None,
+            footprint: bool = False,
+            footprint_vdb_files: bool = True) -> SceneManifest:
     """Load a .hip and describe every render ROP in it.
 
     When ``export`` is requested and a ROP's stage contains live volumes (see
@@ -1473,6 +2196,20 @@ def inspect(hip_path: str, export: bool = False,
     ROP frame parms depend on) *and* is passed to each stage cook, so the two
     cannot disagree. Either way ``manifest.inspected_frame`` records the moment
     the description was taken at -- a consumer should never have to guess.
+
+    ``footprint`` additionally counts what the scene *contains* that drives
+    render memory -- volumes, textures, geometry and the framebuffer -- into
+    ``manifest.footprint``. It is **off by default** because it costs real time
+    on a heavy stage: the walk itself is cheap, but reading a point array or
+    opening a .vdb is not. It reuses the stage each ROP has already cooked and
+    never cooks one of its own, so it adds nothing to the dominant cost.
+
+    ``footprint_vdb_files`` (on by default, and meaningless unless ``footprint``
+    is set) controls the one part that reads files: counting the active voxels
+    of an on-disk ``.vdb`` means opening it, at roughly 320-350 MB/s, and
+    holding that grid in memory while it is counted. Switch it off on a shot
+    with very large caches -- the uncounted files are then listed in
+    ``footprint.skipped`` rather than silently reading as zero.
     """
     if hou is None:
         raise RuntimeError("hsl.inspector must be run under hython, not system Python.")
@@ -1532,6 +2269,13 @@ def inspect(hip_path: str, export: bool = False,
     seen_cameras: dict[str, Camera] = {}
     seen_assets: dict[tuple, MissingAsset] = {}
     seen_volumes: dict[str, LiveVolume] = {}
+    # Fed the stage each ROP has already cooked, so the footprint costs no
+    # extra cook -- which is what makes it affordable on a heavy shot. It reads
+    # at `inspected_frame`, because Houdini authors volume fields as time
+    # samples with no default value: at the wrong time code they read as empty.
+    scan = (_FootprintScan(count_vdb_files=footprint_vdb_files,
+                           time_code=inspected_frame)
+            if footprint else None)
 
     for node in rop_nodes:
         rop = describe_rop(node, warnings)
@@ -1560,11 +2304,28 @@ def inspect(hip_path: str, export: bool = False,
                 seen_vars.setdefault(item.prim_path, item)
             for item in cameras:
                 seen_cameras.setdefault(item.prim_path, item)
-            for asset in scan_missing_assets(stage):
+            # Both scans read at `inspected_frame` for the same reason the
+            # footprint does: Houdini authors asset attributes as time samples
+            # with no default value, so at the default time code a cached .vdb
+            # sequence reads as a live volume and a missing texture reads as
+            # nothing at all (docs/UNVERIFIED.md N10).
+            for asset in scan_missing_assets(stage, time_code=inspected_frame):
                 seen_assets.setdefault((asset.attr_path, asset.asset_path), asset)
-            stage_volumes = scan_live_volumes(stage)
+            stage_volumes = scan_live_volumes(stage, time_code=inspected_frame)
             for volume in stage_volumes:
                 seen_volumes.setdefault(volume.prim_path, volume)
+
+            if scan is not None:
+                # A footprint that cannot be counted must not cost the caller
+                # the manifest it actually asked for.
+                try:
+                    scan.scan(stage)
+                except Exception as exc:            # noqa: BLE001
+                    warnings.append(
+                        f"{node.path()}: the footprint scan failed on this "
+                        f"stage ({exc}), so its contents are missing from "
+                        f"manifest.footprint."
+                    )
 
             # Everything above describes one moment. Say so out loud when
             # another moment would have looked different (TASKS.md T5).
@@ -1583,11 +2344,12 @@ def inspect(hip_path: str, export: bool = False,
                 detail = f" ({fields})" if fields else ""
                 warnings.append(
                     f"{node.path()}: skipped USD export -- {len(stage_volumes)} "
-                    f"live volume(s){detail} have no on-disk VDB "
-                    f"(OpenVDBAsset.filePath empty) and would bake tens of "
-                    f"GB/frame into the export. Render with --engine hython "
-                    f"(no export), cache the volumes to .vdb, or pass "
-                    f"--allow-volume-bake to export anyway."
+                    f"live volume(s){detail} have no on-disk VDB at frame "
+                    f"{inspected_frame:g} (OpenVDBAsset.filePath is empty or an "
+                    f"op: reference to a SOP) and would bake tens of GB/frame "
+                    f"into the export. Render with --engine hython (no export), "
+                    f"cache the volumes to .vdb, or pass --allow-volume-bake to "
+                    f"export anyway."
                 )
             else:
                 usd_name = export_names.get(
@@ -1608,6 +2370,14 @@ def inspect(hip_path: str, export: bool = False,
     manifest.cameras = list(seen_cameras.values())
     manifest.missing_assets = list(seen_assets.values())
     manifest.live_volumes = list(seen_volumes.values())
+    if scan is not None:
+        try:
+            manifest.footprint = scan.result()
+        except Exception as exc:                    # noqa: BLE001
+            warnings.append(f"Could not summarise the scene footprint: {exc}")
+        finally:
+            # Releases the temporary File SOP and whatever VDB it still holds.
+            scan.close()
     # Caches, sims and the non-Solaris ROPs. Failing to describe these must not
     # cost the caller its render manifest, which is what it actually asked for.
     try:
@@ -1897,6 +2667,17 @@ def main(argv=None) -> int:
     parser.add_argument("--allow-volume-bake", action="store_true",
                         help="Export even when live volumes would bake ~GB/frame "
                              "(default: skip the export for such ROPs)")
+    parser.add_argument("--footprint", action="store_true",
+                        help="Also count what the scene contains that drives "
+                             "render memory (volumes, textures, geometry, "
+                             "framebuffer) into manifest.footprint. Off by "
+                             "default: it costs real time on a heavy stage")
+    parser.add_argument("--footprint-no-vdb-files", action="store_true",
+                        help="With --footprint, do not open on-disk .vdb files "
+                             "to count their active voxels. That part reads "
+                             "each file (~320-350 MB/s) and holds the grid in "
+                             "memory; the files it skips are listed in "
+                             "footprint.skipped rather than counted as zero")
     parser.add_argument("--render-direct", action="store_true",
                         help="Render the ROP directly inside hython (0 USD disk space)")
     parser.add_argument("--cook", action="store_true",
@@ -2001,7 +2782,9 @@ def main(argv=None) -> int:
                            allow_volume_bake=args.allow_volume_bake,
                            export_frames=(tuple(args.export_frames)
                                           if args.export_frames else None),
-                           frame=args.frame)
+                           frame=args.frame,
+                           footprint=args.footprint,
+                           footprint_vdb_files=not args.footprint_no_vdb_files)
     except Exception:
         # The launcher parses stdout as JSON, so failures must be structured.
         error = {"schema_version": 0, "error": traceback.format_exc()}

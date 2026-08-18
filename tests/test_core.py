@@ -36,7 +36,7 @@ from hsl.husk import (
 from hsl.manifest import (
     TASK_CACHE, TASK_RENDER, TASK_SIM, TASK_UNKNOWN, Camera, LiveVolume,
     MissingAsset, OutputTask, RenderProduct, RenderRop, RenderSettings,
-    RenderVar, SceneManifest,
+    RenderVar, SceneFootprint, SceneManifest,
 )
 from hsl.progress import (
     eta_seconds, format_eta, queue_progress_summary, task_progress_text,
@@ -2362,6 +2362,52 @@ class TestQueueMemoryMeasurement(unittest.TestCase):
         self.assertEqual(queue.tasks[0].state, State.FAILED)
         self.assertEqual(len(seen), 1)
 
+    def test_what_the_scene_contained_is_filed_beside_what_it_used(self):
+        """Groundwork for TASKS.md T10.
+
+        A peak on its own cannot answer "will this *other* scene fit"; the
+        scene facts that went with it are what a future calibration would be
+        fitted to. If the footprint is dropped here it is gone for good --
+        the render it described has already happened."""
+        filed = []
+        original = memlog.record
+        memlog.record = filed.append
+        self.addCleanup(setattr, memlog, "record", original)
+
+        manifest = SceneManifest(hip_path=os.path.join(self.dir, "shot.hip"),
+                                 footprint=SceneFootprint(
+                                     active_voxels=5000, voxel_bytes=20000,
+                                     texture_bytes=99, scanned=True))
+        job = self._job()
+        job.footprint = manifest.footprint
+        queue = RenderQueue([job])
+        queue.start(block=True)
+
+        self.assertTrue(filed, "nothing was recorded at all")
+        self.assertEqual(filed[0].active_voxels, 5000)
+        self.assertEqual(filed[0].voxel_bytes, 20000)
+        self.assertEqual(filed[0].texture_bytes, 99)
+
+    def test_a_scene_that_was_never_scanned_still_records_its_peak(self):
+        # The footprint is optional; a render measured without one is still
+        # worth keeping, just with nothing to correlate it against.
+        filed = []
+        original = memlog.record
+        memlog.record = filed.append
+        self.addCleanup(setattr, memlog, "record", original)
+        queue = RenderQueue([self._job()])       # job.footprint is None
+        queue.start(block=True)
+        self.assertTrue(filed)
+        self.assertIsNone(filed[0].active_voxels)
+
+    def test_jobs_carry_their_own_scenes_footprint(self):
+        # A batch queue holds jobs from several scenes at once, so the
+        # footprint has to travel on the job, not on the queue.
+        manifest = sample_manifest()
+        manifest.footprint = SceneFootprint(active_voxels=7, scanned=True)
+        jobs = jobs_for_rop(manifest, manifest.rops[0], "/tmp/s.usd")
+        self.assertTrue(all(j.footprint is manifest.footprint for j in jobs))
+
     def test_a_cancelled_render_is_not_measured(self):
         # We cut it short, so its peak says nothing about what the scene needs.
         seen = []
@@ -3865,6 +3911,314 @@ class TestTreeMemoryReporting(unittest.TestCase):
         code, out = self._run(["memory", "--machine"])
         self.assertEqual(code, 0)
         self.assertIn("whole-tree RAM", out)
+
+
+class TestSceneFootprint(unittest.TestCase):
+    """SceneFootprint: what a scene CONTAINS, never a predicted memory total.
+    See its docstring in hsl/manifest.py -- these tests hold the CONSUMERS to
+    that contract, not the dataclass itself (owned elsewhere)."""
+
+    def test_footprint_round_trips_through_json(self):
+        m = sample_manifest()
+        m.footprint = SceneFootprint(
+            volume_count=2, active_voxels=1_000_000, voxel_bytes=4_000_000,
+            texture_count=5, texture_bytes=200_000_000,
+            point_count=50000, prim_count=120, instance_count=3000,
+            framebuffer_bytes=33177600, scanned=True,
+            skipped=["texture at /mat/broken.exr: file not found"],
+            seconds=4.2,
+        )
+        restored = SceneManifest.from_json(m.to_json())
+        self.assertIsInstance(restored.footprint, SceneFootprint)
+        self.assertEqual(restored.footprint.volume_count, 2)
+        self.assertEqual(restored.footprint.voxel_bytes, 4_000_000)
+        self.assertEqual(restored.footprint.texture_bytes, 200_000_000)
+        self.assertEqual(restored.footprint.point_count, 50000)
+        self.assertEqual(restored.footprint.framebuffer_bytes, 33177600)
+        self.assertEqual(restored.footprint.skipped,
+                         ["texture at /mat/broken.exr: file not found"])
+        self.assertEqual(restored.footprint.seconds, 4.2)
+
+    def test_a_v3_manifest_with_no_footprint_key_loads_as_none_not_empty(self):
+        # v3 predates SceneFootprint entirely. None here has to mean "nobody
+        # scanned this scene" -- an empty SceneFootprint() would instead read
+        # as "scanned, and found nothing", which is a different, false claim.
+        data = json.loads(sample_manifest().to_json())
+        data.pop("footprint", None)
+        data["schema_version"] = 3
+        restored = SceneManifest.from_json(json.dumps(data))
+        self.assertIsNone(restored.footprint)
+
+    def test_heaviest_picks_the_largest_known_term(self):
+        fp = SceneFootprint(voxel_bytes=10, texture_bytes=1000,
+                            framebuffer_bytes=500)
+        self.assertEqual(fp.heaviest, "textures on disk")
+
+    def test_heaviest_is_empty_string_when_nothing_is_known(self):
+        # Not "unknown", not a KeyError -- an empty string a caller can test
+        # for truthiness against, same as every other "nothing here" value
+        # in this codebase.
+        self.assertEqual(SceneFootprint().heaviest, "")
+
+    def test_heaviest_treats_a_measured_zero_like_unmeasured(self):
+        # heaviest filters on truthiness, so an explicit 0 (genuinely no
+        # voxels) drops out of the running the same as a None would -- there
+        # is nothing heavy to report for that term either way.
+        fp = SceneFootprint(voxel_bytes=0, texture_bytes=500)
+        self.assertEqual(fp.heaviest, "textures on disk")
+
+
+class TestFootprintCli(unittest.TestCase):
+    """`hsl inspect --footprint`: the flag reaching the inspector argv, and
+    the report never turning an unmeasured None into a misleading 0."""
+
+    def _capture_argv(self, **kwargs):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        hip = os.path.join(d, "s.hip")
+        with open(hip, "w") as fh:
+            fh.write("x")
+        captured = {}
+
+        def fake_run(cmd, **run_kwargs):
+            captured["cmd"] = list(cmd)
+            json_path = cmd[cmd.index("--json") + 1]
+            with open(json_path, "w") as fh:
+                fh.write(SceneManifest(hip_path=hip).to_json())
+
+            class Result:
+                returncode, stdout, stderr = 0, "", ""
+            return Result()
+
+        original_run = bridge.subprocess.run
+        original_find = bridge.find_hython
+        bridge.subprocess.run = fake_run
+        bridge.find_hython = lambda *a, **k: "hython-stand-in"
+        try:
+            bridge.inspect_hip(hip, export_usd=False, **kwargs)
+        finally:
+            bridge.subprocess.run = original_run
+            bridge.find_hython = original_find
+        return captured["cmd"]
+
+    def test_footprint_flag_reaches_the_inspector_argv(self):
+        cmd = self._capture_argv(footprint=True)
+        self.assertIn("--footprint", cmd)
+
+    def test_no_footprint_means_no_flag(self):
+        cmd = self._capture_argv()
+        self.assertNotIn("--footprint", cmd)
+
+    def test_inspect_parser_takes_footprint(self):
+        args = build_parser().parse_args(["inspect", "s.hip", "--footprint"])
+        self.assertTrue(args.footprint)
+        self.assertFalse(
+            build_parser().parse_args(["inspect", "s.hip"]).footprint)
+
+    def _inspect(self, manifest):
+        original = bridge.inspect_hip
+        bridge.inspect_hip = lambda *a, **k: manifest
+        self.addCleanup(setattr, bridge, "inspect_hip", original)
+        args = build_parser().parse_args(["inspect", "s.hip", "--footprint"])
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            cmd_inspect(args)
+        return out.getvalue()
+
+    def test_cmd_inspect_forwards_the_footprint_flag_to_the_bridge(self):
+        captured = {}
+        original = bridge.inspect_hip
+
+        def fake(*args, **kwargs):
+            captured.update(kwargs)
+            return sample_manifest()
+
+        bridge.inspect_hip = fake
+        self.addCleanup(setattr, bridge, "inspect_hip", original)
+        args = build_parser().parse_args(["inspect", "s.hip", "--footprint"])
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            cmd_inspect(args)
+        self.assertTrue(captured.get("footprint"))
+
+    def test_unmeasured_fields_print_as_unknown_not_zero(self):
+        m = sample_manifest()
+        m.footprint = SceneFootprint(scanned=True)   # every Optional[int] None
+        out = self._inspect(m)
+        self.assertIn("unknown", out)
+        # None must never masquerade as a literal 0 anywhere in the report.
+        self.assertNotIn("0 active voxel", out)
+        self.assertNotIn("0 point(s)", out)
+        self.assertNotIn("0 prim(s)", out)
+        self.assertNotIn("0 point-instancer instance(s)", out)
+
+    def test_heaviest_headline_and_skipped_gaps_are_both_reported(self):
+        m = sample_manifest()
+        m.footprint = SceneFootprint(
+            voxel_bytes=50 * 1024 ** 3, texture_bytes=1024,
+            skipped=["texture at /mat/broken.exr: file not found"],
+            seconds=2.5,
+        )
+        out = self._inspect(m)
+        self.assertIn("heaviest: volume data", out)
+        # A gap the user cannot see is worse than no scan -- it must be
+        # printed, not swallowed into a plain byte count.
+        self.assertIn("texture at /mat/broken.exr: file not found", out)
+
+    def test_no_footprint_section_when_nothing_was_scanned(self):
+        out = self._inspect(sample_manifest())     # footprint stays None
+        self.assertNotIn("scene footprint", out)
+
+
+class TestFootprintPreflight(unittest.TestCase):
+    """Preflight's footprint checks fire only on the two terms that are safe
+    to compare directly against a number -- framebuffer_bytes (exact
+    arithmetic) and voxel_bytes (a documented lower bound) -- never on a
+    predicted total, and never at all with no footprint."""
+
+    def setUp(self):
+        original_ram = sysinfo.total_ram_bytes
+        self.addCleanup(setattr, sysinfo, "total_ram_bytes", original_ram)
+
+    def _set_ram(self, value):
+        sysinfo.total_ram_bytes = lambda: value
+
+    def _hits(self, manifest):
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        return [w for w in preflight.run_preflight_checks(job, manifest)
+               if w.category == "footprint"]
+
+    def test_silent_when_manifest_has_no_footprint(self):
+        self._set_ram(16 * 1024 ** 3)
+        m = sample_manifest()
+        self.assertIsNone(m.footprint)
+        self.assertEqual(self._hits(m), [])
+
+    def test_framebuffer_at_the_threshold_warns(self):
+        total = 16 * 1024 ** 3
+        self._set_ram(total)
+        m = sample_manifest()
+        # A hair above the fraction, not exactly on it -- the boundary itself
+        # is a float multiply and not worth chasing to the byte.
+        m.footprint = SceneFootprint(
+            framebuffer_bytes=int(total * preflight._FOOTPRINT_FRAMEBUFFER_WARN_FRACTION) + 1)
+        hits = self._hits(m)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "warning")
+        self.assertIn("exact", hits[0].message)
+
+    def test_framebuffer_well_under_the_threshold_says_nothing(self):
+        self._set_ram(16 * 1024 ** 3)
+        m = sample_manifest()
+        m.footprint = SceneFootprint(framebuffer_bytes=10 * 1024 ** 2)  # 10 MB
+        self.assertFalse(any(w.message for w in self._hits(m)
+                             if "Framebuffer" in w.message))
+
+    def test_voxel_bytes_over_installed_ram_is_an_error(self):
+        self._set_ram(16 * 1024 ** 3)
+        m = sample_manifest()
+        m.footprint = SceneFootprint(voxel_bytes=32 * 1024 ** 3)
+        hits = self._hits(m)
+        errors = [w for w in hits if w.level == "error"]
+        self.assertEqual(len(errors), 1)
+        # A lower bound, not a total -- the message has to say so.
+        self.assertIn("lower bound", errors[0].message)
+        self.assertIn("least", errors[0].message)
+
+    def test_voxel_bytes_under_installed_ram_is_not_an_error(self):
+        self._set_ram(64 * 1024 ** 3)
+        m = sample_manifest()
+        m.footprint = SceneFootprint(voxel_bytes=1 * 1024 ** 3)
+        errors = [w for w in self._hits(m) if w.level == "error"]
+        self.assertEqual(errors, [])
+
+    def test_skipped_entries_become_info_not_warnings_or_errors(self):
+        self._set_ram(16 * 1024 ** 3)
+        m = sample_manifest()
+        m.footprint = SceneFootprint(
+            skipped=["volume at /obj/pyro/vol1: field data unreadable"])
+        hits = self._hits(m)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "info")
+        self.assertIn("field data unreadable", hits[0].message)
+
+    def test_no_ram_reading_suppresses_the_ram_comparisons_but_not_skipped(self):
+        # Without an installed-RAM figure there is nothing honest to compare
+        # framebuffer/voxel bytes against, but a skipped-scan gap is still
+        # worth reporting regardless of what this machine can measure.
+        self._set_ram(None)
+        m = sample_manifest()
+        m.footprint = SceneFootprint(
+            framebuffer_bytes=999 * 1024 ** 3, voxel_bytes=999 * 1024 ** 3,
+            skipped=["texture at /mat/x.exr: unreadable"])
+        hits = self._hits(m)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "info")
+
+
+class TestMemlogFootprintFields(unittest.TestCase):
+    """memlog additions that pair what a scene CONTAINED with what its
+    render actually USED -- groundwork for a future calibrated estimate,
+    not read by anything yet."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        original = memlog.LOG_FILE
+        memlog.LOG_FILE = os.path.join(tmpdir.name, "memory.json")
+        self.addCleanup(setattr, memlog, "LOG_FILE", original)
+
+    def test_footprint_fields_of_none_is_an_empty_dict(self):
+        # A caller that always calls this should never need an extra branch
+        # for the "nothing was scanned this run" case.
+        self.assertEqual(memlog.footprint_fields(None), {})
+
+    def test_footprint_fields_extracts_the_documented_subset(self):
+        fp = SceneFootprint(volume_count=1, active_voxels=42, voxel_bytes=99,
+                            texture_count=3, texture_bytes=123,
+                            point_count=7, prim_count=8, instance_count=9,
+                            framebuffer_bytes=456)
+        fields = memlog.footprint_fields(fp)
+        self.assertEqual(fields, {
+            "active_voxels": 42, "voxel_bytes": 99, "texture_bytes": 123,
+            "point_count": 7, "framebuffer_bytes": 456,
+        })
+        # prim_count/instance_count/volume_count/texture_count are not part
+        # of MemorySample's schema and must not leak through.
+        self.assertNotIn("prim_count", fields)
+        self.assertNotIn("instance_count", fields)
+
+    def test_footprint_fields_feed_straight_into_a_memory_sample(self):
+        fp = SceneFootprint(active_voxels=1, voxel_bytes=2, texture_bytes=3,
+                            point_count=4, framebuffer_bytes=5)
+        sample = memlog.MemorySample(hip_path="/s.hip", rop_path="/r",
+                                     peak_rss=1024, **memlog.footprint_fields(fp))
+        memlog.record(sample)
+        recorded = memlog.history("/s.hip", "/r")[0]
+        self.assertEqual(recorded.active_voxels, 1)
+        self.assertEqual(recorded.voxel_bytes, 2)
+        self.assertEqual(recorded.texture_bytes, 3)
+        self.assertEqual(recorded.point_count, 4)
+        self.assertEqual(recorded.framebuffer_bytes, 5)
+
+    def test_an_old_memlog_record_without_footprint_fields_still_loads(self):
+        # Additive schema change, same discipline manifest.py documents: an
+        # old row simply lacks these keys, and every one must default to
+        # None -- "never recorded", not "measured as zero".
+        os.makedirs(os.path.dirname(memlog.LOG_FILE), exist_ok=True)
+        with open(memlog.LOG_FILE, "w", encoding="utf-8") as fh:
+            json.dump([{"hip_path": "/j/old.hip", "rop_path": "/out/rop1",
+                        "engine": "husk", "frames": 4, "peak_rss": 1234,
+                        "peak_vram": None, "vram_sampled": False,
+                        "when": 10.0, "houdini": "20.5.370"}], fh)
+        loaded = memlog.history()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].peak_rss, 1234)
+        self.assertIsNone(loaded[0].active_voxels)
+        self.assertIsNone(loaded[0].voxel_bytes)
+        self.assertIsNone(loaded[0].texture_bytes)
+        self.assertIsNone(loaded[0].point_count)
+        self.assertIsNone(loaded[0].framebuffer_bytes)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,8 @@ and pass the result through the manifest.
 | `hsl/husk.py` | plain Python | no | yes |
 | `hsl/runner.py` | plain Python | no | yes (fake husk) |
 | `hsl/progress.py` | plain Python | no | yes |
+| `hsl/sysinfo.py` | plain Python | no | partially — platform-specific |
+| `hsl/memlog.py` | plain Python | no | yes |
 | `hsl/ui.py` | plain Python + Qt | no | import-check only |
 | `hsl/cli.py` | plain Python | no | yes |
 
@@ -75,6 +77,13 @@ and pass the result through the manifest.
 6. **Qt work happens on the Qt thread.** `RenderQueue` callbacks arrive on
    worker threads; they must cross into the UI through `QueueBridge` signals,
    never by touching a widget directly.
+7. **Measure, do not predict.** Memory figures are recorded from renders that
+   really ran (`hsl/sysinfo.py`, `hsl/memlog.py`). An unmeasured value is
+   `None` and prints `unknown` — never `0`, and never a modelled estimate.
+   `SceneFootprint` reports what a scene *contains*, each number labelled with
+   exactly what it counts; it deliberately has no "total memory needed" field,
+   because that number would rest on constants nobody publishes and would be
+   planned around anyway.
 
 ## Conventions
 

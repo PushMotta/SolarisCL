@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import sys
+import textwrap
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,7 +23,10 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import bridge, farm, husk as husk_mod, preflight, presets, progress, resources
+from . import (
+    bridge, farm, husk as husk_mod, memlog, preflight, presets, progress,
+    resources, sysinfo,
+)
 from .manifest import TASK_RENDER, RenderRop, SceneManifest
 from .runner import RenderQueue, State, Task
 
@@ -40,16 +45,24 @@ APP_USER_MODEL_ID = "PushMotta.SolarisCL.Launcher"
 # --------------------------------------------------------------------------
 
 class InspectWorker(QObject):
+    """Reads one .hip under hython, off the Qt thread.
+
+    ``footprint`` asks the inspector to also count what the scene contains.
+    That scan walks the whole stage, so it belongs here for the same reason
+    the read itself does: on a heavy shot it takes long enough that doing it
+    on the Qt thread would freeze the window.
+    """
     finished = Signal(object)   # SceneManifest
     failed = Signal(str)
 
     def __init__(self, hip_path: str, export_usd: bool, flatten: bool,
-                 hython: str = ""):
+                 hython: str = "", footprint: bool = False):
         super().__init__()
         self.hip_path = hip_path
         self.export_usd = export_usd
         self.flatten = flatten
         self.hython = hython
+        self.footprint = footprint
 
     @Slot()
     def run(self) -> None:
@@ -57,6 +70,7 @@ class InspectWorker(QObject):
             manifest = bridge.inspect_hip(
                 self.hip_path, hython=self.hython,
                 export_usd=self.export_usd, flatten=self.flatten,
+                footprint=self.footprint,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -218,6 +232,211 @@ _STATUS_STYLES = {
 # Rows in the batch list that could not be read. Same red as the error status
 # style, applied to a tree item (which takes a brush, not a stylesheet).
 _ERROR_BRUSH = QBrush(QColor("#F44336"))
+
+
+# --------------------------------------------------------------------------
+# Measured facts, formatted for the detail box
+# --------------------------------------------------------------------------
+#
+# Two things get shown there, and neither is a prediction: what a past render
+# of this scene and ROP actually *used* (hsl.memlog), and what the scene
+# *contains* (SceneManifest.footprint). They are never added together. A
+# "memory needed" total would depend on the delegate, the Houdini build and
+# texture-cache budgets nobody publishes -- it would be an invented number that
+# someone would then plan a farm around, which is the one thing this refuses to
+# do. Every byte figure goes through sysinfo.human_bytes so an unmeasured one
+# says "unknown" rather than showing up as a plausible 0.
+
+# Label column of a "label   value" row, and how far to wrap under it. The
+# detail box is monospace and roughly half the window wide, so lines are
+# wrapped here rather than left to the widget, which would re-wrap them to the
+# left margin and lose the column.
+_FACT_LABEL = 14
+_FACT_WIDTH = 68
+
+
+def _fact(label: str, value: str) -> list:
+    """One ``label   value`` row, wrapped under the value column."""
+    return textwrap.wrap(
+        value, width=_FACT_WIDTH,
+        initial_indent="  %-*s " % (_FACT_LABEL, label),
+        subsequent_indent=" " * (_FACT_LABEL + 3),
+    ) or ["  %-*s %s" % (_FACT_LABEL, label, value)]
+
+
+def _note(text: str) -> list:
+    """An indented paragraph under a block -- the caveat that goes with it."""
+    return textwrap.wrap(text, width=_FACT_WIDTH,
+                         initial_indent="  ", subsequent_indent="  ")
+
+
+def _count(value: Optional[int]) -> str:
+    """A count with thousands separators, or ``unknown`` when unmeasured.
+
+    The counting twin of :func:`sysinfo.human_bytes`: ``None`` means nobody
+    measured it, and printing that as 0 would turn a gap into a fact.
+    """
+    return "unknown" if value is None else format(value, ",")
+
+
+def _qualify(shown: str, value: Optional[int], qualifier: str,
+             missing: str = "") -> str:
+    """``shown`` plus what it means -- but only when there is a number.
+
+    Every figure here needs its qualifier: voxel bytes are a lower bound,
+    texture bytes are on disk rather than in memory, the framebuffer is exact
+    arithmetic. None of that describes a value nobody measured, so an
+    unmeasured one says only that it is unknown.
+    """
+    # ``shown`` is checked too: sysinfo.human_bytes renders 0 as "unknown", and
+    # a qualifier hung off that word would describe nothing.
+    if value is None or shown == "unknown":
+        return missing or "unknown"
+    return shown + " " + qualifier
+
+
+def _measured_when(epoch: float) -> str:
+    """When a measurement was taken. Never raises on a bad timestamp."""
+    if not epoch:
+        return "an earlier run"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
+    except (OSError, OverflowError, ValueError):
+        return "an earlier run"
+
+
+def memory_lines(sample, total_ram: Optional[int]) -> list:
+    """The "Measured (not predicted)" block for one recorded render.
+
+    ``sample`` is a :class:`hsl.memlog.MemorySample` -- the heaviest recorded
+    render of one scene+ROP, not the most recent one, which is why the heading
+    says so. ``None`` yields no lines at all: a scene nobody has rendered yet
+    has nothing honest to say, and a placeholder number would be believed.
+    """
+    if sample is None:
+        return []
+
+    ram = sysinfo.human_bytes(sample.peak_rss)
+    if total_ram:
+        ram += " of %s installed" % sysinfo.human_bytes(total_ram)
+    # A single-process figure and a whole-tree one must never be shown alike.
+    # If the renderer was launched through a wrapper script, the wrapper is all
+    # the old measurement covered -- 8 MB for a render that used 300 MB -- so
+    # the scope is part of the number, not a footnote.
+    if sample.peak_rss_is_tree:
+        ram += ", whole process tree"
+    else:
+        ram += (", main process only -- a lower bound. It covers the process "
+                "hsl started and not the children of a wrapper script, so the "
+                "render itself may have used more.")
+
+    if sample.peak_vram is None:
+        # Never 0: per-process VRAM cannot be read on every card, and a zero
+        # here would read as "this render used no GPU memory".
+        vram = "unknown -- per-process VRAM cannot be read on every GPU"
+    elif sample.vram_sampled:
+        vram = (sysinfo.human_bytes(sample.peak_vram)
+                + ", polled while the render ran, so a shorter spike between "
+                  "polls would have been missed")
+    else:
+        vram = sysinfo.human_bytes(sample.peak_vram)
+
+    taken = _measured_when(sample.when)
+    if sample.frames:
+        taken += ", %d frame(s)" % sample.frames
+    if sample.engine:
+        taken += ", %s engine" % sample.engine
+
+    lines = ["Measured (not predicted) -- the heaviest recorded render of this ROP"]
+    lines += _fact("Peak RAM", ram)
+    lines += _fact("Peak VRAM", vram)
+    lines += _fact("Measured", taken)
+    return lines
+
+
+def footprint_lines(footprint) -> list:
+    """The "Scene weight" block for a :class:`hsl.manifest.SceneFootprint`.
+
+    Each row is labelled with what it actually counts, in the dataclass's own
+    terms -- voxel bytes are the uncompressed voxel data with no renderer
+    overhead, texture bytes are on disk rather than in memory, and only the
+    framebuffer is exact arithmetic. Everything in ``skipped`` is listed in
+    full: a gap the user cannot see is worse than never having scanned.
+
+    ``None`` (nobody scanned) yields nothing.
+    """
+    if footprint is None:
+        return []
+
+    if not footprint.scanned:
+        # A footprint that exists but measured nothing still has to say so,
+        # and still owes the user whatever it could not count.
+        return (["Scene weight -- the scan measured nothing."]
+                + _skipped_lines(footprint))
+
+    # Kept short enough to fit the detail box at the window's default width;
+    # the scan is scene-wide rather than per-ROP, which the closing note says.
+    head = "Scene weight"
+    if footprint.heaviest:
+        head += " -- heaviest is %s" % footprint.heaviest
+    head += ", scanned in %.1f s" % footprint.seconds
+
+    lines = [head]
+    lines += _fact("Volumes", "%d" % footprint.volume_count)
+    if footprint.volume_count:
+        # Each qualifier describes a number, so it is only printed when there
+        # is one. "unknown of voxel data, uncompressed, with no renderer
+        # overhead" explains a figure that is not there.
+        lines += _fact("Active voxels", _qualify(
+            _count(footprint.active_voxels), footprint.active_voxels,
+            "stored -- VDB is sparse, so this is the active set, not the "
+            "bounding-box product"))
+        lines += _fact("Voxel data", _qualify(
+            sysinfo.human_bytes(footprint.voxel_bytes), footprint.voxel_bytes,
+            "-- the voxel data itself, uncompressed, with no renderer "
+            "overhead of any kind. A lower bound on what volumes cost, "
+            "never the whole cost."))
+    lines += _fact("Textures", "%d file(s), %s" % (
+        footprint.texture_count,
+        _qualify(sysinfo.human_bytes(footprint.texture_bytes),
+                 footprint.texture_bytes,
+                 "on disk -- not what they take in memory",
+                 missing="total size on disk unknown")))
+    lines += _fact("Geometry", "%s, %s" % (
+        _qualify(_count(footprint.point_count), footprint.point_count,
+                 "points", missing="point count unknown"),
+        _qualify(_count(footprint.prim_count), footprint.prim_count,
+                 "prims", missing="prim count unknown")))
+    lines += _fact("Instances", _qualify(
+        _count(footprint.instance_count), footprint.instance_count,
+        "point-instancer instances -- counted, deliberately not weighted: a "
+        "delegate may render them nearly free or ruinously"))
+    lines += _fact("Framebuffer", _qualify(
+        sysinfo.human_bytes(footprint.framebuffer_bytes),
+        footprint.framebuffer_bytes,
+        "-- exact arithmetic: width x height x channels x bytes per channel, "
+        "summed over products"))
+    lines += _skipped_lines(footprint)
+    lines.append("")
+    lines += _note("These describe the whole scene, not a single ROP. They are "
+                   "separate facts and not a total: what a render needs depends "
+                   "on the delegate and the Houdini build, so hsl does not add "
+                   "them up.")
+    return lines
+
+
+def _skipped_lines(footprint) -> list:
+    """Everything the scan could not count, listed in full.
+
+    Never trimmed to a count or a first few: a gap the user cannot see is
+    worse than not having scanned, because the rows above it then look
+    complete.
+    """
+    if not footprint.skipped:
+        return []
+    lines = ["", "  Not counted"]
+    lines += ["    %s" % entry for entry in footprint.skipped]
+    return lines
 
 
 @dataclass
@@ -399,8 +618,19 @@ class LauncherWindow(QMainWindow):
             "Collapse all layers into one file. More portable across a farm, "
             "larger on disk."
         )
+        # Off by default: the scan walks every volume, texture and mesh on the
+        # stage, which costs real time on a heavy scene. What it counts appears
+        # under the ROP details, as facts about the scene -- never as a
+        # prediction of what a render will need.
+        self.footprint_check = QCheckBox("Measure scene weight")
+        self.footprint_check.setToolTip(
+            "Count what the scene contains while reading it — volumes and "
+            "voxels, textures, geometry, framebuffer — and show it under the "
+            "ROP details. The scan walks the whole stage, so it adds real time "
+            "on a heavy scene. Leave it off unless you want those numbers.")
         opts_row.addWidget(self.export_usd_check)
         opts_row.addWidget(self.flatten_check)
+        opts_row.addWidget(self.footprint_check)
         opts_row.addStretch(1)
         self.status_label = QLabel("No scene read yet.")
         self.status_label.setStyleSheet(_STATUS_STYLES["muted"])
@@ -495,6 +725,11 @@ class LauncherWindow(QMainWindow):
 
         self.aov_list = QListWidget()
         self.aov_list.setMinimumHeight(96)
+        # Capped like the ROP table above it. Left uncapped, an empty-ish list
+        # still claimed its full size hint and squeezed the detail box below to
+        # about four lines -- which was survivable when that box only repeated
+        # the combos, and is not now that it carries the measured figures.
+        self.aov_list.setMaximumHeight(130)
         aov_layout.addWidget(self.aov_list)
 
         aov_btn_row = QHBoxLayout()
@@ -512,9 +747,14 @@ class LauncherWindow(QMainWindow):
         self.detail.setReadOnly(True)
         self.detail.setFont(QFont(MONO, 9))
         self.detail.setPlaceholderText(_DETAIL_PLACEHOLDER)
-        # Hidden until a ROP is actually described -- it carries the layout's
-        # stretch, so left visible-but-empty it was a large blank box under
-        # the empty-state message above.
+        # It carries the layout's stretch, but stretch only shares out space
+        # left over after every widget's size hint is met -- so a floor is
+        # what actually keeps it readable. Roughly the ROP header plus the
+        # measured-memory block, which is what a reader most needs to see
+        # without scrolling.
+        self.detail.setMinimumHeight(180)
+        # Hidden until a ROP is actually described -- left visible-but-empty it
+        # was a large blank box under the empty-state message above.
         self.detail.setVisible(False)
         layout.addWidget(self.detail, 1)
         return box
@@ -1939,15 +2179,22 @@ class LauncherWindow(QMainWindow):
                                 f"There is no file at:\n{hip_path}")
             return
 
+        want_footprint = self.footprint_check.isChecked()
         if not force_reload:
             cached = bridge.load_cached(hip_path)
-            if cached:
+            # A cached read taken without the scan cannot answer "what does
+            # this scene contain" -- reusing it would leave the ticked box
+            # doing nothing at all, so ask hython instead.
+            if cached and not (want_footprint and cached.footprint is None):
                 self.on_scene_read(cached)
                 self._set_status(f"Loaded cached manifest for {os.path.basename(hip_path)} (Instant).")
                 return
 
         self.read_btn.setEnabled(False)
-        self._set_status("Reading scene in hython. Large scenes take a while…")
+        self._set_status(
+            "Reading scene in hython and measuring what it contains. Large "
+            "scenes take a while…" if want_footprint else
+            "Reading scene in hython. Large scenes take a while…")
 
         self._thread = QThread(self)
         self._worker = InspectWorker(
@@ -1955,6 +2202,7 @@ class LauncherWindow(QMainWindow):
             export_usd=self.export_usd_check.isChecked(),
             flatten=self.flatten_check.isChecked(),
             hython=self.hython_edit.text().strip(),
+            footprint=want_footprint,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -2041,9 +2289,16 @@ class LauncherWindow(QMainWindow):
             self.empty_hint.setVisible(True)
 
         self._set_scene_loaded(bool(manifest.rops))
+        weight = footprint_lines(manifest.footprint)
         if manifest.rops:
             self.detail.setPlaceholderText(_DETAIL_PLACEHOLDER)
             self.on_rop_changed(0)
+        elif weight:
+            # No ROP to describe, but the scan was asked for and did run. Its
+            # result has nowhere else to appear, and a scan whose findings the
+            # user cannot see is worse than not having run it.
+            self.detail.setPlainText("\n".join(weight))
+            self.detail.setVisible(True)
         else:
             # empty_hint already says this, prominently -- repeating it here in
             # grey monospace made the panel look full of nothing. Hide the box
@@ -2270,6 +2525,20 @@ class LauncherWindow(QMainWindow):
             jobs += rop_jobs
         return jobs
 
+    def _measured_lines(self, rop: RenderRop) -> list:
+        """What a past render of this exact scene and ROP peaked at, if any.
+
+        Reads the memory log from disk, which is a small capped JSON file --
+        the same call ``preflight`` already makes on this thread for every
+        command refresh. Nothing recorded means no lines: silence, not a
+        placeholder.
+        """
+        hip = self.manifest.hip_path if self.manifest else ""
+        if not hip:
+            return []
+        return memory_lines(memlog.worst(hip, rop.node_path),
+                            sysinfo.total_ram_bytes())
+
     def _describe(self, rop: RenderRop, settings) -> str:
         m = self.manifest
         lines = [
@@ -2282,6 +2551,17 @@ class LauncherWindow(QMainWindow):
             else f"Frames     {rop.frame_start} (single)",
             "",
         ]
+
+        # Both blocks sit here, high in the panel, because this is where the
+        # decision about what to render is made -- and both are absent unless
+        # something was actually measured, so a scene with no render history
+        # and no scan looks exactly as it did before they existed.
+        measured = self._measured_lines(rop)
+        if measured:
+            lines += measured + [""]
+        weight = footprint_lines(m.footprint if m else None)
+        if weight:
+            lines += weight + [""]
 
         if settings:
             resolution = ("%d × %d" % settings.resolution) if settings.resolution else "—"
@@ -2529,9 +2809,17 @@ class LauncherWindow(QMainWindow):
             if errs:
                 self.preflight_label.setStyleSheet("color: #F44336; font-weight: bold;")
                 self.preflight_label.setText(f"Preflight: {len(errs)} Error(s), {len(warns)} Warning(s).")
-            else:
+            elif warns:
                 self.preflight_label.setStyleSheet("color: #FF9800; font-weight: bold;")
                 self.preflight_label.setText(f"Preflight: {len(warns)} Warning(s) detected.")
+            else:
+                # Info-only findings -- the measured-memory note is one, and is
+                # now the common case for any scene with render history. An
+                # orange "0 Warning(s) detected" over them announced a problem
+                # that preflight had not found.
+                self.preflight_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+                self.preflight_label.setText(
+                    f"Preflight: All checks passed. {len(checks)} note(s) — hover to read.")
             self.preflight_label.setToolTip("\n".join(f"[{w.level.upper()}] {w.message}" for w in checks))
         else:
             self.preflight_label.setStyleSheet("color: #4CAF50; font-weight: bold;")

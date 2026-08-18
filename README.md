@@ -159,6 +159,27 @@ Known limits, deliberately not papered over:
   job killed by the machine running out of memory is the most useful sample
   there is.
 
+### What the scene contains: `inspect --footprint`
+
+```bash
+python -m hsl.cli inspect shot.hip --footprint
+```
+
+This scans volumes, textures and geometry and reports what the scene
+**contains** — active voxel count, voxel bytes (uncompressed, no renderer
+overhead), texture bytes on disk, point/prim/instance counts, and an exact
+framebuffer size (resolution × channels × bytes-per-channel, summed over
+products). It is **not** a memory requirement: what a render actually needs
+depends on the delegate, texture-cache budgets and BVH constants nobody
+publishes, which is exactly why `hsl memory` measures rather than predicts.
+`--footprint` tells you what is *heavy in the scene*, not what it will cost —
+worth checking before a render, not instead of measuring one.
+
+The scan costs real time on a heavy stage, so it only runs when asked. A term
+that could not be counted shows up in the report rather than being folded
+into a number that looks more complete than it is, and anything genuinely
+unmeasured prints as `unknown`, never `0`.
+
 ## Caches and simulations
 
 `hsl` is not only a render launcher: it cooks the rest of a `.hip` headless

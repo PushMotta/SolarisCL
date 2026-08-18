@@ -6,6 +6,8 @@ Performs sanity and environment checks before launching hython or husk processes
   * Output directory existence and write permissions
   * Available disk space
   * Memory: what a past render of this scene+ROP actually used, if known
+  * Scene footprint: facts about what the scene contains (voxels, textures,
+    framebuffer size), if a --footprint scan was run
 """
 
 from __future__ import annotations
@@ -23,6 +25,16 @@ from .manifest import SceneManifest
 # Near-ceiling threshold: at this fraction of installed RAM, swapping is
 # likely even though the machine technically has enough.
 _NEAR_RAM_LIMIT = 0.85
+
+# Framebuffer-alone threshold: framebuffer_bytes is exact arithmetic (width *
+# height * channels * bytes-per-channel, summed over products) with no
+# measurement error, so it is safe to compare directly against installed RAM
+# -- unlike a predicted total. A single beauty pass is a few MB even at 4K;
+# reaching a fifth of the machine's RAM on framebuffers ALONE, before the
+# renderer has allocated any geometry or texture memory on top of it, means
+# an unusually large resolution, AOV count or bit depth and is worth flagging
+# early rather than discovering it mid-render.
+_FOOTPRINT_FRAMEBUFFER_WARN_FRACTION = 0.20
 
 
 # One formatter for the whole tool, so a preflight message and `hsl memory`
@@ -146,7 +158,8 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
             category="volume_bake",
             message=(
                 f"{n} live volume(s), {total_fields} field(s){detail} have no "
-                f"on-disk VDB (OpenVDBAsset.filePath empty) and will bake into "
+                f"on-disk VDB (filePath is empty, or an op: reference back to "
+                f"a SOP) and will bake into "
                 f"the USD export -- tens of GB per frame. Render with the hython "
                 f"engine (no export) or point the volumes at a .vdb cache."
             ),
@@ -221,6 +234,52 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
                          f"at {_human_bytes(peak)} RSS on {when}, out of "
                          f"{_human_bytes(total_ram)} installed. If a future "
                          f"run needs to use less, {advice}.{scope}")
+            ))
+
+    # 8. Scene footprint -- facts about what the scene CONTAINS (see
+    #    SceneFootprint's docstring), never a predicted memory total. Only
+    #    fires on the two terms that are safe to compare directly against a
+    #    number: framebuffer_bytes is exact arithmetic and voxel_bytes is a
+    #    documented lower bound, so neither needs the hedging a measured
+    #    peak-RSS figure does. Silent when nothing was ever scanned.
+    if manifest and manifest.footprint:
+        fp = manifest.footprint
+        total_ram = sysinfo.total_ram_bytes()
+
+        if total_ram and fp.framebuffer_bytes and \
+                fp.framebuffer_bytes >= total_ram * _FOOTPRINT_FRAMEBUFFER_WARN_FRACTION:
+            warnings.append(PreflightWarning(
+                level="warning",
+                category="footprint",
+                message=(
+                    f"Framebuffer alone is {_human_bytes(fp.framebuffer_bytes)} "
+                    f"(exact: width x height x channels x bytes-per-channel, "
+                    f"summed over products) -- "
+                    f"{100.0 * fp.framebuffer_bytes / total_ram:.0f}% of this "
+                    f"machine's {_human_bytes(total_ram)} RAM, before the "
+                    f"renderer has allocated any geometry or texture memory on "
+                    f"top of it. Check resolution, AOV count and bit depth."
+                )
+            ))
+
+        if total_ram and fp.voxel_bytes and fp.voxel_bytes > total_ram:
+            warnings.append(PreflightWarning(
+                level="error",
+                category="footprint",
+                message=(
+                    f"Volume data alone is at least {_human_bytes(fp.voxel_bytes)} "
+                    f"(uncompressed voxels, no renderer overhead -- a lower "
+                    f"bound, never the whole cost) -- more than this machine's "
+                    f"{_human_bytes(total_ram)} RAM. This cannot fit before the "
+                    f"renderer has allocated anything else."
+                )
+            ))
+
+        for item in fp.skipped:
+            warnings.append(PreflightWarning(
+                level="info",
+                category="footprint",
+                message=f"Scene footprint scan skipped: {item}"
             ))
 
     return warnings

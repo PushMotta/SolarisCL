@@ -17,6 +17,8 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+from .manifest import SceneFootprint
+
 LOG_FILE = (
     os.path.expandvars(r"%APPDATA%\hsl\memory.json")
     if os.name == "nt"
@@ -42,6 +44,14 @@ MAX_TOTAL = 500
 #   *truthful* reading of an older record: before Job Objects existed here
 #   every figure was single-process, so old rows are correctly labelled by the
 #   default rather than being silently promoted to a claim they cannot make.
+#
+#   ``active_voxels``, ``voxel_bytes``, ``texture_bytes``, ``point_count``,
+#   ``framebuffer_bytes`` -- what a :class:`~hsl.manifest.SceneFootprint`
+#   scan found for this scene, recorded alongside what the render actually
+#   used. All default to None, which is exactly what an older row means: not
+#   "scanned and found nothing", but "no footprint was ever recorded here".
+#   Pairing the two is the only route to a future calibrated estimate built
+#   from real data rather than recall; nothing reads these yet.
 
 
 @dataclass
@@ -56,6 +66,39 @@ class MemorySample:
     vram_sampled: bool = False         # True = polled, so a spike may have been missed
     when: float = 0.0                  # epoch seconds
     houdini: str = ""                  # version string if known
+    # What the scene CONTAINED, from a SceneFootprint scan taken alongside
+    # this measurement -- None means no footprint was recorded, not zero.
+    # See hsl.manifest.SceneFootprint for what each field counts exactly.
+    active_voxels: Optional[int] = None
+    voxel_bytes: Optional[int] = None
+    texture_bytes: Optional[int] = None
+    point_count: Optional[int] = None
+    framebuffer_bytes: Optional[int] = None
+
+
+def footprint_fields(footprint: Optional[SceneFootprint]) -> dict:
+    """The subset of a SceneFootprint worth storing on a MemorySample.
+
+    Callers building a sample pass this straight in as ``**kwargs`` --
+    ``MemorySample(hip_path=..., peak_rss=peak, **footprint_fields(fp))`` --
+    instead of hand-copying five field names, which is exactly the kind of
+    drift that leaves one of them silently dropped the next time
+    SceneFootprint grows a field.
+
+    ``None`` (nothing was scanned this run) returns ``{}`` rather than
+    raising, so a caller can call this unconditionally with no extra branch.
+    Never invents a value: whatever SceneFootprint itself does not know stays
+    None here too.
+    """
+    if footprint is None:
+        return {}
+    return {
+        "active_voxels": footprint.active_voxels,
+        "voxel_bytes": footprint.voxel_bytes,
+        "texture_bytes": footprint.texture_bytes,
+        "point_count": footprint.point_count,
+        "framebuffer_bytes": footprint.framebuffer_bytes,
+    }
 
 
 def _key(hip_path: str, rop_path: str) -> str:
@@ -113,6 +156,18 @@ def _load_all() -> list[MemorySample]:
                 vram_sampled=bool(entry.get("vram_sampled", False)),
                 when=float(entry.get("when") or 0.0),
                 houdini=str(entry.get("houdini", "")),
+                # Absent in a store written before footprint scanning existed
+                # -- None is the correct reading of that absence, not 0.
+                active_voxels=(int(entry["active_voxels"])
+                               if entry.get("active_voxels") is not None else None),
+                voxel_bytes=(int(entry["voxel_bytes"])
+                             if entry.get("voxel_bytes") is not None else None),
+                texture_bytes=(int(entry["texture_bytes"])
+                               if entry.get("texture_bytes") is not None else None),
+                point_count=(int(entry["point_count"])
+                             if entry.get("point_count") is not None else None),
+                framebuffer_bytes=(int(entry["framebuffer_bytes"])
+                                   if entry.get("framebuffer_bytes") is not None else None),
             ))
         except (TypeError, ValueError):
             # One malformed row must not take the rest of the history with it.

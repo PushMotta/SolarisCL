@@ -138,6 +138,7 @@ def inspect_hip(hip_path: str, *, hython: str = "", export_usd: bool = True,
                 usd_dir: str = "", flatten: bool = False, rop: str = "",
                 allow_volume_bake: bool = True, export_frames=None,
                 frame: Optional[float] = None,
+                footprint: bool = False,
                 timeout: float = 1800.0,
                 env: Optional[dict] = None) -> SceneManifest:
     """Run the inspector under hython and return the parsed manifest.
@@ -150,6 +151,11 @@ def inspect_hip(hip_path: str, *, hython: str = "", export_usd: bool = True,
     forwarded to the inspector: when false, an export that would bake live
     volumes into the USD is skipped and reported in ``manifest.warnings``
     instead of silently filling the disk.
+
+    ``footprint`` asks the inspector to also scan volumes, textures and
+    geometry and populate ``manifest.footprint``. Off by default: the scan
+    costs real time on a heavy stage, so it is opt-in rather than paid on
+    every inspect.
     """
     hip_path = os.path.abspath(hip_path)
     if not os.path.isfile(hip_path):
@@ -185,6 +191,8 @@ def inspect_hip(hip_path: str, *, hython: str = "", export_usd: bool = True,
         # over time looks different at another moment (TASKS.md T5); the
         # manifest records the frame used in ``inspected_frame``.
         cmd += ["--frame", str(frame)]
+    if footprint:
+        cmd.append("--footprint")
 
     run_env = dict(env or os.environ)
     existing = run_env.get("PYTHONPATH", "")

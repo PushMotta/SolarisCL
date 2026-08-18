@@ -358,7 +358,12 @@ class RenderQueue:
         except ImportError:
             return          # optional, as above
         try:
+            # What the scene contained goes in beside what it used. On its own
+            # neither answers "will this fit"; together, and only once enough
+            # of them exist, they are the data a calibrated estimate could be
+            # fitted to instead of invented constants (docs/TASKS.md T10).
             memlog.record(memlog.MemorySample(
+                **memlog.footprint_fields(task.job.footprint),
                 hip_path=task.job.hip_file or task.job.usd_file,
                 rop_path=task.job.rop_path,
                 engine=task.job.engine,

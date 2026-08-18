@@ -13,7 +13,9 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
-from .manifest import TASK_RENDER, OutputTask, RenderRop, SceneManifest
+from .manifest import (
+    TASK_RENDER, OutputTask, RenderRop, SceneFootprint, SceneManifest,
+)
 
 # husk emits `ALF_PROGRESS 42%` when run with -Valfred.
 _ALF_PROGRESS = re.compile(r"ALF_PROGRESS\s+(\d+)\s*%")
@@ -192,6 +194,12 @@ class RenderJob:
     # Directories to search for unresolved assets (hython engine only -- the
     # husk path relinks the exported USD before the job is ever built).
     relink_dirs: list[str] = field(default_factory=list)
+    # What the scene this job came from *contained*, so the runner can file it
+    # beside what the render actually *used*. Carried on the job rather than
+    # handed to the queue because a batch queue holds jobs from several
+    # scenes at once, each with its own footprint. Never read by
+    # ``build_command`` -- it does not affect what is run.
+    footprint: Optional[SceneFootprint] = None
     # Render-settings attributes to override, e.g.
     # {"karma:global:samplesperpixel": "64"} (hython engine only -- the husk
     # path authors them into the USD before the job is built).
@@ -333,6 +341,7 @@ def jobs_for_rop(manifest: SceneManifest, rop: RenderRop, usd_file: str = "",
     defaults = {
         "engine": overrides.get("engine", DEFAULT_ENGINE),
         "hip_file": manifest.hip_path,
+        "footprint": manifest.footprint,
         "rop_path": rop.node_path,
         "renderer": rop.renderer or "BRAY_HdKarma",
         "settings_prim": rop.settings_prim or manifest.default_settings_prim,
@@ -422,6 +431,7 @@ def jobs_for_task(manifest: SceneManifest, task: OutputTask, *,
     defaults = {
         "engine": engine,
         "hip_file": manifest.hip_path,
+        "footprint": manifest.footprint,
         "rop_path": task.node_path,
         "task_id": task.node_path,
         "depends_on": list(task.depends_on),

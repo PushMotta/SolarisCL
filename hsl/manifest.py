@@ -20,7 +20,9 @@ from typing import Any, Optional
 # loads (``tasks`` defaults to empty) and nothing gates behaviour on this
 # number, so it is here to describe the shape, not to reject anything.
 # 3 added ``SceneManifest.inspected_frame`` -- additive likewise.
-SCHEMA_VERSION = 3
+# 4 added ``SceneManifest.footprint``. Additive too: a v3 manifest loads with
+# ``footprint`` None, which reads as "nobody scanned this", not as "empty".
+SCHEMA_VERSION = 4
 
 
 # --------------------------------------------------------------------------
@@ -218,6 +220,72 @@ class OutputTask:
 
 
 @dataclass
+class SceneFootprint:
+    """What a scene *contains* that drives render memory.
+
+    Facts about the scene, each labelled with exactly what it counts. This is
+    deliberately **not** a prediction of what a render will need: memory
+    depends on the delegate, the Houdini build, texture-cache budgets and BVH
+    constants nobody publishes, so a total here would be an invented number
+    that someone would then plan a farm around. What it answers instead is
+    "what is heavy in this scene, and by how much" -- which is the question an
+    artist can actually act on.
+
+    ``None`` means *not measured* -- the scan was skipped, or the value could
+    not be read. It never means zero. Counts that are genuinely zero are 0.
+
+    Pairs with the measured history in :mod:`hsl.memlog`: recording what a
+    scene contained next to what its render really used is what could one day
+    make a *calibrated* estimate possible, from real data rather than recall.
+    """
+    # -- volumes ----------------------------------------------------------
+    volume_count: int = 0
+    # Voxels actually stored. VDB is sparse, so this is the active set, not
+    # the bounding-box product.
+    active_voxels: Optional[int] = None
+    # ``active_voxels`` times each grid's own value size: the voxel data
+    # itself, uncompressed, with no renderer overhead of any kind included.
+    # A lower bound on what volumes cost, never the whole cost.
+    voxel_bytes: Optional[int] = None
+
+    # -- textures ---------------------------------------------------------
+    texture_count: int = 0
+    # Bytes **on disk**, not in memory. A compressed EXR expands when loaded,
+    # while a bounded texture cache may never hold all of it at once, so this
+    # is neither an upper nor a lower bound on texture memory. It is the one
+    # honest number available without loading every file.
+    texture_bytes: Optional[int] = None
+
+    # -- geometry ---------------------------------------------------------
+    point_count: Optional[int] = None
+    prim_count: Optional[int] = None
+    # Point-instancer instances, which can be nearly free or ruinous
+    # depending on the delegate -- counted, deliberately not weighted.
+    instance_count: Optional[int] = None
+
+    # -- framebuffer ------------------------------------------------------
+    # The one term that is exact arithmetic rather than a measurement:
+    # width * height * channels * bytes-per-channel, summed over products.
+    framebuffer_bytes: Optional[int] = None
+
+    # -- provenance -------------------------------------------------------
+    scanned: bool = False               # False => nothing here was measured
+    # What could not be counted, and why. The channel for "this scene has
+    # volumes but their voxel counts were unreadable" -- never a silent gap.
+    skipped: list[str] = field(default_factory=list)
+    seconds: float = 0.0                # what the scan cost, for the caller
+
+    @property
+    def heaviest(self) -> str:
+        """Which term dominates, by the bytes actually known. "" if unknown."""
+        known = {"volume data": self.voxel_bytes,
+                 "textures on disk": self.texture_bytes,
+                 "framebuffer": self.framebuffer_bytes}
+        known = {k: v for k, v in known.items() if v}
+        return max(known, key=known.get) if known else ""
+
+
+@dataclass
 class SceneManifest:
     """Everything the launcher needs to know about one .hip file."""
     schema_version: int = SCHEMA_VERSION
@@ -241,6 +309,9 @@ class SceneManifest:
     cameras: list[Camera] = field(default_factory=list)
     missing_assets: list[MissingAsset] = field(default_factory=list)
     live_volumes: list[LiveVolume] = field(default_factory=list)
+    # What the scene contains that drives memory. None until something scans
+    # it -- the scan costs real time on a heavy stage, so it is opt-in.
+    footprint: Optional[SceneFootprint] = None
     warnings: list[str] = field(default_factory=list)
 
     # -- lookups ----------------------------------------------------------
@@ -326,6 +397,13 @@ _ELEMENT_TYPES = {
     "live_volumes": LiveVolume,
 }
 
+# Fields holding **one** nested dataclass rather than a list of them. Without
+# this a round trip would hand back a plain dict, and every attribute access
+# on it would raise somewhere far from the cause.
+_SINGLE_TYPES = {
+    "footprint": SceneFootprint,
+}
+
 
 def _build(cls, data: Any):
     """Rebuild nested dataclasses from plain dicts."""
@@ -338,8 +416,11 @@ def _build(cls, data: Any):
             continue
         value = data[f.name]
         inner = _ELEMENT_TYPES.get(f.name)
+        single = _SINGLE_TYPES.get(f.name)
         if inner is not None and isinstance(value, list):
             value = [_build(inner, v) for v in value]
+        elif single is not None and isinstance(value, dict):
+            value = _build(single, value)
         elif f.name == "resolution" and isinstance(value, list):
             value = tuple(value)
         kwargs[f.name] = value
