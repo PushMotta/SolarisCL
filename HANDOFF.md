@@ -14,7 +14,7 @@ library. The plain-Python half stays testable with no Houdini installed.
   Do not trust this file for push state — run
   `git log --oneline origin/main..main`. At rewrite time the UI mode
   restructure and this rewrite itself had not been pushed.
-- **Green:** 243 tests, boundary lint, 55 drift checks, ui-imports,
+- **Green:** 346 tests, boundary lint, 55 drift checks, ui-imports,
   whitespace. `python -m unittest discover -s tests` needs no Houdini.
 - **Project root:** `F:\Nexus Projects\SolarisCL` — the working dir **is** the
   git root. `_archive\` is the original delivery, gitignored and disposable.
@@ -97,7 +97,33 @@ lists them; the GUI has a **Caches & Sims** mode.
   lives in **`hsl/progress.py`** (stdlib-only, unit-tested); `ui.py` keeps
   thin Qt wrappers. The empty-state blank detail box is gone.
 
-### Newest of all: the Batch tab, and `batch --rop`
+### Memory measurement (layers 1 and 3) — done
+
+Deliberately **measurement, never prediction**. A predicted number would rest
+on delegate- and version-specific constants nobody publishes, and would be
+believed anyway; a recorded one is a fact. New `hsl/sysinfo.py` (platform
+primitives, stdlib+ctypes), `hsl/memlog.py` (capped JSON history in the user
+profile), a `memory` category in preflight, `Task.peak_rss`/`peak_vram` filled
+by a sampler thread in `RenderQueue`, and `hsl memory [--machine|--forget]`.
+
+Design rules worth keeping: an unmeasured value is `None` and prints
+`unknown`, never `0`; a sample carrying no measurement at all is not recorded;
+a **cancelled** task is not measured (we cut it short) while a **failed** one
+is (an out-of-memory kill is the most useful sample there is); and the
+measurement imports are function-local in `runner.py` so instrumentation can
+never stop the queue from loading — its *absence* is reported by
+`hsl memory --machine`, not as a warning on every render.
+
+**Whole-tree measurement (2026-08-18).** `PeakWorkingSetSize` covers only the
+process hsl spawned, so a studio `husk.bat` wrapper measured 8 MB for a render
+that used 300 MB. Each render is now spawned into a Windows **Job Object**
+(opened *before* the `Popen` — it cannot be retrofitted) and `peak_rss` prefers
+`PeakJobMemoryUsed`, falling back to the old figure and recording which it got
+in `Task.peak_rss_is_tree` / `MemorySample.peak_rss_is_tree`. `hsl memory` and
+preflight both label the difference rather than presenting them alike. Windows
+only; see `docs/UNVERIFIED.md` M11–M18.
+
+### Newest: the Batch tab, and `batch --rop`
 
 - **The GUI has a third mode, Batch** — add several `.hip` files, each reads
   in the background (one hython at a time, cache-reused), every render ROP
@@ -203,6 +229,17 @@ mid-cook left no orphan hython.
   Use the editor tools.
 - **`hash()` on a string is randomised per process** — was the manifest cache
   key; now SHA-1.
+- **Windows `PeakWorkingSetSize` covers the process you spawned and *nothing
+  it spawns*.** A `.bat` wrapper around a child that allocated 300 MB measured
+  **8.1 MB**. Direct spawns are fine (`hython.exe` allocating 400 MB measured
+  931.6 MB against a 530.6 MB idle baseline — a 401.0 MB delta). This is why
+  memory measurement uses a Job Object, which must be created **at spawn
+  time** and cannot be retrofitted onto a live `Popen`. The failure mode is
+  the dangerous kind: a plausible small number, not an error.
+- **A test that passes against the broken code proves nothing.** The
+  dependency-ordering regression test only exposes its bug at
+  `max_parallel >= 2`; at 1 the queue's own semaphore serialises the tasks and
+  hides it. Always re-run a new regression test against the unfixed code.
 - **QMessageBox text is the *inverse* of the `&` trap.** Tab labels and group
   titles eat a single `&` (write `&&`), but message-box body text has no
   mnemonic handling — `&&` there *displays* doubled. One escape per widget
@@ -256,7 +293,7 @@ mid-cook left no orphan hython.
 ## How to run / verify
 
 ```bash
-python -m unittest discover -s tests           # 243 tests, no Houdini needed
+python -m unittest discover -s tests           # 346 tests, no Houdini needed
 python .claude/hooks/boundary_guard.py --check-tree .
 python scripts/check_drift.py
 python scripts/check_ui_imports.py

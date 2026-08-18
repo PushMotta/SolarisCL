@@ -5,17 +5,37 @@ Performs sanity and environment checks before launching hython or husk processes
   * Resolution bounds (Indie 1080p limit)
   * Output directory existence and write permissions
   * Available disk space
+  * Memory: what a past render of this scene+ROP actually used, if known
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from typing import Optional
 
+from . import memlog, sysinfo
 from .husk import RenderJob, has_frame_token
 from .manifest import SceneManifest
+
+# Near-ceiling threshold: at this fraction of installed RAM, swapping is
+# likely even though the machine technically has enough.
+_NEAR_RAM_LIMIT = 0.85
+
+
+# One formatter for the whole tool, so a preflight message and `hsl memory`
+# never disagree about how to write the same number of bytes.
+_human_bytes = sysinfo.human_bytes
+
+
+def _format_when(epoch: float) -> str:
+    """A short date for a past measurement. Never raises on a bad timestamp."""
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(epoch))
+    except (OSError, OverflowError, ValueError):
+        return "an earlier run"
 
 
 @dataclass
@@ -139,6 +159,68 @@ def run_preflight_checks(job: RenderJob, manifest: Optional[SceneManifest] = Non
                 level="info",
                 category="scene",
                 message=msg
+            ))
+
+    # 7. Memory: what a past render of this scene+ROP actually used, if
+    #    anything was ever measured. Silent when there is no history --
+    #    a check that always chatters gets ignored, and an unmeasured scene
+    #    has nothing honest to report.
+    peak_job = memlog.worst(job.hip_file or job.usd_file, job.rop_path)
+    if peak_job is not None:
+        peak = peak_job.peak_rss
+        when = _format_when(peak_job.when)
+        advice = ("render fewer frames per chunk, lower the resolution, use "
+                 "the hython engine for a volume-heavy shot, or free up "
+                 "memory before starting")
+        total_ram = sysinfo.total_ram_bytes()
+        # A figure that covered only the spawned process is a *floor*, not a
+        # measurement of the render: if husk_exe pointed at a wrapper script,
+        # the wrapper is what got measured. Saying so is the whole point --
+        # comparing 8 MB against installed RAM and reporting "plenty of room"
+        # is exactly the confident wrong answer this check exists to avoid.
+        scope = ("" if peak_job.peak_rss_is_tree else
+                 " That figure covered only the process hsl started and not "
+                 "its children, so if the renderer was launched through a "
+                 "wrapper script the real total was higher -- treat it as a "
+                 "lower bound.")
+
+        if total_ram is None:
+            warnings.append(PreflightWarning(
+                level="info",
+                category="memory",
+                message=(f"Measured (not predicted): this scene last peaked "
+                         f"at {_human_bytes(peak)} RSS on {when}. Installed "
+                         f"RAM could not be determined here, so this cannot "
+                         f"be compared against the machine -- if it looks "
+                         f"high, {advice}.{scope}")
+            ))
+        elif peak >= total_ram:
+            warnings.append(PreflightWarning(
+                level="error",
+                category="memory",
+                message=(f"Measured (not predicted): this scene has needed "
+                         f"more memory than this machine has -- it peaked at "
+                         f"{_human_bytes(peak)} RSS on {when}, against "
+                         f"{_human_bytes(total_ram)} installed. To bring it "
+                         f"down, {advice}.{scope}")
+            ))
+        elif peak >= total_ram * _NEAR_RAM_LIMIT:
+            warnings.append(PreflightWarning(
+                level="warning",
+                category="memory",
+                message=(f"Measured (not predicted): this scene last peaked "
+                         f"at {_human_bytes(peak)} RSS on {when}, close to "
+                         f"this machine's {_human_bytes(total_ram)} -- "
+                         f"swapping is likely. To bring it down, {advice}.{scope}")
+            ))
+        else:
+            warnings.append(PreflightWarning(
+                level="info",
+                category="memory",
+                message=(f"Measured (not predicted): this scene last peaked "
+                         f"at {_human_bytes(peak)} RSS on {when}, out of "
+                         f"{_human_bytes(total_ram)} installed. If a future "
+                         f"run needs to use less, {advice}.{scope}")
             ))
 
     return warnings

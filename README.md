@@ -109,6 +109,56 @@ python -m hsl.cli batch shotA.hip shotB.hip shotC.hip \
 python -m hsl.cli ui shot.hip
 ```
 
+## Memory: measured, not predicted
+
+Every render records what it actually used — peak RAM per process, and GPU
+memory where `nvidia-smi` can report it. Nothing is modelled: a figure that
+was not measured reads `unknown`, never a guess.
+
+```bash
+python -m hsl.cli memory                 # what past renders used, newest first
+python -m hsl.cli memory shot.hip        # just this scene
+python -m hsl.cli memory --machine       # what this machine can measure at all
+python -m hsl.cli memory --forget        # drop the history
+```
+
+Preflight then uses that history: once a scene has been rendered, starting it
+again on a machine with less RAM than it needed last time is an **error**, and
+coming within 85% of the ceiling is a warning. A scene that has never been
+measured says nothing at all — silence beats a check that always chatters.
+
+Why measurement rather than an estimator: memory depends on the delegate
+(Karma CPU and XPU differ enormously), the Houdini version, texture cache
+budgets that deliberately do not scale with texture count, and BVH constants
+nobody publishes. A predicted number would rest on invented constants and be
+believed anyway. A recorded one is a fact.
+
+RAM is measured across the **whole process tree** on Windows, via a Job Object
+opened at spawn time. That distinction is not academic: Windows' per-process
+peak counter ignores children, so a studio `husk.bat` wrapper around a render
+that really used 300 MB measured **8 MB** — a plausible, quietly wrong number.
+Every record says which kind of figure it is, and `hsl memory --machine` says
+what this machine can do.
+
+Known limits, deliberately not papered over:
+
+- **GPU memory is NVIDIA-only, polled, and often unavailable.** Consumer
+  GeForce cards under the WDDM driver report no per-process VRAM at all — the
+  driver answers `[N/A]`, so hsl records `unknown` rather than `0`. Where it
+  does work, figures are sampled and labelled `sampled`, since a spike between
+  samples is missed. Matched by process id, so a delegate handing GPU work to
+  a child is missed.
+- **Whole-tree RAM is Windows-only.** On Linux a wrapper script is still
+  measured as the wrapper — now *labelled* as main-process-only rather than
+  passed off as the total, but not yet fixed (`docs/UNVERIFIED.md` M18).
+- The job figure is **committed** memory, not working set: a genuinely
+  different quantity, and not to be compared like-for-like with a
+  single-process number.
+- A **cancelled** render is not recorded — we cut it short, so its peak says
+  nothing about what the scene needs. A render that **failed** is recorded: a
+  job killed by the machine running out of memory is the most useful sample
+  there is.
+
 ## Caches and simulations
 
 `hsl` is not only a render launcher: it cooks the rest of a `.hip` headless

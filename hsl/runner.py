@@ -35,6 +35,14 @@ class State(str, Enum):
 TERMINAL_STATES = (State.DONE, State.FAILED, State.CANCELLED, State.SKIPPED)
 
 
+# How often running processes are looked at for memory. RAM has a real
+# operating-system peak counter, but GPU memory does not -- it can only be
+# polled, so a spike between two samples is missed. Two seconds trades catching
+# real peaks against spawning nvidia-smi too often; anything obtained this way
+# is flagged ``vram_sampled`` so nobody reads it as exact.
+SAMPLE_INTERVAL = 2.0
+
+
 @dataclass
 class Task:
     job: RenderJob
@@ -44,7 +52,22 @@ class Task:
     started_at: float = 0.0
     finished_at: float = 0.0
     log: list[str] = field(default_factory=list)
+    # What this process actually used, in bytes. ``None`` means *not measured*
+    # -- never zero, and never an estimate. See hsl/sysinfo.py for what each
+    # platform can and cannot answer.
+    peak_rss: Optional[int] = None
+    peak_vram: Optional[int] = None
+    vram_sampled: bool = False     # GPU figures are polled, so a spike may be missed
+    # True when peak_rss covers the whole process tree (a Job Object), False
+    # when it is only the process hsl spawned. Not a detail: a studio
+    # ``husk.bat`` wrapper measured single-process reads ~8 MB for a render
+    # that really used 300 MB, so a consumer must be able to tell the two
+    # apart rather than trusting whichever it was handed.
+    peak_rss_is_tree: bool = False
     _proc: Optional[subprocess.Popen] = None
+    # The Job Object this task's process was spawned into, if any. Opened
+    # before the Popen and closed in the same finally that clears _proc.
+    _job: Optional[object] = None
 
     @property
     def duration(self) -> float:
@@ -72,12 +95,21 @@ class RenderQueue:
     def __init__(self, jobs: Sequence[RenderJob], max_parallel: int = 1,
                  on_event: Optional[EventCallback] = None,
                  keep_log_lines: int = 2000,
-                 env: Optional[dict] = None):
+                 env: Optional[dict] = None,
+                 measure_memory: bool = True,
+                 record_memory: bool = True):
         self.tasks = [Task(job=job) for job in jobs]
         self.max_parallel = max(1, int(max_parallel))
         self.on_event = on_event or (lambda *a, **k: None)
         self.keep_log_lines = keep_log_lines
         self.env = env
+        # Watching costs one cheap poll per couple of seconds; filing the
+        # result is what makes preflight able to say "this scene needed 48 GB
+        # last time" instead of predicting. Both are off in tests that do not
+        # want a user-profile file written.
+        self.measure_memory = measure_memory
+        self.record_memory = record_memory
+        self._sampler_stop = threading.Event()
         self.warnings: list[str] = []
         self._cancel = threading.Event()
         self._lock = threading.Lock()
@@ -230,7 +262,124 @@ class RenderQueue:
         for task in waiting:
             self.on_event("task_finished", task)
 
+    def _measure_loop(self) -> None:
+        """Poll running processes for memory until the queue is done.
+
+        The import is deliberately function-local: ``sysinfo`` touches ctypes
+        and platform binaries, and nothing there is allowed to stop the queue
+        from even loading. Every failure degrades to "not measured".
+        """
+        try:
+            from . import sysinfo
+        except ImportError:
+            # Instrumentation is optional. Its absence is a fact about the
+            # install, reported by `hsl memory --machine`, not a fault in this
+            # render -- so it must not put a warning on every queue. A failure
+            # *during* sampling is a surprise, and does warn (below).
+            return
+        try:
+            watch_gpu = bool(sysinfo.find_nvidia_smi())
+            while not self._sampler_stop.is_set():
+                with self._lock:
+                    live = {t._proc.pid: t for t in self.tasks
+                            if t.state is State.RUNNING and t._proc is not None}
+                if live:
+                    # Sampled RSS is the fallback for platforms with no peak
+                    # counter; on Windows the exact figure replaces it at exit.
+                    for pid, task in live.items():
+                        rss = sysinfo.current_rss(pid)
+                        if rss and rss > (task.peak_rss or 0):
+                            task.peak_rss = rss
+                    if watch_gpu:
+                        # Matched by pid. A delegate that hands its GPU work to
+                        # a child process is therefore missed -- reported as
+                        # unknown rather than guessed at.
+                        for pid, used in sysinfo.gpu_memory_bytes(list(live)).items():
+                            task = live.get(pid)
+                            if task is not None and used > (task.peak_vram or 0):
+                                task.peak_vram = used
+                                task.vram_sampled = True
+                self._sampler_stop.wait(SAMPLE_INTERVAL)
+        except Exception as exc:        # never let measurement kill a render
+            self.warnings.append(f"memory sampling stopped: {exc}")
+
+    def _open_job(self):
+        """A Job Object to spawn the next render into, or None.
+
+        Function-local import for the same reason ``_measure_loop`` has one:
+        ``sysinfo`` touches ctypes, and nothing there is allowed to stop a
+        render from starting.
+        """
+        try:
+            from . import sysinfo
+            return sysinfo.open_job_object()
+        except Exception:
+            return None
+
+    def _finish_measurement(self, task: Task) -> None:
+        """Take the exact peak if the OS has one, then file the result.
+
+        Three sources, best first:
+
+        1. **The Job Object.** A kernel high-water mark over the whole process
+           tree, so a studio ``husk.bat`` wrapper is measured *through* rather
+           than instead of. Windows only.
+        2. **PeakWorkingSetSize** for the spawned process alone. The old
+           behaviour, and still right for a direct spawn -- but a wrapper
+           reads as the wrapper, which is why the choice is recorded in
+           ``peak_rss_is_tree`` rather than left for a consumer to guess.
+        3. Whatever ``_measure_loop`` sampled, which can miss a spike between
+           samples and is therefore only the last resort.
+
+        Both exact figures *replace* the sampled one rather than being
+        reconciled with it. Every one of them is allowed to be unavailable;
+        the task simply keeps the best it got, and ``None`` if that is none.
+        """
+        try:
+            from . import sysinfo
+            tree = sysinfo.peak_job_memory(task._job)
+            if tree:
+                task.peak_rss = tree
+                task.peak_rss_is_tree = True
+            else:
+                exact = sysinfo.peak_working_set(task._proc)
+                if exact:
+                    task.peak_rss = exact
+                    task.peak_rss_is_tree = False
+        except Exception:
+            pass            # keep whatever sampling managed to see
+
+        if not self.record_memory:
+            return
+        if task.peak_rss is None and task.peak_vram is None:
+            return          # an entry that says nothing only dilutes the history
+        try:
+            from . import memlog
+        except ImportError:
+            return          # optional, as above
+        try:
+            memlog.record(memlog.MemorySample(
+                hip_path=task.job.hip_file or task.job.usd_file,
+                rop_path=task.job.rop_path,
+                engine=task.job.engine,
+                frames=task.job.chunk.count,
+                peak_rss=task.peak_rss,
+                peak_rss_is_tree=task.peak_rss_is_tree,
+                peak_vram=task.peak_vram,
+                vram_sampled=task.vram_sampled,
+                when=task.finished_at or time.time(),
+            ))
+        except Exception as exc:
+            # A history we could not write is not a failed render -- but say so
+            # rather than losing the measurement silently.
+            self.warnings.append(f"could not record memory use: {exc}")
+
     def _drive(self) -> None:
+        sampler = None
+        if self.measure_memory:
+            sampler = threading.Thread(target=self._measure_loop,
+                                       name="hsl-memory", daemon=True)
+            sampler.start()
         try:
             while not self._cancel.is_set():
                 launch, skipped, waiting = self._classify()
@@ -265,9 +414,15 @@ class RenderQueue:
         finally:
             for thread in list(self._threads):
                 thread.join()
+            # Stopped only once no process is left to watch, so a task that
+            # outlives the driver loop is still measured to its end.
+            self._sampler_stop.set()
+            if sampler is not None:
+                sampler.join(timeout=SAMPLE_INTERVAL * 2)
             self.on_event("queue_finished", self)
 
     def _run_task(self, task: Task) -> None:
+        job = None
         try:
             if self._cancel.is_set():
                 task.state = State.CANCELLED
@@ -277,6 +432,14 @@ class RenderQueue:
             task.state = State.RUNNING
             task.started_at = time.time()
             self.on_event("task_started", task)
+
+            # Before the spawn, not after: a Job Object cannot adopt a process
+            # tree retroactively, so this is the one thing that has to happen
+            # in the right order. It carries no limits, so it can neither slow
+            # the render down nor kill it.
+            if self.measure_memory:
+                job = self._open_job()
+                task._job = job
 
             try:
                 proc = subprocess.Popen(
@@ -298,6 +461,18 @@ class RenderQueue:
 
             task._proc = proc
 
+            # Immediately, while the child is still opening its own files and
+            # before it can fork anything the job would miss. A False here is
+            # not an error -- it means this platform or this Windows will not
+            # do whole-tree measurement, and _finish_measurement falls back to
+            # the single-process peak.
+            if job is not None:
+                try:
+                    from . import sysinfo
+                    sysinfo.assign_process_to_job(job, proc)
+                except Exception:
+                    pass
+
             try:
                 for line in proc.stdout:
                     line = line.rstrip("\n")
@@ -316,16 +491,45 @@ class RenderQueue:
             task.finished_at = time.time()
 
             if self._cancel.is_set():
-                task.state = State.CANCELLED
+                outcome = State.CANCELLED
             elif proc.returncode == 0 and self._wrote_something(task):
-                task.state = State.DONE
-                task.progress = 100
+                outcome = State.DONE
             else:
-                task.state = State.FAILED
+                outcome = State.FAILED
 
+            # Measure a task that ran to its own end, whichever way it ended --
+            # a render killed by the machine running out of memory is the most
+            # useful sample there is. A cancelled one was cut short by us, so
+            # its peak says nothing about what the scene needs.
+            #
+            # This happens *before* the terminal state is published, and that
+            # ordering is load-bearing: the driver starts dependants the moment
+            # it sees this task's state, so anything slow between the state
+            # change and the event below lets a dependant start before this
+            # task has even reported finishing. Measuring first also means
+            # ``task_finished`` carries the peaks rather than reaching
+            # consumers with them still empty.
+            if self.measure_memory and outcome in (State.DONE, State.FAILED):
+                self._finish_measurement(task)
+
+            task.state = outcome
+            if outcome is State.DONE:
+                task.progress = 100
             self.on_event("task_finished", task)
         finally:
             task._proc = None
+            # After _finish_measurement, which is the only reader: the peak
+            # counter lives on the handle and goes with it. Closing it cannot
+            # kill the render -- open_job_object sets no limits, least of all
+            # KILL_ON_JOB_CLOSE -- and close_job_object is idempotent, so an
+            # unwound cancel that gets here twice is harmless.
+            if job is not None:
+                task._job = None
+                try:
+                    from . import sysinfo
+                    sysinfo.close_job_object(job)
+                except Exception:
+                    pass
             self._slots.release()
 
     def _wrote_something(self, task: Task) -> bool:

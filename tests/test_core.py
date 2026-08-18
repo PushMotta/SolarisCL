@@ -6,8 +6,11 @@ import json
 import os
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 import shutil
@@ -17,6 +20,7 @@ from hsl import (
     bridge, cli as cli_mod, farm, husk as husk_mod, inspector, preflight,
     presets, resources,
 )
+from hsl import memlog, sysinfo
 from hsl.bridge import (
     find_hython, list_hython_installations, load_user_settings, save_user_setting,
 )
@@ -38,6 +42,30 @@ from hsl.progress import (
     eta_seconds, format_eta, queue_progress_summary, task_progress_text,
 )
 from hsl.runner import RenderQueue, State, Task
+
+_MEMLOG_REDIRECT = None
+
+
+def setUpModule():
+    """Keep the whole module off the real render-memory history.
+
+    The fake-husk tests run genuine subprocesses, so the queue genuinely
+    measures them and genuinely files the result -- straight into the user's
+    profile. A test run wrote 212 junk samples there before this existed, which
+    would have diluted the very history preflight reads to warn people. Point
+    the store at a temp directory for every test in this file, not just the
+    ones that know about it.
+    """
+    global _MEMLOG_REDIRECT
+    _MEMLOG_REDIRECT = (tempfile.TemporaryDirectory(prefix="hsl_memlog_"),
+                        memlog.LOG_FILE)
+    memlog.LOG_FILE = os.path.join(_MEMLOG_REDIRECT[0].name, "memory.json")
+
+
+def tearDownModule():
+    tmpdir, original = _MEMLOG_REDIRECT
+    memlog.LOG_FILE = original
+    tmpdir.cleanup()
 
 
 def sample_manifest() -> SceneManifest:
@@ -2226,6 +2254,179 @@ class TestReleaseBundle(unittest.TestCase):
                             text.index("-m hsl."), rel)
 
 
+class TestQueueMemoryMeasurement(unittest.TestCase):
+    """The queue measures what each render process actually used. Every
+    measurement is optional and must never change how a render behaves."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.fake = os.path.join(self.dir, "fake_husk.py")
+        with open(self.fake, "w") as fh:
+            fh.write("import sys\nprint('ALF_PROGRESS 100%', flush=True)\n"
+                     "sys.exit(9 if '--make-it-fail' in sys.argv else 0)\n")
+        if os.name == "nt":
+            self.exe = os.path.join(self.dir, "fake_husk.bat")
+            with open(self.exe, "w") as fh:
+                fh.write(f'@echo off\n"{sys.executable}" "{self.fake}" %*\n')
+        else:
+            self.exe = self.fake
+            os.chmod(self.fake, os.stat(self.fake).st_mode | stat.S_IEXEC)
+
+    def _job(self, task_id="", fail=False, depends=()):
+        return RenderJob(usd_file=os.path.join(self.dir, "shot.usd"),
+                         engine="husk", husk_exe=self.exe,
+                         hip_file=os.path.join(self.dir, "shot.hip"),
+                         rop_path="/stage/rop1",
+                         task_id=task_id, depends_on=list(depends),
+                         chunk=FrameChunk(1, 2, 1),
+                         extra_args=["--make-it-fail"] if fail else [])
+
+    def test_measurement_can_be_switched_off_entirely(self):
+        queue = RenderQueue([self._job()], measure_memory=False)
+        queue.start(block=True)
+        task = queue.tasks[0]
+        self.assertIsNone(task.peak_rss)
+        self.assertIsNone(task.peak_vram)
+        self.assertEqual(queue.warnings, [])
+
+    def test_a_missing_measurement_is_none_never_zero(self):
+        # None means "nobody measured this"; 0 would be a claim that the
+        # render used no memory, which is never true.
+        task = Task(job=self._job())
+        self.assertIsNone(task.peak_rss)
+        self.assertIsNone(task.peak_vram)
+        self.assertFalse(task.vram_sampled)
+
+    def test_nothing_is_filed_when_nothing_was_measured(self):
+        # An entry carrying no numbers only dilutes the history preflight reads.
+        filed = []
+        original = memlog.record
+        memlog.record = filed.append
+        self.addCleanup(setattr, memlog, "record", original)
+        queue = RenderQueue([self._job()])
+        for task in queue.tasks:            # pretend the platform measured nothing
+            task.peak_rss = task.peak_vram = None
+        queue._finish_measurement = lambda task: RenderQueue._finish_measurement(
+            queue, task)
+        queue.start(block=True)
+        self.assertTrue(all(s.peak_rss is not None or s.peak_vram is not None
+                            for s in filed))
+
+    def test_a_dependency_reports_finishing_before_its_dependant_starts(self):
+        """Regression: measuring must not happen between the terminal state
+        and the finished event.
+
+        The driver starts dependants the moment it sees a task's *state*, so
+        slow work in that window let a dependant start before its prerequisite
+        had even reported finishing. Sequencing, not decoration: a consumer
+        reading the event stream saw effects before their cause."""
+        original = RenderQueue._finish_measurement
+
+        def slow(self, task):               # exaggerate the window
+            time.sleep(0.25)
+            return original(self, task)
+
+        RenderQueue._finish_measurement = slow
+        self.addCleanup(setattr, RenderQueue, "_finish_measurement", original)
+
+        seq = []
+        lock = threading.Lock()
+
+        def on_event(event, *payload):
+            if event in ("task_started", "task_finished"):
+                with lock:
+                    seq.append((event, payload[0].job.task_id))
+
+        # max_parallel must leave a free slot: at 1 the semaphore serialises
+        # the two anyway (it is released only after the finished event) and
+        # the race is invisible. This test passed against the broken code
+        # until that was fixed.
+        queue = RenderQueue([self._job(task_id="up"),
+                             self._job(task_id="down", depends=("up",))],
+                            max_parallel=2, on_event=on_event,
+                            record_memory=False)
+        queue.start(block=True)
+        self.assertLess(seq.index(("task_finished", "up")),
+                        seq.index(("task_started", "down")))
+
+    def test_a_failed_render_is_still_measured(self):
+        # A job killed by the machine running out of memory is the single most
+        # useful sample there is, so failure must not skip measurement.
+        seen = []
+        original = RenderQueue._finish_measurement
+        RenderQueue._finish_measurement = lambda self, task: seen.append(task.state)
+        self.addCleanup(setattr, RenderQueue, "_finish_measurement", original)
+        queue = RenderQueue([self._job(fail=True)])
+        queue.start(block=True)
+        self.assertEqual(queue.tasks[0].state, State.FAILED)
+        self.assertEqual(len(seen), 1)
+
+    def test_a_cancelled_render_is_not_measured(self):
+        # We cut it short, so its peak says nothing about what the scene needs.
+        seen = []
+        original = RenderQueue._finish_measurement
+        RenderQueue._finish_measurement = lambda self, task: seen.append(task)
+        self.addCleanup(setattr, RenderQueue, "_finish_measurement", original)
+        queue = RenderQueue([self._job()])
+        queue._cancel.set()
+        queue.start(block=True)
+        self.assertEqual(seen, [])
+
+
+class TestMemoryReport(unittest.TestCase):
+    """`hsl memory` reports measurements, and says so."""
+
+    def _run(self, argv):
+        args = build_parser().parse_args(argv)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cli_mod.cmd_memory(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_unmeasured_bytes_read_unknown_not_zero(self):
+        self.assertEqual(sysinfo.human_bytes(None), "unknown")
+        self.assertEqual(sysinfo.human_bytes(0), "unknown")
+        self.assertEqual(sysinfo.human_bytes(2 * 1024 ** 3), "2.0 GB")
+
+    def test_an_empty_history_explains_itself(self):
+        # Silence would read as a broken feature; this is a new install.
+        code, out, _ = self._run(["memory"])
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing measured yet", out)
+
+    def test_the_report_says_these_are_measurements(self):
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/stage/rop1", engine="hython",
+            frames=10, peak_rss=8 * 1024 ** 3, when=time.time()))
+        code, out, _ = self._run(["memory"])
+        self.assertEqual(code, 0)
+        self.assertIn("8.0 GB", out)
+        self.assertIn("not predictions", out)
+
+    def test_vram_from_polling_is_labelled_sampled(self):
+        # A polled figure can miss a spike; it must not read as exact.
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/stage/rop1",
+            peak_rss=1024 ** 3, peak_vram=4 * 1024 ** 3, vram_sampled=True,
+            when=time.time()))
+        code, out, _ = self._run(["memory"])
+        self.assertIn("sampled", out)
+
+    def test_machine_report_distinguishes_no_gpu_from_no_tooling(self):
+        code, out, _ = self._run(["memory", "--machine"])
+        self.assertEqual(code, 0)
+        self.assertIn("installed RAM", out)
+        self.assertIn("per-render VRAM", out)
+
+    def test_forget_clears_the_history(self):
+        memlog.record(memlog.MemorySample(hip_path="/jobs/shot.hip",
+                                          peak_rss=1024 ** 3, when=time.time()))
+        code, out, _ = self._run(["memory", "--forget"])
+        self.assertEqual(code, 0)
+        self.assertEqual(memlog.history(), [])
+
+
 class TestConsoleEncoding(unittest.TestCase):
     """A fresh Windows console is cp1252. Printing a character it cannot map
     raises UnicodeEncodeError half way through a report -- the user loses the
@@ -2626,6 +2827,1044 @@ class TestProgressText(unittest.TestCase):
         tasks = [self.task(1, 5, State.RUNNING, progress=0, started_at=1.0)]
         summary = queue_progress_summary(tasks, percent=0, progress_seen=set())
         self.assertEqual(summary, "0% - Frame 0 of 5")
+
+
+class TestMemlog(unittest.TestCase):
+    """memlog is a JSON-backed store of what past renders actually used.
+
+    LOG_FILE is redirected into a fresh temp directory for every test here --
+    this must never touch the real user profile."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        original = memlog.LOG_FILE
+        memlog.LOG_FILE = os.path.join(tmpdir.name, "memory.json")
+        self.addCleanup(setattr, memlog, "LOG_FILE", original)
+
+    def test_a_sample_with_no_measurement_at_all_is_not_recorded(self):
+        # An entry that says nothing (no RSS, no VRAM) is noise that would
+        # only dilute worst() -- record() must refuse it outright.
+        memlog.record(memlog.MemorySample(hip_path="/j/s.hip", rop_path="/out/rop1"))
+        self.assertEqual(memlog.history(), [])
+
+    def test_a_sample_with_only_vram_is_still_recorded(self):
+        memlog.record(memlog.MemorySample(hip_path="/j/s.hip", rop_path="/out/rop1",
+                                          peak_vram=1024, vram_sampled=True))
+        self.assertEqual(len(memlog.history()), 1)
+
+    def test_per_key_cap_evicts_oldest_first(self):
+        # Seed one key already at the cap, then push it over with one more
+        # record() call -- the oldest entry for THIS key must be the one gone.
+        seed = [memlog.MemorySample(hip_path="/j/s.hip", rop_path="/out/rop1",
+                                    peak_rss=1000 + i, when=float(i))
+               for i in range(memlog.MAX_PER_KEY)]
+        memlog._save_all(seed)
+        memlog.record(memlog.MemorySample(hip_path="/j/s.hip", rop_path="/out/rop1",
+                                          peak_rss=9999, when=float(memlog.MAX_PER_KEY)))
+        hist = memlog.history("/j/s.hip", "/out/rop1")
+        self.assertEqual(len(hist), memlog.MAX_PER_KEY)
+        self.assertEqual(hist[0].when, float(memlog.MAX_PER_KEY))  # newest first
+        self.assertNotIn(0.0, {s.when for s in hist})              # oldest evicted
+
+    def test_overall_cap_evicts_oldest_first_across_keys(self):
+        # Each sample here has its OWN key (distinct hip), so the per-key cap
+        # never fires -- only the whole-store cap should trim anything.
+        seed = [memlog.MemorySample(hip_path=f"/j/scene{i}.hip", rop_path="/r",
+                                    peak_rss=1, when=float(i))
+               for i in range(memlog.MAX_TOTAL)]
+        memlog._save_all(seed)
+        memlog.record(memlog.MemorySample(hip_path="/j/new.hip", rop_path="/r",
+                                          peak_rss=1, when=float(memlog.MAX_TOTAL)))
+        everything = memlog.history()
+        self.assertEqual(len(everything), memlog.MAX_TOTAL)
+        self.assertEqual(everything[0].when, float(memlog.MAX_TOTAL))  # newest first
+        self.assertNotIn(0.0, {s.when for s in everything})            # oldest evicted
+
+    def test_corrupt_json_yields_empty_history_not_a_raise(self):
+        os.makedirs(os.path.dirname(memlog.LOG_FILE), exist_ok=True)
+        with open(memlog.LOG_FILE, "w", encoding="utf-8") as fh:
+            fh.write("{not valid json at all")
+        self.assertEqual(memlog.history(), [])
+
+    def test_unreadable_store_degrades_to_empty_history(self):
+        # A missing file must behave the same as a corrupt one -- no raise.
+        self.assertFalse(os.path.exists(memlog.LOG_FILE))
+        self.assertEqual(memlog.history(), [])
+        self.assertIsNone(memlog.worst("/j/s.hip"))
+
+    def test_differently_spelled_hip_path_still_matches_the_same_key(self):
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot/Shot.hip", rop_path="/out/rop1", peak_rss=2000))
+        # Different case and a relative-looking form must resolve to the
+        # SAME key as the originally-recorded absolute, mixed-case path.
+        hits = memlog.history("/JOBS/shot/shot.hip", "/out/rop1")
+        self.assertEqual(len(hits), 1)
+        # ... but the sample keeps its ORIGINAL spelling for display.
+        self.assertEqual(hits[0].hip_path, "/jobs/shot/Shot.hip")
+
+    def test_worst_picks_the_highest_peak_not_the_newest(self):
+        memlog.record(memlog.MemorySample(hip_path="/s.hip", rop_path="/r",
+                                          peak_rss=1000, when=1.0))
+        memlog.record(memlog.MemorySample(hip_path="/s.hip", rop_path="/r",
+                                          peak_rss=5000, when=2.0))
+        memlog.record(memlog.MemorySample(hip_path="/s.hip", rop_path="/r",
+                                          peak_rss=3000, when=3.0))
+        worst = memlog.worst("/s.hip", "/r")
+        self.assertEqual(worst.peak_rss, 5000)
+        self.assertEqual(worst.when, 2.0)
+
+    def test_worst_ignores_samples_with_no_rss_measurement(self):
+        # A VRAM-only sample cannot answer "highest peak_rss" -- it must be
+        # skipped rather than compared as if its peak_rss were 0.
+        memlog.record(memlog.MemorySample(hip_path="/s.hip", rop_path="/r",
+                                          peak_vram=999999999, vram_sampled=True))
+        memlog.record(memlog.MemorySample(hip_path="/s.hip", rop_path="/r",
+                                          peak_rss=100, when=1.0))
+        worst = memlog.worst("/s.hip", "/r")
+        self.assertEqual(worst.peak_rss, 100)
+
+    def test_forget_one_scene_scopes_to_that_hip_only(self):
+        memlog.record(memlog.MemorySample(hip_path="/a.hip", rop_path="/r", peak_rss=1))
+        memlog.record(memlog.MemorySample(hip_path="/b.hip", rop_path="/r", peak_rss=1))
+        removed = memlog.forget("/a.hip")
+        self.assertEqual(removed, 1)
+        self.assertEqual(memlog.history("/a.hip"), [])
+        self.assertEqual(len(memlog.history("/b.hip")), 1)
+
+    def test_forget_with_no_argument_clears_everything(self):
+        memlog.record(memlog.MemorySample(hip_path="/a.hip", rop_path="/r", peak_rss=1))
+        memlog.record(memlog.MemorySample(hip_path="/b.hip", rop_path="/r", peak_rss=1))
+        removed = memlog.forget()
+        self.assertEqual(removed, 2)
+        self.assertEqual(memlog.history(), [])
+
+    def test_a_store_written_before_whole_tree_measurement_still_loads(self):
+        """Additive schema change, the discipline manifest.py documents: an
+        old record has no peak_rss_is_tree key at all, and must load with
+        every other field intact.
+
+        It defaults to False, which is not merely the safe default but the
+        *true* one -- every figure recorded before Job Objects existed here
+        was single-process, so the default labels old rows correctly instead
+        of promoting them to a claim they cannot support."""
+        os.makedirs(os.path.dirname(memlog.LOG_FILE), exist_ok=True)
+        with open(memlog.LOG_FILE, "w", encoding="utf-8") as fh:
+            json.dump([{"hip_path": "/j/old.hip", "rop_path": "/out/rop1",
+                        "engine": "husk", "frames": 4, "peak_rss": 1234,
+                        "peak_vram": None, "vram_sampled": False,
+                        "when": 10.0, "houdini": "20.5.370"}], fh)
+        loaded = memlog.history()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].peak_rss, 1234)
+        self.assertEqual(loaded[0].engine, "husk")
+        self.assertEqual(loaded[0].houdini, "20.5.370")
+        self.assertFalse(loaded[0].peak_rss_is_tree)
+
+    def test_the_whole_tree_flag_survives_a_round_trip(self):
+        # It is what tells a reader whether the number can be trusted as the
+        # render's total, so losing it in the file would be as bad as never
+        # having measured it.
+        memlog.record(memlog.MemorySample(hip_path="/j/s.hip", rop_path="/r",
+                                          peak_rss=4096, peak_rss_is_tree=True))
+        self.assertTrue(memlog.history()[0].peak_rss_is_tree)
+
+
+class TestPreflightMemory(unittest.TestCase):
+    """The memory preflight check only speaks when there is a real
+    measurement, and it must always say MEASURED, never predicted."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        original_log = memlog.LOG_FILE
+        memlog.LOG_FILE = os.path.join(tmpdir.name, "memory.json")
+        self.addCleanup(setattr, memlog, "LOG_FILE", original_log)
+
+        original_ram = sysinfo.total_ram_bytes
+        self.addCleanup(setattr, sysinfo, "total_ram_bytes", original_ram)
+
+    def _set_ram(self, value):
+        sysinfo.total_ram_bytes = lambda: value
+
+    def _hits(self, job):
+        return [w for w in preflight.run_preflight_checks(job)
+               if w.category == "memory"]
+
+    def test_no_history_means_no_memory_check_at_all(self):
+        # Silence is correct for a scene that has never been measured --
+        # a check that always chatters gets ignored.
+        self._set_ram(32 * 1024 ** 3)
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        self.assertEqual(self._hits(job), [])
+
+    def test_peak_above_installed_ram_is_an_error(self):
+        self._set_ram(16 * 1024 ** 3)
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/out/rop1",
+            peak_rss=20 * 1024 ** 3, when=1000.0))
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        hits = self._hits(job)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "error")
+        self.assertIn("GB", hits[0].message)
+        self.assertIn("measured", hits[0].message.lower())
+        self.assertIn("not predicted", hits[0].message.lower())
+
+    def test_peak_at_about_ninety_percent_is_a_warning(self):
+        total = 16 * 1024 ** 3
+        self._set_ram(total)
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/out/rop1",
+            peak_rss=int(total * 0.9), when=1000.0))
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        hits = self._hits(job)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "warning")
+        self.assertIn("not predicted", hits[0].message.lower())
+
+    def test_ram_unknown_still_reports_an_info_line(self):
+        # Knowing the recorded peak is useful even with nothing to compare
+        # it against.
+        self._set_ram(None)
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/out/rop1",
+            peak_rss=8 * 1024 ** 3, when=1000.0))
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        hits = self._hits(job)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "info")
+        self.assertIn("GB", hits[0].message)
+        self.assertIn("not predicted", hits[0].message.lower())
+
+    def test_peak_well_under_ram_is_an_info_line_naming_the_measurement(self):
+        self._set_ram(64 * 1024 ** 3)
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/out/rop1",
+            peak_rss=8 * 1024 ** 3, when=1000.0))
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        hits = self._hits(job)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].level, "info")
+        self.assertIn("8.0 GB", hits[0].message)
+        self.assertIn("not predicted", hits[0].message.lower())
+
+    def test_check_never_fires_for_a_different_rop_on_the_same_hip(self):
+        self._set_ram(4 * 1024 ** 3)
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/out/rop1",
+            peak_rss=20 * 1024 ** 3, when=1000.0))
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop2")
+        self.assertEqual(self._hits(job), [])
+
+    def test_a_single_process_history_is_called_a_lower_bound(self):
+        """This is where a wrongly-small figure does its damage: preflight
+        compares the recorded peak against installed RAM and pronounces on
+        whether the shot fits. A number that only covered a wrapper script
+        must not be presented as the render's total."""
+        self._set_ram(64 * 1024 ** 3)
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/out/rop1",
+            peak_rss=8 * 1024 ** 2, peak_rss_is_tree=False, when=1000.0))
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        hits = self._hits(job)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("lower bound", hits[0].message)
+        self.assertIn("wrapper script", hits[0].message)
+
+    def test_a_whole_tree_history_is_reported_without_the_caveat(self):
+        # The caveat is only honest when it applies; attaching it to a figure
+        # that really did cover the tree would teach people to ignore it.
+        self._set_ram(64 * 1024 ** 3)
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/out/rop1",
+            peak_rss=8 * 1024 ** 3, peak_rss_is_tree=True, when=1000.0))
+        job = RenderJob(hip_file="/jobs/shot.hip", rop_path="/out/rop1")
+        hits = self._hits(job)
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("lower bound", hits[0].message)
+        self.assertIn("not predicted", hits[0].message.lower())
+
+
+# Captured verbatim from `nvidia-smi --query-compute-apps=pid,used_memory
+# --format=csv,noheader,nounits` on a Windows 11 box with an RTX 3090 and an
+# RTX 2060 SUPER (driver 610.62, both cards in WDDM mode). Every row says
+# [N/A]: the driver will not attribute VRAM per process on consumer cards
+# under WDDM. This is the normal case on an artist workstation, not an edge
+# case, which is why it gets a fixture of real output rather than a guess.
+NVIDIA_SMI_ALL_NA = """\
+2284, [N/A]
+9268, [N/A]
+8892, [N/A]
+"""
+
+# The same query on a machine whose driver does report figures.
+NVIDIA_SMI_WITH_NUMBERS = """\
+4242, 1024
+4243, 512
+4244, 16384
+"""
+
+# Captured verbatim from `nvidia-smi --query-gpu=index,name,memory.total
+# --format=csv,noheader,nounits` on that same machine.
+NVIDIA_SMI_GPUS = """\
+0, NVIDIA GeForce RTX 3090, 24576
+1, NVIDIA GeForce RTX 2060 SUPER, 8192
+"""
+
+
+class TestNvidiaSmiParsing(unittest.TestCase):
+    """The pure text half of the GPU probe.
+
+    Split out as its own function precisely so it can be tested on a machine
+    with no GPU at all: everything that can go wrong with nvidia-smi's *output
+    format* is exercised here, on captured text, with no driver involved.
+    """
+
+    def test_reads_pids_and_converts_mib_to_bytes(self):
+        """nvidia-smi's `nounits` output is MiB, and every consumer of this
+        works in bytes. Getting the unit wrong would under-report VRAM by a
+        factor of a million."""
+        parsed = sysinfo._parse_nvidia_smi(NVIDIA_SMI_WITH_NUMBERS)
+        self.assertEqual(parsed, {
+            4242: 1024 * 1024 * 1024,
+            4243: 512 * 1024 * 1024,
+            4244: 16384 * 1024 * 1024,
+        })
+
+    def test_na_rows_are_dropped_not_recorded_as_zero(self):
+        """The whole point. On Windows consumer cards every row is [N/A].
+        Recording those pids as 0 bytes would read downstream as "this render
+        used no VRAM" -- a confident, wrong claim. They must be absent, so the
+        caller can say "unknown" instead."""
+        self.assertEqual(sysinfo._parse_nvidia_smi(NVIDIA_SMI_ALL_NA), {})
+
+    def test_other_driver_refusals_are_dropped_too(self):
+        """[N/A] is not the only thing a driver prints instead of a number."""
+        text = ("11, [Not Supported]\n"
+                "12, [Insufficient Permissions]\n"
+                "13, N/A\n"
+                "14, [Unknown Error]\n")
+        self.assertEqual(sysinfo._parse_nvidia_smi(text), {})
+
+    def test_a_good_row_survives_alongside_refused_ones(self):
+        """A mixed machine must not lose the readings it does have."""
+        text = "11, [N/A]\n22, 256\n33, [N/A]\n"
+        self.assertEqual(sysinfo._parse_nvidia_smi(text), {22: 256 * 1024 * 1024})
+
+    def test_a_pid_on_two_gpus_is_summed(self):
+        """nvidia-smi emits one row per (process, card). A render using both
+        cards must report its total, not whichever row happened to be last."""
+        text = "500, 1024\n500, 2048\n"
+        self.assertEqual(sysinfo._parse_nvidia_smi(text),
+                         {500: 3072 * 1024 * 1024})
+
+    def test_empty_and_malformed_text_yields_no_rows(self):
+        """A driver error, a truncated pipe or a changed output format must
+        produce nothing rather than an exception in the middle of a render."""
+        for text in ("", "\n\n", "garbage", "no-comma-here", "  , 12",
+                     "12", "abc, def"):
+            with self.subTest(text=text):
+                self.assertEqual(sysinfo._parse_nvidia_smi(text), {})
+
+    def test_none_is_tolerated(self):
+        """_run_nvidia_smi returns "" on failure, but a None must not blow up
+        the parser either -- this runs inside a render loop."""
+        self.assertEqual(sysinfo._parse_nvidia_smi(None), {})
+
+    def test_nonsense_pids_are_rejected(self):
+        """A pid of 0 or a negative one is not a process; keeping it would put
+        a bogus key in a dict callers look their own pid up in."""
+        self.assertEqual(sysinfo._parse_nvidia_smi("0, 128\n-5, 128\n"), {})
+
+    def test_gpu_listing_reads_names_and_total_vram(self):
+        gpus = sysinfo._parse_nvidia_smi_gpus(NVIDIA_SMI_GPUS)
+        self.assertEqual(len(gpus), 2)
+        self.assertEqual(gpus[0], {"index": 0, "name": "NVIDIA GeForce RTX 3090",
+                                   "total_vram_bytes": 24576 * 1024 * 1024})
+        self.assertEqual(gpus[1]["name"], "NVIDIA GeForce RTX 2060 SUPER")
+        self.assertEqual(gpus[1]["total_vram_bytes"], 8192 * 1024 * 1024)
+
+    def test_a_card_with_unreadable_size_keeps_its_name(self):
+        """Knowing the card is there is still worth reporting -- a None size
+        says "unknown", which is the honest answer, while dropping the row
+        would say "no such GPU"."""
+        gpus = sysinfo._parse_nvidia_smi_gpus("0, NVIDIA Whatever, [N/A]\n")
+        self.assertEqual(len(gpus), 1)
+        self.assertEqual(gpus[0]["name"], "NVIDIA Whatever")
+        self.assertIsNone(gpus[0]["total_vram_bytes"])
+
+    def test_gpu_listing_of_junk_is_empty(self):
+        for text in ("", "garbage", "a, b, c", "0, only-two-fields"):
+            with self.subTest(text=text):
+                self.assertEqual(sysinfo._parse_nvidia_smi_gpus(text), [])
+
+
+class TestGpuMemoryLookup(unittest.TestCase):
+    """gpu_memory_bytes around the parser -- absent tool, absent driver data."""
+
+    def _fake_smi(self, text):
+        """Replace the subprocess layer so these run with no GPU present."""
+        calls = []
+        original = sysinfo._run_nvidia_smi
+        self.addCleanup(setattr, sysinfo, "_run_nvidia_smi", original)
+
+        def fake(args):
+            calls.append(args)
+            return text
+
+        sysinfo._run_nvidia_smi = fake
+        return calls
+
+    def test_missing_nvidia_smi_returns_an_empty_dict(self):
+        """An AMD machine, or any machine with no NVIDIA driver, must get {}
+        back rather than an exception -- measurement never breaks a render."""
+        original = sysinfo.find_nvidia_smi
+        self.addCleanup(setattr, sysinfo, "find_nvidia_smi", original)
+        sysinfo.find_nvidia_smi = lambda: ""
+        self.assertEqual(sysinfo.gpu_memory_bytes([123, 456]), {})
+
+    def test_no_pids_asked_about_skips_the_subprocess_entirely(self):
+        """Shelling out to a driver tool to answer a question about nothing is
+        pure cost on a path that may be sampled every second."""
+        calls = self._fake_smi(NVIDIA_SMI_WITH_NUMBERS)
+        self.assertEqual(sysinfo.gpu_memory_bytes([]), {})
+        self.assertEqual(calls, [])
+
+    def test_only_the_requested_pids_come_back(self):
+        """nvidia-smi reports every process on the box; a caller asking about
+        its own render must not be handed the browser's VRAM."""
+        self._fake_smi(NVIDIA_SMI_WITH_NUMBERS)
+        self.assertEqual(sysinfo.gpu_memory_bytes([4243]),
+                         {4243: 512 * 1024 * 1024})
+
+    def test_a_pid_holding_no_gpu_memory_is_simply_absent(self):
+        """Absent, not zero -- see _parse_nvidia_smi's [N/A] test."""
+        self._fake_smi(NVIDIA_SMI_WITH_NUMBERS)
+        self.assertEqual(sysinfo.gpu_memory_bytes([999999]), {})
+
+    def test_a_driver_that_reports_nothing_useful_returns_empty(self):
+        """The real Windows consumer-card case, end to end."""
+        self._fake_smi(NVIDIA_SMI_ALL_NA)
+        self.assertEqual(sysinfo.gpu_memory_bytes([2284, 9268]), {})
+
+    def test_a_failed_nvidia_smi_call_returns_empty(self):
+        self._fake_smi("")
+        self.assertEqual(sysinfo.gpu_memory_bytes([1, 2]), {})
+
+    def test_unusable_pid_arguments_return_empty_rather_than_raising(self):
+        """Callers pass whatever a Task carries. A None pid from a process
+        that never started must not take the render down with it."""
+        self._fake_smi(NVIDIA_SMI_WITH_NUMBERS)
+        for pids in (None, 5, ["not-a-pid"], [None]):
+            with self.subTest(pids=pids):
+                self.assertEqual(sysinfo.gpu_memory_bytes(pids), {})
+
+    def test_running_the_tool_never_raises_when_the_path_is_wrong(self):
+        """A stale cached path, a driver uninstalled mid-session: "" not a
+        FileNotFoundError."""
+        original = sysinfo._nvidia_smi_path
+        self.addCleanup(setattr, sysinfo, "_nvidia_smi_path", original)
+        sysinfo._nvidia_smi_path = os.path.join(
+            tempfile.gettempdir(), "definitely-not-nvidia-smi.exe")
+        self.assertEqual(sysinfo._run_nvidia_smi(["--help"]), "")
+
+
+class TestSysinfoProbes(unittest.TestCase):
+    """The live probes, asserted only on their contract.
+
+    Deliberately no assertion about how much RAM or which GPU this machine
+    has -- these must pass on a laptop, a farm blade and a CI container alike.
+    What is worth locking in is that every one of them returns a usable value
+    or an honest None, and that none of them raises.
+    """
+
+    def test_total_ram_is_a_positive_int_or_none(self):
+        total = sysinfo.total_ram_bytes()
+        if total is not None:
+            self.assertIsInstance(total, int)
+            self.assertGreater(total, 0)
+
+    def test_available_ram_is_a_non_negative_int_or_none(self):
+        available = sysinfo.available_ram_bytes()
+        if available is not None:
+            self.assertIsInstance(available, int)
+            self.assertGreaterEqual(available, 0)
+
+    def test_available_never_exceeds_total(self):
+        """A sanity check on the two readings being the same quantity. If a
+        platform branch ever mixed up bytes and kB, this is where it shows."""
+        total = sysinfo.total_ram_bytes()
+        available = sysinfo.available_ram_bytes()
+        if total is not None and available is not None:
+            self.assertLessEqual(available, total)
+
+    def test_current_rss_of_this_process_is_an_int_or_none(self):
+        rss = sysinfo.current_rss(os.getpid())
+        if rss is not None:
+            self.assertIsInstance(rss, int)
+            self.assertGreater(rss, 0)
+
+    def test_current_rss_of_an_impossible_pid_is_none(self):
+        """Never 0. A caller sampling a curve must be able to tell "the
+        process is gone" from "the process is using no memory"."""
+        for pid in (0, -1, None, "nope", 3.7):
+            with self.subTest(pid=pid):
+                self.assertIsNone(sysinfo.current_rss(pid))
+
+    def test_peak_of_a_finished_child_is_an_int_or_none(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        peak = sysinfo.peak_working_set(proc)
+        if peak is not None:
+            self.assertIsInstance(peak, int)
+            self.assertGreater(peak, 0)
+
+    def test_peak_of_a_non_process_is_none(self):
+        """Never 0 for something that was never measured."""
+        self.assertIsNone(sysinfo.peak_working_set(None))
+        self.assertIsNone(sysinfo.peak_working_set(object()))
+
+    @unittest.skipUnless(sys.platform == "win32",
+                         "PeakWorkingSetSize is a Windows-only guarantee")
+    def test_peak_survives_the_process_exiting_on_windows(self):
+        """The finding this module is built around: Windows keeps the process
+        object alive while Popen holds a handle, so the peak can be read after
+        wait() -- which is when it is final. If this ever regresses, callers
+        would have to sample during the render instead, so it is worth a test
+        rather than a comment.
+
+        On Linux the opposite is true (VmHWM vanishes with the process), which
+        is why this is guarded rather than asserted everywhere.
+        """
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        after = sysinfo.peak_working_set(proc)
+        self.assertIsNotNone(after)
+        self.assertGreater(after, 0)
+        # Still stable on a second read, and unchanged -- it is a high-water
+        # mark, not a live figure.
+        self.assertEqual(sysinfo.peak_working_set(proc), after)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows handle semantics")
+    def test_peak_is_none_once_the_handle_is_closed(self):
+        """Documented failure mode: the reading depends on the handle, so a
+        caller that closes it first gets an honest None, not a stale number."""
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        proc._handle.Close()
+        self.assertIsNone(sysinfo.peak_working_set(proc))
+
+    def test_find_nvidia_smi_returns_a_string_and_caches_it(self):
+        """Never None -- callers test it with `if not path`. Cached because a
+        machine with no NVIDIA card should not pay a filesystem walk on every
+        sample of a render."""
+        first = sysinfo.find_nvidia_smi()
+        self.assertIsInstance(first, str)
+        self.assertEqual(sysinfo.find_nvidia_smi(), first)
+        if first:
+            self.assertTrue(os.path.isfile(first))
+
+    def test_gpu_memory_bytes_on_this_machine_does_not_raise(self):
+        """Whatever this machine has -- an NVIDIA card, an AMD one, none at
+        all -- asking must produce a dict and never an exception."""
+        result = sysinfo.gpu_memory_bytes([os.getpid()])
+        self.assertIsInstance(result, dict)
+        for pid, used in result.items():
+            self.assertIsInstance(pid, int)
+            self.assertIsInstance(used, int)
+
+
+class TestSysinfoDescribe(unittest.TestCase):
+    """describe() is what the CLI prints so a user can tell "no GPU" from "no
+    tool". Its keys are therefore a contract, not an implementation detail."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Once for the class: describe() shells out to nvidia-smi twice, and
+        # doing that per test method would make the suite pay for it eight
+        # times over on a machine that has a driver.
+        cls.info = sysinfo.describe()
+
+    def test_every_documented_key_is_present(self):
+        for key in ("platform", "platform_detail", "total_ram_bytes",
+                    "available_ram_bytes", "peak_rss_available",
+                    "peak_rss_method", "nvidia_smi", "gpus",
+                    "per_process_vram", "notes"):
+            with self.subTest(key=key):
+                self.assertIn(key, self.info)
+
+    def test_platform_and_method_are_strings(self):
+        self.assertIsInstance(self.info["platform"], str)
+        self.assertIsInstance(self.info["platform_detail"], str)
+        self.assertIsInstance(self.info["peak_rss_method"], str)
+        self.assertIsInstance(self.info["nvidia_smi"], str)
+
+    def test_capability_flags_are_real_booleans(self):
+        """These drive `if` branches in the CLI's report; a truthy string or a
+        None would read as a capability the machine may not have."""
+        self.assertIsInstance(self.info["peak_rss_available"], bool)
+        self.assertIsInstance(self.info["per_process_vram"], bool)
+
+    def test_ram_values_are_ints_or_none(self):
+        for key in ("total_ram_bytes", "available_ram_bytes"):
+            with self.subTest(key=key):
+                value = self.info[key]
+                self.assertTrue(value is None or isinstance(value, int))
+
+    def test_gpu_entries_have_the_documented_shape(self):
+        self.assertIsInstance(self.info["gpus"], list)
+        for gpu in self.info["gpus"]:
+            self.assertIn("index", gpu)
+            self.assertIsInstance(gpu["name"], str)
+            total = gpu["total_vram_bytes"]
+            self.assertTrue(total is None or isinstance(total, int))
+
+    def test_a_missing_tool_is_explained_rather_than_left_blank(self):
+        """The reason describe() exists. If nvidia-smi is absent the report
+        must say so in words, so "VRAM unknown" is not mistaken for
+        "this render used no VRAM"."""
+        if not self.info["nvidia_smi"]:
+            self.assertEqual(self.info["gpus"], [])
+            self.assertFalse(self.info["per_process_vram"])
+            self.assertTrue(any("nvidia-smi" in n for n in self.info["notes"]))
+
+    def test_notes_are_plain_strings(self):
+        self.assertIsInstance(self.info["notes"], list)
+        for note in self.info["notes"]:
+            self.assertIsInstance(note, str)
+            self.assertTrue(note.strip())
+
+    def test_describe_is_json_serialisable(self):
+        """It ends up in CLI output and may end up in a farm submission or a
+        bug report; a ctypes object leaking into it would only fail there."""
+        json.dumps(self.info)
+
+    def test_it_says_whether_a_wrapper_script_would_be_seen_through(self):
+        """The single-process/whole-tree difference is a factor of forty on a
+        launcher script, and nothing else in the report reveals which one a
+        number is. So it is a documented key, not an inference."""
+        self.assertIsInstance(self.info["peak_rss_tree"], bool)
+        self.assertIsInstance(self.info["peak_rss_tree_method"], str)
+        # A capability claimed must name its mechanism, so a wrong figure can
+        # be traced to the thing that produced it.
+        if self.info["peak_rss_tree"]:
+            self.assertTrue(self.info["peak_rss_tree_method"].strip())
+        else:
+            self.assertEqual(self.info["peak_rss_tree_method"], "")
+
+    def test_the_children_gap_is_described_the_way_it_actually_is(self):
+        """describe() used to state flatly that children are never covered.
+        Once they are, saying so anyway would be its own quiet lie -- the
+        notes have to track the machine, not the old limitation."""
+        notes = " ".join(self.info["notes"]).lower()
+        if self.info["peak_rss_tree"]:
+            self.assertIn("whole process tree", notes)
+        elif sys.platform == "win32":
+            self.assertIn("not", notes)
+            self.assertIn("children", notes)
+
+
+class TestTreeMemoryMeasurement(unittest.TestCase):
+    """Whole-process-tree peak memory, via a Windows Job Object.
+
+    The defect these exist for: ``peak_working_set`` covers only the process
+    hsl spawned, so a studio ``husk.bat`` wrapper -- which ``RenderJob.
+    husk_exe`` may legitimately point at -- measured 8 MB for a render that
+    really used 300 MB. A silently *small* number is the worst possible
+    outcome: preflight compares it against installed RAM and cheerfully
+    reports plenty of room for a shot that will swap for six hours.
+
+    Job Objects are Windows-only, so the behavioural cases are guarded; the
+    contract cases (None in, None out, never raises) must hold everywhere.
+    """
+
+    def _child(self, tmp, payload_mb=0, linger=0.25):
+        """A script that allocates and *touches* payload_mb, then lingers.
+
+        Touching matters -- an untouched bytearray is committed but never
+        faulted in, and half the point is measuring what really landed in
+        memory. The linger removes a race that has nothing to do with what is
+        being tested: assignment happens just after the spawn, so a child that
+        exits instantly could be gone before it is adopted.
+        """
+        path = os.path.join(tmp, "child_%d.py" % payload_mb)
+        with open(path, "w") as fh:
+            fh.write("import time\n")
+            if payload_mb:
+                fh.write("b = bytearray(%d * 1024 * 1024)\n"
+                         "for i in range(0, len(b), 4096): b[i] = 1\n"
+                         % payload_mb)
+            fh.write("time.sleep(%r)\n" % linger)
+        return path
+
+    def _measure(self, cmd):
+        """Spawn cmd the way runner.py does and report (single, tree)."""
+        job = sysinfo.open_job_object()
+        self.addCleanup(sysinfo.close_job_object, job)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        assigned = sysinfo.assign_process_to_job(job, proc)
+        proc.wait()
+        return assigned, sysinfo.peak_working_set(proc), sysinfo.peak_job_memory(job)
+
+    # -- contract, everywhere ---------------------------------------------
+
+    def test_every_call_tolerates_having_nothing_to_measure(self):
+        """A measurement must never be able to take a render down with it, so
+        there is no argument any of these will raise on."""
+        self.assertFalse(sysinfo.assign_process_to_job(None, None))
+        self.assertFalse(sysinfo.assign_process_to_job(None, object()))
+        self.assertIsNone(sysinfo.peak_job_memory(None))
+        self.assertIsNone(sysinfo.close_job_object(None))
+
+    def test_support_is_a_cached_boolean(self):
+        """Callers branch on it, so a truthy string would read as a capability
+        the machine may not have. Cached because the probe creates a real
+        kernel object and a render should not pay for it repeatedly."""
+        first = sysinfo.supports_tree_measurement()
+        self.assertIsInstance(first, bool)
+        self.assertIs(sysinfo.supports_tree_measurement(), first)
+
+    @unittest.skipIf(sys.platform == "win32", "the non-Windows answer")
+    def test_a_platform_without_job_objects_admits_it(self):
+        """Unknown, stated. Silently handing back a single-process figure
+        under a whole-tree name is the failure being avoided."""
+        self.assertFalse(sysinfo.supports_tree_measurement())
+        self.assertIsNone(sysinfo.open_job_object())
+        self.assertFalse(sysinfo.assign_process_to_job(None, None))
+
+    # -- behaviour, Windows ------------------------------------------------
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_job_nothing_ran_in_reports_none_not_zero(self):
+        """The kernel really does answer 0 for an empty job. Passing that on
+        would claim a render used no memory, which is never true -- the same
+        rule the rest of sysinfo is built around."""
+        job = sysinfo.open_job_object()
+        self.addCleanup(sysinfo.close_job_object, job)
+        self.assertIsNotNone(job)
+        self.assertIsNone(sysinfo.peak_job_memory(job))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows handle semantics")
+    def test_closing_a_job_twice_is_harmless(self):
+        """A cancelled render can unwind through the same finally twice, and
+        double-closing a Windows handle is how an unrelated handle that has
+        since reused the value gets corrupted."""
+        job = sysinfo.open_job_object()
+        sysinfo.close_job_object(job)
+        sysinfo.close_job_object(job)
+        self.assertIsNone(sysinfo.peak_job_memory(job))
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_wrapper_script_is_measured_through_rather_than_instead_of(self):
+        """The defect itself, in one test.
+
+        A .bat that launches a Python child which allocates and touches a real
+        payload. The wrapper's own footprint is a few MB; the tree's is the
+        payload. Measured on this machine at 300 MB: 8.0 MB single-process
+        against 315.6 MB whole-tree. The payload here is smaller only so the
+        suite stays cheap on a modest box -- the gap is the point, not the
+        absolute number.
+        """
+        payload_mb = 150
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        child = self._child(tmp, payload_mb)
+        wrapper = os.path.join(tmp, "wrap.bat")
+        with open(wrapper, "w") as fh:
+            fh.write('@echo off\r\n"%s" "%s"\r\n' % (sys.executable, child))
+
+        assigned, single, tree = self._measure([wrapper])
+        self.assertTrue(assigned)
+        # The wrapper alone is tiny. That reading is not wrong, it is just an
+        # answer to a different question -- and it is why it must be labelled.
+        self.assertIsNotNone(single)
+        self.assertLess(single, 50 * 1024 ** 2)
+        # The tree it started really did allocate the payload.
+        self.assertIsNotNone(tree)
+        self.assertGreater(tree, payload_mb * 1024 ** 2)
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_spawn_with_no_wrapper_of_our_own_is_measured_correctly(self):
+        """The case that already worked must not regress: no .bat in the way,
+        and the payload still has to show up.
+
+        Only the tree figure is asserted, and that is not laziness --
+        ``sys.executable`` is not necessarily one process. In this repo's venv
+        it is a 45 KB uv trampoline that spawns the real interpreter as a
+        child, so even this "direct" spawn is a two-process tree and its
+        single-process peak reads about 5 MB against a 150 MB payload. That is
+        the same defect as the .bat wrapper, arriving with no .bat involved,
+        and it is why the whole-tree figure is the one worth pinning."""
+        payload_mb = 150
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        assigned, single, tree = self._measure(
+            [sys.executable, self._child(tmp, payload_mb)])
+        self.assertTrue(assigned)
+        self.assertIsNotNone(single)                    # still a real reading
+        self.assertIsNotNone(tree)
+        self.assertGreater(tree, payload_mb * 1024 ** 2)
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_genuinely_single_process_spawn_agrees_both_ways(self):
+        """Where the interpreter really is one process -- ``sys._base_executable``
+        under a venv -- the two mechanisms must land on the same story, or the
+        job figure is measuring something other than what it claims. They will
+        not be equal: the job counts committed memory and the working set
+        counts resident pages. Both must see the payload.
+
+        Skipped rather than faked where the base interpreter cannot be found,
+        because a test that quietly measures the trampoline again would prove
+        nothing."""
+        base = getattr(sys, "_base_executable", None) or sys.executable
+        if not base or not os.path.isfile(base):
+            self.skipTest("no base interpreter to spawn directly")
+        payload_mb = 150
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        assigned, single, tree = self._measure(
+            [base, self._child(tmp, payload_mb)])
+        self.assertTrue(assigned)
+        if single is None or single < payload_mb * 1024 ** 2:
+            self.skipTest("%s is itself a launcher, not a single process" % base)
+        self.assertGreater(tree, payload_mb * 1024 ** 2)
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_trivial_process_still_reports_a_small_figure(self):
+        """The other direction of wrong. If the job ever measured something
+        wider than the tree it owns -- this test process, or the machine -- a
+        child that does nothing would come back large, and every render would
+        look like it needed gigabytes it never touched."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        assigned, _, tree = self._measure([sys.executable, self._child(tmp)])
+        self.assertTrue(assigned)
+        self.assertIsNotNone(tree)
+        self.assertLess(tree, 100 * 1024 ** 2)
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_process_already_in_a_job_is_handled_either_way(self):
+        """Nested jobs are a Windows 8+ feature, and hsl is often not the only
+        thing making them -- CI runners and some terminals put everything they
+        start inside one. Whether a *second* assignment succeeds is therefore
+        a property of the machine, not of this code: both answers are fine,
+        raising is not, and the first job must keep its measurement regardless.
+
+        Measured here: it succeeds. This repo's own test process runs inside a
+        job already, so the ordinary path is the nested one.
+        """
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        outer = sysinfo.open_job_object()
+        inner = sysinfo.open_job_object()
+        self.addCleanup(sysinfo.close_job_object, outer)
+        self.addCleanup(sysinfo.close_job_object, inner)
+
+        proc = subprocess.Popen([sys.executable, self._child(tmp)],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        first = sysinfo.assign_process_to_job(outer, proc)
+        second = sysinfo.assign_process_to_job(inner, proc)
+        proc.wait()
+
+        self.assertTrue(first)
+        self.assertIsInstance(second, bool)
+        self.assertIsNotNone(sysinfo.peak_job_memory(outer))
+
+
+class TestTreeMemoryInTheQueue(unittest.TestCase):
+    """RenderQueue has to open the job before it spawns, because a Job Object
+    cannot adopt a tree retroactively. These pin that ordering and the
+    fallback, with the platform calls stubbed so they run anywhere."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        script = os.path.join(self.dir, "fake_husk.py")
+        with open(script, "w") as fh:
+            fh.write("print('ALF_PROGRESS 100%', flush=True)\n")
+        if os.name == "nt":
+            self.exe = os.path.join(self.dir, "fake_husk.bat")
+            with open(self.exe, "w") as fh:
+                fh.write(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        else:
+            self.exe = script
+            os.chmod(script, os.stat(script).st_mode | stat.S_IEXEC)
+
+        # Restore every platform call this class stubs, whichever it touched.
+        for name in ("open_job_object", "assign_process_to_job",
+                     "peak_job_memory", "close_job_object", "peak_working_set"):
+            self.addCleanup(setattr, sysinfo, name, getattr(sysinfo, name))
+
+    def _job(self):
+        return RenderJob(usd_file=os.path.join(self.dir, "shot.usd"),
+                         engine="husk", husk_exe=self.exe,
+                         hip_file=os.path.join(self.dir, "shot.hip"),
+                         rop_path="/stage/rop1", chunk=FrameChunk(1, 1, 1))
+
+    def _run(self, **kwargs):
+        queue = RenderQueue([self._job()], record_memory=False, **kwargs)
+        queue.start(block=True)
+        return queue, queue.tasks[0]
+
+    def test_a_whole_tree_figure_beats_the_single_process_one(self):
+        # Both are available and they disagree by a factor of forty -- which
+        # is exactly the wrapper-script case. The tree figure is the render.
+        sysinfo.peak_job_memory = lambda job: 300 * 1024 ** 2
+        sysinfo.peak_working_set = lambda proc: 8 * 1024 ** 2
+        _, task = self._run()
+        self.assertEqual(task.peak_rss, 300 * 1024 ** 2)
+        self.assertTrue(task.peak_rss_is_tree)
+
+    def test_it_falls_back_to_the_single_process_peak_and_says_so(self):
+        # No job to be had (any non-Windows machine, or a Windows that refused
+        # one). The old figure is still worth having -- but a consumer must be
+        # able to tell it apart from a whole-tree one, or it will size a farm
+        # off a launcher's footprint.
+        sysinfo.peak_job_memory = lambda job: None
+        sysinfo.peak_working_set = lambda proc: 8 * 1024 ** 2
+        _, task = self._run()
+        self.assertEqual(task.peak_rss, 8 * 1024 ** 2)
+        self.assertFalse(task.peak_rss_is_tree)
+
+    def test_the_job_is_opened_before_the_spawn_and_closed_after(self):
+        """The ordering constraint the whole mechanism rests on: a Job Object
+        must exist *before* CreateProcess, because AssignProcessToJobObject
+        cannot adopt children the target has already made. Opening it after
+        the Popen would compile, run, and quietly measure the wrapper again.
+
+        Checked by watching the task's own process handle: None when the job
+        is opened, present by the time the child is assigned."""
+        token = object()
+        seen = {}
+        calls = []
+        queue = RenderQueue([self._job()], record_memory=False)
+        task = queue.tasks[0]
+
+        def opened():
+            calls.append("open")
+            seen["proc_at_open"] = task._proc
+            return token
+
+        def assign(job, proc):
+            calls.append("assign")
+            seen["job"] = job
+            seen["proc_at_assign"] = task._proc
+            return True
+
+        sysinfo.open_job_object = opened
+        sysinfo.assign_process_to_job = assign
+        sysinfo.peak_job_memory = lambda job: calls.append("peak")
+        sysinfo.close_job_object = lambda job: calls.append("close")
+
+        queue.start(block=True)
+        self.assertEqual(calls, ["open", "assign", "peak", "close"])
+        self.assertIs(seen["job"], token)
+        self.assertIsNone(seen["proc_at_open"])         # before the spawn
+        self.assertIsNotNone(seen["proc_at_assign"])    # adopted right after
+
+    def test_no_job_is_opened_when_measurement_is_switched_off(self):
+        # measure_memory=False means no instrumentation at all, not cheaper
+        # instrumentation -- a caller that turned it off should pay nothing.
+        calls = []
+        sysinfo.open_job_object = lambda: calls.append("open")
+        _, task = self._run(measure_memory=False)
+        self.assertEqual(calls, [])
+        self.assertIsNone(task.peak_rss)
+        self.assertFalse(task.peak_rss_is_tree)
+
+    def test_a_measurement_that_explodes_never_breaks_the_render(self):
+        # Every one of these is a ctypes call into the OS. If measuring can
+        # fail a render, measuring is worse than not measuring at all.
+        def boom(*args, **kwargs):
+            raise RuntimeError("the OS said no")
+
+        for name in ("open_job_object", "assign_process_to_job",
+                     "peak_job_memory", "close_job_object", "peak_working_set"):
+            setattr(sysinfo, name, boom)
+        queue, task = self._run()
+        self.assertEqual(task.state, State.DONE)
+        self.assertIsNone(task.peak_rss)
+        self.assertEqual(queue.warnings, [])
+
+    def test_the_filed_sample_records_which_kind_of_figure_it_was(self):
+        """A history that mixes whole-tree and single-process numbers without
+        labelling them cannot be read at all -- preflight would compare a
+        wrapper's 8 MB against installed RAM as if it were the render."""
+        filed = []
+        original = memlog.record
+        memlog.record = filed.append
+        self.addCleanup(setattr, memlog, "record", original)
+
+        sysinfo.peak_job_memory = lambda job: 300 * 1024 ** 2
+        queue = RenderQueue([self._job()])          # record_memory left on
+        queue.start(block=True)
+        self.assertEqual(len(filed), 1)
+        self.assertEqual(filed[0].peak_rss, 300 * 1024 ** 2)
+        self.assertTrue(filed[0].peak_rss_is_tree)
+
+
+class TestTreeMemoryReporting(unittest.TestCase):
+    """`hsl memory` must never present a single-process figure as if it were
+    the whole tree. Its own store, so the assertions do not depend on what
+    other tests in this file happened to record."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        original = memlog.LOG_FILE
+        memlog.LOG_FILE = os.path.join(tmpdir.name, "memory.json")
+        self.addCleanup(setattr, memlog, "LOG_FILE", original)
+
+    def _run(self, argv):
+        args = build_parser().parse_args(argv)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = cli_mod.cmd_memory(args)
+        return code, out.getvalue()
+
+    def _record(self, is_tree):
+        memlog.record(memlog.MemorySample(
+            hip_path="/jobs/shot.hip", rop_path="/stage/rop1", engine="husk",
+            frames=1, peak_rss=8 * 1024 ** 2, peak_rss_is_tree=is_tree,
+            when=time.time()))
+
+    def test_a_single_process_figure_is_labelled_and_explained(self):
+        # 8 MB for a render is only believable if you do not know it was the
+        # wrapper that got measured. The report has to say which it was.
+        self._record(is_tree=False)
+        code, out = self._run(["memory"])
+        self.assertEqual(code, 0)
+        self.assertIn("main process only", out)
+        self.assertNotIn("whole tree", out)
+        self.assertIn("wrapper script", out)
+
+    def test_a_whole_tree_figure_says_that_instead(self):
+        self._record(is_tree=True)
+        code, out = self._run(["memory"])
+        self.assertEqual(code, 0)
+        self.assertIn("whole tree", out)
+        self.assertNotIn("main process only", out)
+
+    def test_the_worst_peak_line_carries_the_scope_too(self):
+        """It is the line someone quotes when sizing a machine, so it is the
+        last place a single-process figure should pass as a total."""
+        self._record(is_tree=False)
+        original = sysinfo.total_ram_bytes
+        sysinfo.total_ram_bytes = lambda: 64 * 1024 ** 3
+        self.addCleanup(setattr, sysinfo, "total_ram_bytes", original)
+        _, out = self._run(["memory"])
+        self.assertIn("Worst recorded peak", out)
+        self.assertIn("main process only", out.split("Worst recorded peak")[1])
+
+    def test_the_machine_report_states_whether_tree_measurement_works(self):
+        # So someone reading a suspiciously small number can find out whether
+        # this machine was even capable of the right one.
+        code, out = self._run(["memory", "--machine"])
+        self.assertEqual(code, 0)
+        self.assertIn("whole-tree RAM", out)
 
 
 if __name__ == "__main__":

@@ -534,6 +534,69 @@ what the real SandBurst products had) falls back to its prim name plus the
 requested extension, and the source layer is left untouched. Colliding
 destinations are reported as a warning rather than silently overwriting.
 
+## M. Host memory measurement — `hsl/sysinfo.py`
+
+Not a Houdini API, but the same failure mode applies: a wrong number here is
+silent, looks reasonable, and someone sizes a farm off it. Measured on this
+machine (Windows 11 Pro 10.0.26200, 128 GB, RTX 3090 + RTX 2060 SUPER, driver
+610.62) on 2026-08-18.
+
+| # | Assumption | Status | Evidence |
+|---|---|---|---|
+| M1 | `GlobalMemoryStatusEx.ullTotalPhys` is installed RAM | `OK` (Win 11) | `137,339,101,184` bytes, **exactly** equal to `Get-CimInstance Win32_ComputerSystem.TotalPhysicalMemory`. Note `Win32_PhysicalMemory` sums to `137,438,953,472` (128 GiB of DIMMs) — the 99.9 MB gap is firmware-reserved and invisible to the OS. Visible RAM is the right ceiling for a render |
+| M2 | psapi `PeakWorkingSetSize` tracks a real peak with no polling | `OK` (Win 11) | child allocating + touching a 500 MB bytearray → `534,847,488` B (510.1 MB); `python -c "pass"` → `10,539,008` B (10.1 MB); difference **500.0 MB**, the payload exactly |
+| M3 | the peak is still readable **after** the process exits | `OK` (Win 11) | same `534,847,488` B read back after `wait()` returned and again 1.5 s later, while `WorkingSetSize` had collapsed to `32,768`. Callers may read before or after `wait()`; **after** is preferred, since that is when the peak is final |
+| M4 | the reading depends on `Popen._handle` staying open | `OK` (Win 11) | after `proc._handle.Close()` `GetProcessMemoryInfo` returns FALSE and `peak_working_set` returns `None`. Do not close the handle, or let the `Popen` be collected, before reading |
+| M5 | `PeakWorkingSetSize` covers **only** the spawned process, never its children | `OK` (Win 11) — still true of that counter; **no longer how hsl measures**, see M11 | found the hard way: this repo's venv `python.exe` is a 45 KB uv **trampoline** that spawns the real interpreter as a child, and measuring it reported 5.1 MB while its child held 510 MB. A whole-tree figure needs a Windows **Job Object** created at spawn time, which cannot be retrofitted onto a `Popen` after the fact — so `runner.py` now opens one *before* its `Popen` |
+| M6 | `nvidia-smi --query-compute-apps=pid,used_memory` yields per-process VRAM | **`WRONG` on consumer Windows cards** | all 27 listed compute apps returned `[N/A]`; `nvidia-smi pmon` showed `-` in its `mem` column for every one. Both cards report `driver_model.current = WDDM`. This is the driver's answer, not a query mistake. `_parse_nvidia_smi` therefore **drops** such rows rather than recording 0 |
+| M7 | `--query-gpu=index,name,memory.total` yields card names and VRAM | `OK` (Win 11) | `0, NVIDIA GeForce RTX 3090, 24576` / `1, NVIDIA GeForce RTX 2060 SUPER, 8192` — parsed to 24 GiB / 8 GiB |
+
+**M6 is why `describe()` exists.** Without it a memory report cannot distinguish
+"this render used no VRAM" from "this driver will not say", and those are very
+different answers for someone deciding whether a shot fits on a 3090.
+
+### Whole-process-tree measurement · Job Objects · measured 2026-08-18
+
+M5 was not just a documentation note — it was a live defect. `RenderJob.husk_exe`
+and `hython_exe` may point at a **wrapper script**, which studios commonly use,
+and a wrapper measured with `PeakWorkingSetSize` reports the wrapper. The failure
+is silent, plausible and in the dangerous direction: preflight would have compared
+8 MB against installed RAM and announced plenty of room for a shot that swaps.
+
+Fixed by spawning each render into a Windows **Job Object**
+(`sysinfo.open_job_object` → `Popen` → `assign_process_to_job` → `peak_job_memory`
+→ `close_job_object`, threaded through `runner._run_task`). Every step returns
+`None`/`False` rather than raising, and `_finish_measurement` falls back to
+`peak_working_set` whenever the job figure is unavailable — recording which it
+got in `Task.peak_rss_is_tree` and `MemorySample.peak_rss_is_tree`.
+
+| # | Assumption | Status | Evidence |
+|---|---|---|---|
+| M11 | `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed` measures the whole tree, wrapper scripts included | `FIXED` (Win 11) | `.bat` → `python.exe` → 300 MB touched bytearray: **8.0 MB** single-process vs **315.5 MB** whole-tree. Through the real `RenderQueue` with a `husk.bat`: **8.1 MB → 317.4 MB**, `peak_rss_is_tree=True` |
+| M12 | the counter is maintained with **no** memory limit set on the job | `OK` (Win 11) | no `LimitFlags` are ever set (deliberately — `KILL_ON_JOB_CLOSE` would make closing the handle kill the render) and the figure is still populated on every run |
+| M13 | the job peak **survives** every process in the job exiting | `OK` (Win 11) | identical value re-read after `wait()` returned, on all four fixtures. Same property as M3, and it is the handle rather than the process that holds it |
+| M14 | **nested jobs work here** — a process whose parent is already in a job can still be assigned | `OK` (Win 11) | `IsProcessInJob(self)` → **True**: this repo's own test process runs inside a job, so the ordinary path *is* the nested one, and `AssignProcessToJobObject` returned TRUE (err 0) on every fixture. A second, independent job accepted the same child too |
+| M15 | the job figure is **committed memory**, not working set | `OK` (Win 11) | hython + 400 MB against an idle hython baseline: **+399.2 MB** by working set, **+407.8 MB** by job. Same payload, two quantities — do not compare them like for like. Commit is the safe direction for "will it fit" |
+| M16 | a direct spawn is still measured correctly | `OK` (Win 11) | `hython.exe -c` allocating 400 MB: 931.3 MB against a 532.1 MB idle baseline (single-process), 929.0 MB against 521.2 MB (whole-tree). Both deltas ~400 MB |
+| M17 | a trivial process still reads small | `OK` (Win 11) | `python -c pass`: 5.2 MB single-process, **8.1 MB** whole-tree. The job measures its own tree and nothing wider |
+
+**The one hole, measured rather than hand-waved.** A process is assigned *just
+after* it starts, not atomically with it, and `AssignProcessToJobObject` does not
+adopt children the target already spawned — Windows offers no way to do that from
+a plain `subprocess.Popen` (the atomic form needs `STARTUPINFOEX` +
+`PROC_THREAD_ATTRIBUTE_JOB_LIST`, which `Popen` does not expose). So a wrapper
+that forks in the microseconds before the assignment lands could escape.
+**Not observed: 25/25 runs of the `.bat` fixture caught the whole tree, spread
+330.7–330.9 MB, zero misses.**
+
+`describe()` now reports `peak_rss_tree` / `peak_rss_tree_method`, and its old
+note claiming children are never covered has been replaced rather than left to
+contradict the code. `hsl memory` labels every figure `(whole tree)` or
+`(main process only)`, and preflight calls a single-process figure a **lower
+bound** — an old record loaded from a store written before this change defaults
+to `peak_rss_is_tree=False`, which is not merely the safe default but the true
+one.
+
 ## F. Environment and licensing
 
 | # | Assumption | Status |
@@ -600,6 +663,7 @@ destinations are reported as a warning rather than silently overwriting.
 | C6 | one `--export-usd` pass exports **every** ROP, each to its own `usd_path`, each holding that ROP's own stage | 22.0.368 | 2026-07-31 | two-ROP throwaway scene: 2 rops, 2 files, `/geo_A` vs `/geo_B`. Multi-ROP husk is wireable |
 | C7 | **fixed** — export filenames are made unique per pass (`_export_usd_names`): colliding groups get an 8-char SHA-1 of the node path, and the manifest warns | 21.0.729, 22.0.368 | 2026-07-31 | was one file for `/stage/a_b/rop` + `/stage/a/b_rop`; now 2 files, `/geo_FIRST` and `/geo_SECOND` in the right ones, warning present. `--rop` gives the same name as a full pass; a non-colliding scene's names are unchanged |
 | C8 | **fixed** — `export_usd()` sets the range with `_force_parm` (`deleteAllKeyframes()` then set then read back), so `$FSTART`/`$FEND` no longer defeat it | 21.0.729, 22.0.368 | 2026-07-31 | was: asked 3-4, got 240 frames. Now `--export-frames 3 4 1` → samples `[3, 4]` (1 859 B vs 16 705 B); no flag → each ROP's own range, `[1,2]` and `[5,6,7]`. Same defect as K4 |
+| M11–M17 | **fixed** — whole-process-tree peak memory via a Windows Job Object opened before each spawn | Win 11 10.0.26200 | 2026-08-18 | a `.bat` wrapper round a 300 MB child read **8.0 MB** before and **315.5 MB** after (8.1 → 317.4 MB through `RenderQueue`); direct `hython.exe` still ~400 MB delta; `python -c pass` still 8.1 MB. Nested-job assignment works here (this test process is itself in a job). The figure is **committed** memory, not working set |
 | K-COOK | **end-to-end headless cook** | 22.0.368 | 2026-07-28 | throwaway scene: `find_output_tasks` found 4 tasks (2 geometry ROPs, 1 dop, 1 filecache in `/obj`), classified cache/cache/sim/cache, read `final_rop → cache_rop` off the input chain, and the queue wrote **6 real `.bgeo.sc` files**; sequential filecache stayed 1 chunk under `chunk_size=2` |
 
 ## Still unknown (do not guess)
@@ -623,6 +687,35 @@ destinations are reported as a warning rather than silently overwriting.
   is verified (D10e), only the trigger is not. Check: on a pre-20 build, run
   `hython -m hsl.inspector scene.hip --frame 5` and confirm the warning appears
   and the description is still frame 5's.
+- **M8** — **Karma XPU VRAM attribution.** `gpu_memory_bytes(pid)` assumes the
+  husk/hython process hsl spawned is the one holding the VRAM. XPU renders
+  across CPU and GPU and may hold it under a helper process instead, in which
+  case the figure would read low or empty while the card is genuinely full. Not
+  checked — the only NVIDIA cards here are consumer WDDM ones that report
+  `[N/A]` for *every* process (M6), so no XPU number can be obtained on this
+  machine at all. Check: run an XPU render on a card that reports real
+  per-process figures (a datacentre card, or TCC mode) and compare
+  `gpu_memory_bytes` for the husk pid against the card's total in-use VRAM.
+- **M9** — **per-process VRAM anywhere.** M6 means the *populated* branch of
+  `_parse_nvidia_smi` has never run against a live driver here; it is covered
+  only by unit tests fed captured text. The empty result is proven, the
+  non-empty one is not.
+- **M10** — **Linux and macOS memory paths.** `/proc/meminfo`, `/proc/<pid>/statm`,
+  `VmHWM`, `sysconf` and the macOS `ps`/`sysctl` fallbacks are written but have
+  never been executed — this is a Windows machine. Check: run
+  `python -m unittest discover -s tests` plus a 500 MB allocation probe on a
+  Linux box and confirm `peak_working_set` reports it *before* the child exits.
+- **M18** — **whole-tree measurement on Linux and macOS is not implemented at
+  all**, deliberately and out of scope for the Job Object work. There is no
+  equivalent wired up: `supports_tree_measurement()` returns False,
+  `open_job_object()` returns None, and every render there falls back to the
+  single-process figure — which means a studio `husk.sh` wrapper on a Linux
+  farm blade is still measured as the wrapper. That is now *labelled* rather
+  than silent (`peak_rss_is_tree=False`, and preflight calls it a lower bound),
+  but it is not fixed. The mechanism when someone does it is a **cgroup v2**
+  scope per render, reading `memory.peak`; the same before/after fixture in
+  this section is the way to prove it (a `.sh` wrapper launching a child that
+  touches 300 MB must report ~300 MB, not ~8 MB).
 - **A3** — the `::`-versioned type-name split path.
 - **E8/E9** — accepted values for `--complexity` and `--purpose`.
 - **F2/F3** — Karma license behaviour and the Indie resolution cap.

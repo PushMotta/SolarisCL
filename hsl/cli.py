@@ -14,7 +14,7 @@ import threading
 from dataclasses import replace
 from typing import Optional
 
-from . import bridge, husk as husk_mod, preflight
+from . import bridge, husk as husk_mod, memlog, preflight, sysinfo
 from .manifest import (
     TASK_CACHE, TASK_RENDER, TASK_SIM, RenderRop, SceneManifest,
 )
@@ -135,6 +135,94 @@ def _run_queue(jobs, parallel: int, verb: str) -> int:
         sys.stderr.write(f"\n{', '.join(parts)}, of {len(queue.tasks)} chunk(s).\n")
         return 1
     sys.stderr.write(f"\n{verb} {len(queue.tasks)} chunk(s).\n")
+    return 0
+
+
+def cmd_memory(args) -> int:
+    """Show what past renders actually used, or what this machine can measure.
+
+    Deliberately a *record*, not a prediction. Every number here came off a
+    render that really ran; nothing is modelled or extrapolated.
+    """
+    _human_bytes = sysinfo.human_bytes
+
+    if args.machine:
+        info = sysinfo.describe()
+        print(f"platform        {info.get('platform_detail') or info.get('platform') or 'unknown'}")
+        print(f"installed RAM   {_human_bytes(info.get('total_ram_bytes'))}")
+        print(f"available RAM   {_human_bytes(info.get('available_ram_bytes'))}")
+        method = info.get("peak_rss_method") or ""
+        print(f"per-render RAM  {'yes' if info.get('peak_rss_available') else 'no'}"
+              + (f"   ({method})" if method else ""))
+        # Whether that figure covers a renderer launched through a wrapper
+        # script, or only the wrapper. Worth its own line: the two differ by
+        # a factor of forty and nothing else in the report would show it.
+        tree_method = info.get("peak_rss_tree_method") or ""
+        print(f"whole-tree RAM  {'yes' if info.get('peak_rss_tree') else 'no'}"
+              + (f"   ({tree_method})" if tree_method else ""))
+        smi = info.get("nvidia_smi") or ""
+        print(f"nvidia-smi      {smi or 'not found'}")
+        for gpu in info.get("gpus") or []:
+            print(f"  gpu           [{gpu.get('index')}] {gpu.get('name')}  "
+                  f"{_human_bytes(gpu.get('total_vram_bytes'))}")
+        print(f"per-render VRAM {'yes' if info.get('per_process_vram') else 'no'}")
+        for note in info.get("notes") or []:
+            print(f"\n  note: {note}")
+        return 0
+
+    if args.forget:
+        removed = memlog.forget(args.hip or "")
+        scope = args.hip or "every scene"
+        print(f"Forgot {removed} recorded render(s) for {scope}.")
+        return 0
+
+    entries = memlog.history(args.hip or "")
+    if not entries:
+        print("Nothing measured yet.\n"
+              "Renders record what they used as they run, so this fills in by\n"
+              "itself. 'hsl memory --machine' shows what can be measured here.")
+        return 0
+
+    import datetime
+    print(f"{len(entries)} measured render(s), newest first. "
+          f"These are measurements, not predictions.\n")
+    shown = entries[:args.limit]
+    for entry in shown:
+        when = (datetime.datetime.fromtimestamp(entry.when).strftime("%Y-%m-%d %H:%M")
+                if entry.when else "unknown time")
+        vram = _human_bytes(entry.peak_vram)
+        if entry.peak_vram and entry.vram_sampled:
+            vram += " (sampled)"
+        # A single-process figure must never be shown as if it were the whole
+        # tree. A render launched through a wrapper script measured that way
+        # reads as the wrapper -- megabytes for a job that used gigabytes --
+        # so the scope is printed next to the number, not inferred from it.
+        ram = _human_bytes(entry.peak_rss)
+        if entry.peak_rss:
+            ram += " (whole tree)" if entry.peak_rss_is_tree \
+                else " (main process only)"
+        print(f"  {when}   RAM {ram}   VRAM {vram}")
+        print(f"      {entry.hip_path}")
+        print(f"      {entry.rop_path or '(no rop)'}  [{entry.engine}]  "
+              f"{entry.frames} frame(s)")
+    if len(entries) > args.limit:
+        print(f"\n  ... {len(entries) - args.limit} older, --limit to see more")
+
+    if any(e.peak_rss and not e.peak_rss_is_tree for e in shown):
+        print("\n  'main process only' means the figure covers just the process\n"
+              "  hsl started. If that was a wrapper script rather than the\n"
+              "  renderer itself, the real render used more -- possibly far more.")
+
+    total = sysinfo.total_ram_bytes()
+    measured = [e for e in entries if e.peak_rss]
+    peak_entry = max(measured, key=lambda e: e.peak_rss) if measured else None
+    if total and peak_entry:
+        scope = ("whole process tree" if peak_entry.peak_rss_is_tree
+                 else "main process only")
+        print(f"\nWorst recorded peak {_human_bytes(peak_entry.peak_rss)} of "
+              f"{_human_bytes(total)} installed "
+              f"({100.0 * peak_entry.peak_rss / total:.0f}% of this machine's "
+              f"RAM, {scope}).")
     return 0
 
 
@@ -1057,6 +1145,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("--dry-run", action="store_true",
                          help="Print the render commands and stop")
     p_batch.set_defaults(func=cmd_batch)
+
+    p_memory = sub.add_parser(
+        "memory",
+        help="What past renders actually used, and what this machine can measure")
+    p_memory.add_argument("hip", nargs="?", default="",
+                          help="Show only this scene's measured renders")
+    p_memory.add_argument("--machine", action="store_true",
+                          help="Report what can be measured here (RAM, GPU tooling) "
+                               "instead of the history")
+    p_memory.add_argument("--forget", action="store_true",
+                          help="Delete recorded measurements (all, or one scene's)")
+    p_memory.add_argument("--limit", type=int, default=20,
+                          help="How many records to print (default 20)")
+    p_memory.set_defaults(func=cmd_memory)
 
     p_hython = sub.add_parser("hython",
                               help="List the Houdini/hython installs found on this machine")
